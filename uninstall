@@ -20,7 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable
 
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 
 
 @dataclass(frozen=True)
@@ -63,6 +63,15 @@ class RemovalPlan:
     preview_available: bool
     protected_items: list[str]
     notes: list[str]
+
+
+@dataclass(frozen=True)
+class DnfInstallRecord:
+    transaction_id: int
+    command: str
+    reason: str
+    groups: tuple[str, ...] = ()
+    environments: tuple[str, ...] = ()
 
 
 def norm(value: str) -> str:
@@ -1560,9 +1569,9 @@ def relationship_root_paths(
 
 
 @lru_cache(maxsize=64)
-def dnf_history_reason(target: str) -> str:
+def dnf_install_record(target: str) -> DnfInstallRecord | None:
     if not shutil.which("dnf5"):
-        return ""
+        return None
     text = capture([
         "dnf5", "history", "list",
         f"--contains-pkgs={target}", "--json",
@@ -1570,9 +1579,9 @@ def dnf_history_reason(target: str) -> str:
     try:
         transactions = json.loads(text)
     except (json.JSONDecodeError, TypeError):
-        return ""
+        return None
     if not isinstance(transactions, list):
-        return ""
+        return None
     valid_transactions = [
         transaction for transaction in transactions
         if isinstance(transaction, dict)
@@ -1606,11 +1615,117 @@ def dnf_history_reason(target: str) -> str:
                 or "unknown command"
             )
             reason = str(package.get("reason") or "unknown reason")
-            return (
-                f"DNF transaction {transaction_id}: {command} "
-                f"(recorded reason: {reason})"
+            groups = tuple(
+                str(group.get("group"))
+                for group in detail.get("groups", [])
+                if isinstance(group, dict)
+                and str(group.get("action", "")).casefold() == "install"
+                and isinstance(group.get("group"), str)
             )
-    return ""
+            environments = tuple(
+                str(environment.get("environment"))
+                for environment in detail.get("environments", [])
+                if isinstance(environment, dict)
+                and str(
+                    environment.get("action", "")).casefold() == "install"
+                and isinstance(environment.get("environment"), str)
+            )
+            return DnfInstallRecord(
+                transaction_id, command, reason, groups, environments)
+    return None
+
+
+@lru_cache(maxsize=64)
+def dnf_history_reason(target: str) -> str:
+    record = dnf_install_record(target)
+    if not record:
+        return ""
+    return (
+        f"DNF transaction {record.transaction_id}: {record.command} "
+        f"(recorded reason: {record.reason})"
+    )
+
+
+@lru_cache(maxsize=64)
+def dnf_group_memberships(target: str) -> tuple[tuple[str, str], ...]:
+    if not shutil.which("dnf5"):
+        return ()
+    output = capture([
+        "dnf5", "-q", "-C", "group", "info",
+        "--installed", "--hidden", f"--contains-pkgs={target}",
+    ])
+    memberships: list[tuple[str, str]] = []
+    for details in parse_pacman_info(output):
+        group_id = details.get("Id", "")
+        if group_id:
+            memberships.append((group_id, details.get("Name", group_id)))
+    return tuple(memberships)
+
+
+@lru_cache(maxsize=64)
+def dnf_environment_details(
+        environment_id: str,
+) -> tuple[str, tuple[str, ...]]:
+    if not shutil.which("dnf5"):
+        return "", ()
+    output = capture([
+        "dnf5", "-q", "-C", "environment", "info",
+        "--installed", environment_id,
+    ])
+    records = parse_pacman_info(output)
+    if not records:
+        return "", ()
+    details = records[0]
+    groups = tuple(
+        details.get(key, "").split()
+        for key in ("Required groups", "Optional groups")
+    )
+    return (
+        details.get("Name", environment_id),
+        tuple(group for collection in groups for group in collection),
+    )
+
+
+def dnf_group_install_reason(target: str) -> str:
+    record = dnf_install_record(target)
+    transaction = (
+        f"DNF transaction {record.transaction_id}: {record.command}"
+        if record else ""
+    )
+    if not record:
+        return "installed as part of a package group"
+    if record.reason.casefold() != "group":
+        generic = "installed as part of a package group"
+        return f"{generic}; {transaction}" if transaction else generic
+
+    recorded_groups = set(record.groups)
+    memberships = [
+        (group_id, name)
+        for group_id, name in dnf_group_memberships(target)
+        if group_id in recorded_groups
+    ]
+    if len(memberships) != 1:
+        generic = "installed as part of a package group"
+        return f"{generic}; {transaction}" if transaction else generic
+
+    group_id, group_name = memberships[0]
+    environments: list[str] = []
+    for environment_id in record.environments:
+        environment_name, environment_groups = dnf_environment_details(
+            environment_id)
+        if group_id not in environment_groups:
+            continue
+        if (environment_name
+                and not environment_name.casefold().endswith("environment")):
+            environment_name += " Environment"
+        environments.append(environment_name or environment_id)
+
+    group = f"{group_name} ({group_id})"
+    if len(environments) == 1:
+        cause = f"installed through {environments[0]} \u2192 {group}"
+    else:
+        cause = f"installed as part of {group}"
+    return f"{cause}; {transaction}" if transaction else cause
 
 
 @lru_cache(maxsize=None)
@@ -1775,7 +1890,11 @@ def install_reason(item: Match) -> str:
     if item.role == "external":
         return "installed outside the native package manager"
     if item.role == "group":
-        return "installed as part of a package group"
+        return (
+            dnf_group_install_reason(package_base(item.ident))
+            if item.kind == "DNF"
+            else "installed as part of a package group"
+        )
     if item.role not in {"dependency", "weak dependency"}:
         return "the package manager did not record a reason"
 

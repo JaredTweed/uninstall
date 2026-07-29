@@ -26,7 +26,10 @@ class UninstallTests(unittest.TestCase):
         MODULE.rpm_ostree_layered_packages.cache_clear()
         MODULE.zypper_userinstalled.cache_clear()
         MODULE.dnf_install_reasons.cache_clear()
+        MODULE.dnf_install_record.cache_clear()
         MODULE.dnf_history_reason.cache_clear()
+        MODULE.dnf_group_memberships.cache_clear()
+        MODULE.dnf_environment_details.cache_clear()
         MODULE.rpm_dependency_graph.cache_clear()
         MODULE.rpm_reverse_graph.cache_clear()
         MODULE.apt_reverse_graph.cache_clear()
@@ -749,6 +752,81 @@ class UninstallTests(unittest.TestCase):
             MODULE.dnf_history_reason("dosbox-staging"),
             "DNF transaction 193: dnf install wine "
             "(recorded reason: Weak Dependency)",
+        )
+
+    @patch.object(
+        MODULE, "dnf_environment_details",
+        return_value=(
+            "COSMIC Desktop",
+            ("cosmic-desktop", "cosmic-desktop-apps"),
+        ),
+    )
+    @patch.object(
+        MODULE, "dnf_group_memberships",
+        return_value=((
+            "cosmic-desktop-apps",
+            "COSMIC Desktop Supplementary Applications",
+        ),),
+    )
+    @patch.object(MODULE, "dnf_install_record")
+    def test_dnf_group_reason_names_environment_group_and_transaction(
+            self, install_record, _memberships, _environment):
+        install_record.return_value = MODULE.DnfInstallRecord(
+            224,
+            "dnf install @cosmic-desktop-environment",
+            "Group",
+            ("cosmic-desktop", "cosmic-desktop-apps"),
+            ("cosmic-desktop-environment",),
+        )
+        item = MODULE.Match(
+            "DNF", "okular", "okular", role="group")
+        self.assertEqual(
+            MODULE.install_reason(item),
+            "installed through COSMIC Desktop Environment \u2192 "
+            "COSMIC Desktop Supplementary Applications "
+            "(cosmic-desktop-apps); DNF transaction 224: "
+            "dnf install @cosmic-desktop-environment",
+        )
+
+    @patch.object(MODULE, "capture")
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/dnf5")
+    def test_dnf_group_membership_uses_installed_cache_only_metadata(
+            self, _which, capture):
+        capture.return_value = (
+            "Id : cosmic-desktop-apps\n"
+            "Name : COSMIC Desktop Supplementary Applications\n"
+            "Installed : yes\n"
+        )
+        self.assertEqual(
+            MODULE.dnf_group_memberships("okular"),
+            ((
+                "cosmic-desktop-apps",
+                "COSMIC Desktop Supplementary Applications",
+            ),),
+        )
+        capture.assert_called_once_with([
+            "dnf5", "-q", "-C", "group", "info",
+            "--installed", "--hidden", "--contains-pkgs=okular",
+        ])
+
+    @patch.object(
+        MODULE, "dnf_group_memberships",
+        return_value=(
+            ("first", "First Group"),
+            ("second", "Second Group"),
+        ),
+    )
+    @patch.object(MODULE, "dnf_install_record")
+    def test_ambiguous_dnf_group_membership_falls_back_without_guessing(
+            self, install_record, _memberships):
+        install_record.return_value = MODULE.DnfInstallRecord(
+            9, "dnf group install desktop", "Group",
+            ("first", "second"), (),
+        )
+        self.assertEqual(
+            MODULE.dnf_group_install_reason("example"),
+            "installed as part of a package group; "
+            "DNF transaction 9: dnf group install desktop",
         )
 
     @patch.object(MODULE, "capture")

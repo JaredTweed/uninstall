@@ -132,6 +132,19 @@ when history is available:
 Why installed: wine recommends it; DNF transaction 193: dnf install wine (recorded reason: Weak Dependency)
 ```
 
+For packages installed through a DNF environment or group, cached installed
+comps metadata supplies the immediate group and its display name while
+transaction history supplies the original environment and command:
+
+```text
+Why installed: installed through COSMIC Desktop Environment → COSMIC Desktop Supplementary Applications (cosmic-desktop-apps); DNF transaction 224: dnf install @cosmic-desktop-environment
+```
+
+Group metadata is queried cache-only, so explaining an installation never
+refreshes repositories or imports signing keys. If several groups could have
+caused the installation, `uninstall` reports the generic group reason instead
+of guessing.
+
 Before asking for confirmation, native simulations determine what the package
 manager expects to remove. Routine internal details stay out of the way.
 `uninstall` prints the information that can change the decision: installed
