@@ -19,7 +19,7 @@ Choose numbers separated by commas, “a” for all, or Enter to cancel.
 
 It searches:
 
-- Flatpak, Snap, and AppImage
+- Flatpak, Snap, AppImage, and AppImages managed by Gear Lever
 - APT/dpkg, DNF/YUM/RPM, rpm-ostree, Zypper/RPM, and Pacman
 - Homebrew, Nix profiles, Cargo, pipx, and global npm packages
 - standalone executables on `PATH`
@@ -33,6 +33,11 @@ and alternatives are resolved before falling back to standalone removal.
 If no manager owns a command, `uninstall` can remove its exact executable from
 `PATH`. It labels this as `Standalone` because files installed alongside that
 executable cannot always be inferred safely.
+
+Gear Lever installations are discovered through its machine-readable installed
+app list, including custom AppImage folders. Removal is delegated back to Gear
+Lever so the AppImage, desktop entry, icon, and Gear Lever update metadata are
+handled together.
 
 ## Install
 

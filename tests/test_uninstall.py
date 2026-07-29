@@ -79,6 +79,77 @@ class UninstallTests(unittest.TestCase):
         self.assertEqual(result[0].ident, "org.freecad.FreeCAD")
         self.assertEqual(result[0].scope, "user")
 
+    def test_gearlever_json_is_parsed_without_table_guessing(self):
+        result = MODULE.parse_gearlever_list(
+            'log line\n{"schema_version": 1, "installed": ['
+            '{"name": "Arduino IDE", "path": "/home/test/AppImages/arduino.appimage",'
+            ' "current_version": "2.3.6", "desktop_id": "arduino.desktop"}]}\n'
+        )
+        self.assertEqual(result, [{
+            "name": "Arduino IDE",
+            "path": "/home/test/AppImages/arduino.appimage",
+            "current_version": "2.3.6",
+            "desktop_id": "arduino.desktop",
+        }])
+
+    def test_gearlever_older_table_output_supports_spaces_in_paths(self):
+        result = MODULE.parse_gearlever_list(
+            "My App   [Not specified]   [UpdatesNotAvailable]   "
+            "/home/test/My App.AppImage   \n"
+        )
+        self.assertEqual(result, [{
+            "name": "My App",
+            "path": "/home/test/My App.AppImage",
+            "current_version": "",
+        }])
+
+    @patch.object(MODULE.shutil, "which", return_value=None)
+    @patch.object(MODULE, "capture")
+    @patch.object(
+        MODULE, "gearlever_command",
+        return_value=["flatpak", "run", "it.mijorus.gearlever"],
+    )
+    def test_gearlever_apps_are_detected_from_managed_metadata(
+            self, _command, capture, _which):
+        with tempfile.TemporaryDirectory() as directory:
+            appimage = Path(directory) / "arduino_ide.appimage"
+            appimage.touch()
+            capture.return_value = MODULE.json.dumps({
+                "schema_version": 1,
+                "installed": [{
+                    "name": "Arduino IDE",
+                    "path": str(appimage),
+                    "current_version": "2.3.6",
+                    "desktop_id": "arduino_ide.desktop",
+                }],
+            })
+            result = MODULE.detect_gearlever("arduino")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].kind, "Gear Lever")
+        self.assertEqual(result[0].name, "Arduino IDE")
+        self.assertEqual(result[0].version, "2.3.6")
+        self.assertEqual(result[0].path, appimage)
+        capture.assert_called_once_with([
+            "flatpak", "run", "it.mijorus.gearlever",
+            "--list-installed", "--json",
+        ])
+
+    @patch.object(
+        MODULE, "gearlever_command",
+        return_value=["flatpak", "run", "it.mijorus.gearlever"],
+    )
+    def test_gearlever_removal_uses_its_complete_lifecycle(self, _command):
+        path = Path("/home/test/AppImages/arduino_ide.appimage")
+        item = MODULE.Match(
+            "Gear Lever", str(path), "Arduino IDE", path=path)
+        self.assertEqual(
+            MODULE.uninstall_command(item, False),
+            [
+                "flatpak", "run", "it.mijorus.gearlever",
+                "--remove", str(path), "--yes",
+            ],
+        )
+
     @patch.object(MODULE.shutil, "which", return_value="/usr/bin/dpkg-query")
     @patch.object(MODULE, "capture", return_value=(
         "ii \tfreecad\t0.21\tExtensible Open Source CAx program\n"
@@ -152,6 +223,18 @@ class UninstallTests(unittest.TestCase):
             [(item.kind, item.name) for item in result],
             [("Standalone", "edit"), ("Flatpak", "Edit")],
         )
+
+    @patch.object(MODULE, "DETECTORS")
+    def test_gearlever_metadata_wins_over_generic_appimage(self, detectors):
+        path = Path("/home/test/Applications/example.appimage")
+        managed = MODULE.Match(
+            "Gear Lever", str(path), "Example", path=path)
+        generic = MODULE.Match(
+            "AppImage", str(path), "example", path=path)
+        detectors.__iter__.return_value = iter([
+            lambda _query: [generic, managed],
+        ])
+        self.assertEqual(MODULE.find_matches(str(path)), [managed])
 
     @patch.object(MODULE, "capture_any")
     @patch.object(MODULE.shutil, "which")
@@ -488,6 +571,25 @@ class UninstallTests(unittest.TestCase):
             ]
             with patch.dict(os.environ, {"XDG_DATA_HOME": str(data_home)}):
                 self.assertIn(desktop, MODULE.find_user_data(selected))
+
+    def test_gearlever_desktop_entry_is_manager_owned_not_optional_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_home = Path(directory)
+            applications = data_home / "applications"
+            applications.mkdir()
+            desktop = applications / "arduino_ide.desktop"
+            appimage = Path(directory) / "arduino_ide.appimage"
+            appimage.touch()
+            desktop.write_text(
+                f"[Desktop Entry]\nTryExec={appimage}\nExec={appimage} %U\n",
+                encoding="utf-8",
+            )
+            selected = [
+                MODULE.Match(
+                    "Gear Lever", str(appimage), "Arduino IDE", path=appimage)
+            ]
+            with patch.dict(os.environ, {"XDG_DATA_HOME": str(data_home)}):
+                self.assertNotIn(desktop, MODULE.find_user_data(selected))
 
     def test_custom_xdg_data_location_is_found_and_allowed(self):
         selected = [MODULE.Match("Standalone", "/tmp/tool", "tool")]

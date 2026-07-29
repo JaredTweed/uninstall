@@ -19,7 +19,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 
 @dataclass(frozen=True)
@@ -219,6 +219,82 @@ def detect_homebrew(query: str) -> list[Match]:
             if fields and relevant(query, fields[0]):
                 found.append(Match(kind, fields[0], fields[0],
                                    " ".join(fields[1:]), "user"))
+    return found
+
+
+def gearlever_command() -> list[str]:
+    if shutil.which("gearlever"):
+        return ["gearlever"]
+    if shutil.which("flatpak"):
+        return ["flatpak", "run", "it.mijorus.gearlever"]
+    return []
+
+
+def parse_gearlever_list(text: str) -> list[dict[str, object]]:
+    """Parse Gear Lever's versioned JSON, with its older table as a fallback."""
+    for line in reversed(text.splitlines()):
+        if not line.lstrip().startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        installed = payload.get("installed")
+        if isinstance(installed, list):
+            return [item for item in installed if isinstance(item, dict)]
+
+    installed: list[dict[str, object]] = []
+    table_row = re.compile(
+        r"^(.*?)\s{2,}\[([^\]]*)\]\s{2,}\[([^\]]*)\]\s{2,}(.+?)\s*$"
+    )
+    for line in text.splitlines():
+        match = table_row.match(line)
+        if not match:
+            continue
+        name, version, _manager, path = match.groups()
+        installed.append({
+            "name": name.strip(),
+            "path": path.strip(),
+            "current_version": "" if version == "Not specified" else version,
+        })
+    return installed
+
+
+def detect_gearlever(query: str) -> list[Match]:
+    command = gearlever_command()
+    if not command:
+        return []
+    text = capture(command + ["--list-installed", "--json"])
+    if not text:
+        text = capture(command + ["--list-installed"])
+    found: list[Match] = []
+    for metadata in parse_gearlever_list(text):
+        name = metadata.get("name")
+        path_value = metadata.get("path")
+        if not isinstance(name, str) or not isinstance(path_value, str):
+            continue
+        path = Path(path_value).expanduser()
+        if (not path.is_absolute()
+                or (not path.is_file() and not path.is_symlink())):
+            continue
+        if not relevant(query, name, path.name, path.stem, str(path)):
+            continue
+        visible = shutil.which(query) if Path(query).name == query else ""
+        provides = ""
+        if visible:
+            try:
+                if Path(visible).resolve() == path.resolve():
+                    provides = str(Path(visible).absolute())
+            except OSError:
+                pass
+        raw_version = metadata.get("current_version")
+        version = raw_version if isinstance(raw_version, str) else ""
+        found.append(Match(
+            "Gear Lever", str(path), name, version, "user", path,
+            provides=provides,
+        ))
     return found
 
 
@@ -508,8 +584,8 @@ def detect_appimages(query: str) -> list[Match]:
 
 DETECTORS: tuple[Callable[[str], list[Match]], ...] = (
     detect_flatpak, detect_snap, detect_dpkg, detect_rpm, detect_pacman,
-    detect_homebrew, detect_pipx, detect_npm, detect_cargo, detect_nix, detect_appimages,
-    detect_executable_owner,
+    detect_homebrew, detect_gearlever, detect_pipx, detect_npm, detect_cargo,
+    detect_nix, detect_appimages, detect_executable_owner,
 )
 
 
@@ -538,6 +614,18 @@ def find_matches(query: str) -> list[Match]:
         matches.extend(detector(query))
     unique = {(m.kind, m.ident, m.scope): m for m in matches}
     results = list(unique.values())
+    gearlever_paths = {
+        str(item.path.resolve()) for item in results
+        if item.kind == "Gear Lever" and item.path
+    }
+    if gearlever_paths:
+        results = [
+            item for item in results
+            if not (
+                item.kind == "AppImage" and item.path
+                and str(item.path.resolve()) in gearlever_paths
+            )
+        ]
     command_candidates = [
         item for item in results
         if item.provides or item.kind == "Standalone"
@@ -623,7 +711,7 @@ def annotate_roles(matches: list[Match]) -> list[Match]:
 
     inherently_explicit = {
         "Flatpak", "Homebrew Cask", "Cargo", "Pipx", "NPM", "Nix",
-        "AppImage", "Standalone",
+        "AppImage", "Gear Lever", "Standalone",
     }
     for item in matches:
         key = (item.kind, item.ident, item.scope)
@@ -867,6 +955,11 @@ def dependency_report(item: Match) -> DependencyReport:
             direct_ok and recursive_ok,
             "Homebrew reports recursive root causes without exact path edges.",
         )
+    elif item.kind == "Gear Lever":
+        return DependencyReport(
+            item, [], [], True,
+            "Gear Lever manages this installation as a single AppImage.",
+        )
     else:
         return DependencyReport(
             item, [], [], False,
@@ -995,9 +1088,14 @@ def native_removal_preview(
             )
         elif kind in {
             "Flatpak", "Homebrew Cask", "Cargo", "Pipx",
-            "NPM", "Nix", "AppImage",
+            "NPM", "Nix", "AppImage", "Gear Lever",
         }:
             planned.extend(identifiers)
+            if kind == "Gear Lever":
+                notes.append(
+                    "Gear Lever will trash the AppImage when possible and remove its "
+                    "desktop entry, icon, and update metadata."
+                )
         elif kind == "Homebrew":
             planned.extend(identifiers)
             available = False
@@ -1272,19 +1370,28 @@ def find_user_data(selected: list[Match]) -> list[Path]:
             str(item.path) for item in selected
             if item.path and item.kind in {"AppImage", "Standalone"}
         }
+        manager_owned_files = {
+            str(item.path) for item in selected
+            if item.path and item.kind == "Gear Lever"
+        }
         try:
             for desktop_file in applications.glob("*.desktop"):
                 matches_name = norm(desktop_file.stem) in keys
                 references_file = False
-                if selected_files:
+                manager_owned = False
+                if selected_files or manager_owned_files:
                     try:
                         if desktop_file.stat().st_size <= 1024 * 1024:
                             content = desktop_file.read_text(
                                 encoding="utf-8", errors="replace")
                             references_file = any(
                                 target in content for target in selected_files)
+                            manager_owned = any(
+                                target in content for target in manager_owned_files)
                     except OSError:
                         pass
+                if manager_owned:
+                    continue
                 if matches_name or references_file:
                     paths.add(desktop_file)
         except OSError:
@@ -1354,6 +1461,11 @@ def uninstall_command(item: Match, remove_data: bool) -> list[str]:
         return command if item.scope == "user" else privileged(command)
     if item.kind == "Nix":
         return ["nix", "profile", "remove", item.ident]
+    if item.kind == "Gear Lever" and item.path:
+        command = gearlever_command()
+        if not command:
+            raise RuntimeError("Gear Lever is no longer available")
+        return command + ["--remove", str(item.path), "--yes"]
     if item.kind == "AppImage" and item.path:
         command = ["rm", "--", str(item.path)]
         return command if os.access(item.path.parent, os.W_OK) else privileged(command)
@@ -1371,7 +1483,7 @@ def yes(prompt: str) -> bool:
 
 
 def preflight_file(item: Match) -> str | None:
-    if item.kind not in {"AppImage", "Standalone"} or not item.path:
+    if item.kind not in {"AppImage", "Gear Lever", "Standalone"} or not item.path:
         return None
     path = item.path
     if not path.is_absolute():

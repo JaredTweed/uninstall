@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-RELEASE_VERSION=0.5.0
+RELEASE_VERSION=0.6.0
 SOURCE_URL=${UNINSTALL_SOURCE_URL:-https://raw.githubusercontent.com/JaredTweed/uninstall/v${RELEASE_VERSION}/uninstall}
 PREFIX=${PREFIX:-/usr/local}
 DESTINATION="$PREFIX/bin/uninstall"
