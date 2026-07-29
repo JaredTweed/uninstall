@@ -157,7 +157,22 @@ transaction is always authoritative.
 Nothing is removed during search or planning, invalid selections can be
 retried, and pressing Enter at a prompt cancels.
 
-Package-manager cleanup and possible user-data paths are separate choices:
+Package-manager cleanup and detected user-data paths appear in one numbered
+prompt:
+
+```text
+Remove associated data too? (optional)
+
+   1. [Flatpak] Sandbox data and permissions
+   2. [Detected] /home/jared/.cache/FreeCAD
+   3. [Detected] /home/jared/.config/FreeCAD
+
+Flatpak data is manager-owned. Detected paths are name matches, are not
+guaranteed to belong to this app, and will be deleted permanently.
+Choose numbers separated by commas, 'a' for all, or Enter to keep everything.
+```
+
+The available package-manager choice depends on the selected software:
 
 - APT `purge` removes package-managed system configuration, not home data.
 - Flatpak `--delete-data` removes sandbox data and permission-store entries.
@@ -166,13 +181,14 @@ Package-manager cleanup and possible user-data paths are separate choices:
 - Homebrew Cask `--zap` removes declared associated files and may include files
   shared by other apps.
 
-When several backends are selected, each backend's cleanup option is confirmed
-independently.
+When several backends are selected, each package-manager cleanup option gets
+its own number.
 
 Possible directories under the XDG config, cache, data, and state locations are
 exact name or executable-path matches, not asserted ownership. They are
-labelled as candidates and selected individually. They are kept if any
-uninstall command fails.
+labelled `[Detected]` and selected individually. Every selected cleanup action
+is shown under `Ready to run`, and detected paths are kept if any uninstall
+command fails.
 
 Do not run the whole program with `sudo`; `uninstall` invokes `sudo` or `doas`
 itself only for selected system-wide operations. Shell built-ins and shell

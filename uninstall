@@ -20,7 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 
 
 @dataclass(frozen=True)
@@ -2369,90 +2369,97 @@ def build_uninstall_batches(
     return batches
 
 
-def choose_cleanup_paths(paths: list[Path]) -> list[Path]:
-    if not paths:
-        return []
-    print("\nPossible user-data paths:")
-    for index, path in enumerate(paths, 1):
-        print(f"  {index:>2}. {display(path)}")
-    print(
-        "These are exact name or executable-path matches, not guarantees. "
-        "Review them carefully."
+def ask_cleanup(
+        selected: list[Match], paths: list[Path],
+) -> tuple[set[str], list[Path]]:
+    kinds = {item.kind for item in selected}
+    descriptions = (
+        ("Flatpak", "Sandbox data and permissions"),
+        ("APT", "Package-managed system configuration (not home data)"),
+        ("Snap", "Do not create a recovery snapshot"),
+        (
+            "Homebrew Cask",
+            "Declared associated files (--zap; may include shared files)",
+        ),
     )
-    print("Deleting a selected path cannot be undone.")
+    managed = [
+        (kind, description)
+        for kind, description in descriptions
+        if kind in kinds
+    ]
+    if not managed and not paths:
+        return set(), []
+
+    print("\nRemove associated data too? (optional)\n")
+    entries: list[tuple[str, Path | None]] = []
+    for kind, description in managed:
+        entries.append((kind, None))
+        print(f"  {len(entries):>2}. [{kind}] {description}")
+    for path in paths:
+        entries.append(("", path))
+        print(f"  {len(entries):>2}. [Detected] {display(path)}")
+
+    if managed:
+        manager_note = (
+            "Flatpak data is manager-owned."
+            if [kind for kind, _description in managed] == ["Flatpak"]
+            else "Package-manager options use their manager's cleanup rules."
+        )
+        print(f"\n{manager_note}", end="")
+    if paths:
+        spacer = " " if managed else "\n"
+        print(
+            spacer
+            + "Detected paths are name matches, are not guaranteed to belong "
+            "to this app, and will be deleted permanently.",
+            end="",
+        )
     print(
-        "Choose paths to delete (numbers separated by commas), "
-        "'a' for all, or Enter to keep all."
+        "\nChoose numbers separated by commas, 'a' for all, "
+        "or Enter to keep everything."
     )
     while True:
         try:
             raw = input("> ").strip().casefold()
         except EOFError:
-            return []
+            return set(), []
         if not raw:
-            return []
+            return set(), []
         if raw in {"a", "all"}:
-            return paths
-        try:
-            indexes = {int(part.strip()) for part in raw.split(",")}
-        except ValueError:
-            print("That selection was not understood; try again.", file=sys.stderr)
-            continue
-        if not indexes or min(indexes) < 1 or max(indexes) > len(paths):
-            print("Selection is out of range; try again.", file=sys.stderr)
-            continue
-        return [
-            path for index, path in enumerate(paths, 1)
-            if index in indexes
-        ]
-
-
-def ask_cleanup(
-        selected: list[Match], paths: list[Path],
-) -> tuple[set[str], list[Path]]:
-    kinds = {item.kind for item in selected}
-    managed_cleanup = kinds.intersection({
-        "Flatpak", "Snap", "APT", "Homebrew Cask",
-    })
-    cleanup_kinds: set[str] = set()
-    if managed_cleanup:
-        print("\nOptional package-manager cleanup:")
-        print("  These options can remove saved configuration or recovery data.")
-        descriptions = (
-            (
-                "Flatpak",
-                "delete sandbox data under ~/.var/app and "
-                "permission-store entries.",
-            ),
-            (
-                "APT",
-                "purge package-managed system configuration; "
-                "this does not purge files in your home directory.",
-            ),
-            (
-                "Snap",
-                "skip the automatic recovery snapshot. "
-                "Existing snapshots are not deleted.",
-            ),
-            (
-                "Homebrew Cask",
-                "use --zap for associated files. "
-                "A cask may declare files shared with other apps.",
-            ),
-        )
-        for kind, description in descriptions:
-            if kind not in kinds:
+            indexes = set(range(1, len(entries) + 1))
+        else:
+            try:
+                indexes = {int(part.strip()) for part in raw.split(",")}
+            except ValueError:
+                print(
+                    "That selection was not understood; try again.",
+                    file=sys.stderr,
+                )
                 continue
-            print(f"  {kind}: {description}")
-            if yes(f"Use {kind} cleanup? [y/N] "):
-                cleanup_kinds.add(kind)
-    selected_paths = choose_cleanup_paths(paths)
-    if selected_paths:
-        print(
-            "Selected user-data paths will be deleted only after "
-            "every uninstall command succeeds."
-        )
-    return cleanup_kinds, selected_paths
+            if (not indexes or min(indexes) < 1
+                    or max(indexes) > len(entries)):
+                print(
+                    "Selection is out of range; try again.",
+                    file=sys.stderr,
+                )
+                continue
+        cleanup_kinds = {
+            entries[index - 1][0]
+            for index in indexes
+            if entries[index - 1][0]
+        }
+        selected_paths = [
+            path
+            for index, (_kind, path) in enumerate(entries, 1)
+            if index in indexes and path is not None
+        ]
+        return cleanup_kinds, selected_paths
+
+
+def cleanup_display_command(path: Path) -> list[str]:
+    if path.is_dir() and not path.is_symlink():
+        return ["rm", "-r", "--", str(path)]
+    return ["rm", "--", str(path)]
 
 
 def yes(prompt: str) -> bool:
@@ -2585,11 +2592,8 @@ def run_uninstall(
     print("\nReady to run:")
     for _items, command in batches:
         print("  " + display(shlex.join(command)))
-    if paths_to_remove:
-        print(
-            f"  and remove {len(paths_to_remove)} user-data path"
-            f"{'s' if len(paths_to_remove) != 1 else ''}"
-        )
+    for path in paths_to_remove:
+        print("  " + display(shlex.join(cleanup_display_command(path))))
     if plan.level in {"HIGH", "UNKNOWN"}:
         expected = ("REMOVE " + selected[0].ident if len(selected) == 1
                     else "REMOVE ALL")

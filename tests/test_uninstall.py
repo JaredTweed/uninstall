@@ -1120,7 +1120,7 @@ class UninstallTests(unittest.TestCase):
         find_matches.return_value = [item]
         find_user_data.return_value = [Path("/home/test/.config/Example")]
         run.return_value.returncode = 1
-        with patch("builtins.input", side_effect=["y", "a", "y"]):
+        with patch("builtins.input", side_effect=["a", "y"]):
             self.assertEqual(MODULE.run_uninstall("Example"), 1)
         remove_paths.assert_not_called()
         self.assertIn("--delete-data", run.call_args.args[0])
@@ -1128,9 +1128,40 @@ class UninstallTests(unittest.TestCase):
     def test_user_can_choose_individual_cleanup_paths(self):
         paths = [Path("/tmp/first"), Path("/tmp/second")]
         with patch("builtins.input", return_value="2"):
+            cleanup_kinds, selected_paths = MODULE.ask_cleanup([], paths)
+        self.assertEqual(cleanup_kinds, set())
+        self.assertEqual(selected_paths, [paths[1]])
+
+    def test_managed_and_detected_data_share_one_numbered_prompt(self):
+        selected = [
+            MODULE.Match(
+                "Flatpak", "org.freecad.FreeCAD", "FreeCAD", scope="system"),
+        ]
+        paths = [
+            Path("/home/test/.cache/FreeCAD"),
+            Path("/home/test/.config/FreeCAD"),
+        ]
+        output = io.StringIO()
+        with redirect_stdout(output), \
+                patch("builtins.input", return_value="1,3"):
+            cleanup_kinds, selected_paths = MODULE.ask_cleanup(selected, paths)
+        self.assertEqual(cleanup_kinds, {"Flatpak"})
+        self.assertEqual(selected_paths, [paths[1]])
+        rendered = output.getvalue()
+        self.assertIn("Remove associated data too? (optional)", rendered)
+        self.assertIn("[Flatpak] Sandbox data and permissions", rendered)
+        self.assertIn("[Detected] /home/test/.cache/FreeCAD", rendered)
+        self.assertIn("Flatpak data is manager-owned.", rendered)
+        self.assertIn("not guaranteed to belong to this app", rendered)
+
+    def test_cleanup_summary_uses_recursive_removal_for_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "FreeCAD"
+            path.mkdir()
+            (path / "settings").touch()
             self.assertEqual(
-                MODULE.choose_cleanup_paths(paths),
-                [paths[1]],
+                MODULE.cleanup_display_command(path),
+                ["rm", "-r", "--", str(path)],
             )
 
     def test_manager_cleanup_choices_are_independent(self):
@@ -1139,7 +1170,7 @@ class UninstallTests(unittest.TestCase):
                 "Flatpak", "org.example.App", "Example", scope="user"),
             MODULE.Match("APT", "example", "example"),
         ]
-        with patch("builtins.input", side_effect=["y", "n"]):
+        with patch("builtins.input", return_value="1"):
             cleanup_kinds, paths = MODULE.ask_cleanup(selected, [])
         self.assertEqual(cleanup_kinds, {"Flatpak"})
         self.assertEqual(paths, [])
