@@ -4,17 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 
 @dataclass(frozen=True)
@@ -29,19 +31,51 @@ class Match:
 
 
 def norm(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+    decomposed = unicodedata.normalize("NFKD", value.casefold())
+    return "".join(
+        char for char in decomposed
+        if char.isalnum() and not unicodedata.combining(char)
+    )
+
+
+def display(value: object) -> str:
+    """Make untrusted package metadata safe to print to a terminal."""
+    text = str(value)
+    return "".join(
+        char if char.isprintable() and char not in "\x1b\x7f" else "?"
+        for char in text
+    )
+
+
+def path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
 
 
 def relevant(query: str, *values: str) -> bool:
     needle = norm(query)
-    return bool(needle) and any(needle in norm(value) for value in values)
+    if not needle:
+        return False
+    normalized = [norm(value) for value in values]
+    if len(needle) < 3:
+        return any(
+            needle == value or needle == norm(raw.rsplit(".", 1)[-1])
+            for raw, value in zip(values, normalized)
+        )
+    return any(needle in value for value in normalized)
 
 
 def capture(command: list[str]) -> str:
     try:
+        env = os.environ.copy()
+        env["LC_ALL"] = "C"
         result = subprocess.run(
-            command, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            timeout=20, check=False,
+            command, text=True, encoding="utf-8", errors="replace",
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=20, check=False, env=env,
         )
         return result.stdout if result.returncode == 0 else ""
     except (OSError, subprocess.TimeoutExpired):
@@ -49,6 +83,9 @@ def capture(command: list[str]) -> str:
 
 
 def rpm_manager() -> str:
+    if (Path("/run/ostree-booted").exists()
+            and shutil.which("rpm-ostree")):
+        return "RPM-OSTree"
     if shutil.which("dnf5") or shutil.which("dnf"):
         return "DNF"
     if shutil.which("yum"):
@@ -87,12 +124,16 @@ def detect_snap(query: str) -> list[Match]:
 def detect_dpkg(query: str) -> list[Match]:
     if not shutil.which("dpkg-query"):
         return []
-    fmt = "${binary:Package}\\t${Version}\\t${binary:Summary}\\n"
+    fmt = "${db:Status-Abbrev}\\t${binary:Package}\\t${Version}\\t${binary:Summary}\\n"
     found: list[Match] = []
     for line in capture(["dpkg-query", "-W", "-f=" + fmt]).splitlines():
-        fields = line.split("\t", 2)
-        if len(fields) >= 2 and relevant(query, fields[0], fields[2] if len(fields) > 2 else ""):
-            found.append(Match("APT", fields[0], fields[0], fields[1], "system"))
+        fields = line.split("\t", 3)
+        installed = fields and len(fields[0]) > 1 and fields[0][1] == "i"
+        if (installed and len(fields) >= 3
+                and relevant(query, fields[1],
+                             fields[3] if len(fields) > 3 else "")):
+            found.append(Match("APT", fields[1], fields[1],
+                               fields[2], "system"))
     return found
 
 
@@ -123,6 +164,166 @@ def detect_pacman(query: str) -> list[Match]:
     return found
 
 
+def detect_homebrew(query: str) -> list[Match]:
+    if not shutil.which("brew"):
+        return []
+    found: list[Match] = []
+    for kind, option in (("Homebrew", "--formula"), ("Homebrew Cask", "--cask")):
+        for line in capture(["brew", "list", option, "--versions"]).splitlines():
+            fields = line.split()
+            if fields and relevant(query, fields[0]):
+                found.append(Match(kind, fields[0], fields[0],
+                                   " ".join(fields[1:]), "user"))
+    return found
+
+
+def detect_pipx(query: str) -> list[Match]:
+    if not shutil.which("pipx"):
+        return []
+    found: list[Match] = []
+    for scope, extra in (("user", []), ("system", ["--global"])):
+        command = ["pipx", "list", "--short"] + extra
+        for line in capture(command).splitlines():
+            fields = line.split()
+            if fields and relevant(query, fields[0]):
+                found.append(Match("Pipx", fields[0], fields[0],
+                                   fields[1] if len(fields) > 1 else "", scope))
+    return found
+
+
+def detect_npm(query: str) -> list[Match]:
+    if not shutil.which("npm"):
+        return []
+    prefix = capture(["npm", "prefix", "--global"]).strip()
+    try:
+        payload = json.loads(capture(["npm", "list", "--global", "--depth=0", "--json"]))
+    except (json.JSONDecodeError, TypeError):
+        return []
+    dependencies = payload.get("dependencies", {}) if isinstance(payload, dict) else {}
+    scope = ("user" if prefix
+             and path_is_within(Path(prefix).expanduser(), Path.home())
+             else "system")
+    found: list[Match] = []
+    for name, metadata in dependencies.items():
+        if relevant(query, name):
+            version = metadata.get("version", "") if isinstance(metadata, dict) else ""
+            found.append(Match("NPM", name, name, version, scope))
+    return found
+
+
+def detect_cargo(query: str) -> list[Match]:
+    if not shutil.which("cargo"):
+        return []
+    found: list[Match] = []
+    crate = ""
+    version = ""
+    binaries: list[str] = []
+
+    def add_crate() -> None:
+        if crate and (relevant(query, crate) or any(relevant(query, item) for item in binaries)):
+            command_path = shutil.which(query) if query in binaries else ""
+            cargo_root = Path(
+                os.environ.get("CARGO_INSTALL_ROOT")
+                or os.environ.get("CARGO_HOME")
+                or Path.home() / ".cargo"
+            ).expanduser()
+            if (command_path and
+                    Path(command_path).resolve().parent != (cargo_root / "bin").resolve()):
+                command_path = ""
+            found.append(Match("Cargo", crate, crate, version, "user",
+                               provides=command_path or ""))
+
+    for line in capture(["cargo", "install", "--list"]).splitlines():
+        if line and not line[0].isspace() and line.endswith(":"):
+            add_crate()
+            header = line[:-1].rsplit(maxsplit=1)
+            crate = header[0]
+            version = header[1].lstrip("v") if len(header) > 1 else ""
+            binaries = []
+        elif crate and line.strip():
+            binaries.append(line.strip())
+    add_crate()
+    return found
+
+
+def parse_nix_profile(text: str) -> list[tuple[str, list[str]]]:
+    entries: list[tuple[str, list[str]]] = []
+    for block in text.split("\n\n"):
+        fields: dict[str, str] = {}
+        for line in block.splitlines():
+            key, separator, value = line.partition(":")
+            if separator:
+                fields[key.strip()] = value.strip()
+        ident = fields.get("Name") or fields.get("Index")
+        stores = fields.get("Store paths", "").split()
+        if ident and stores:
+            entries.append((ident, stores))
+    return entries
+
+
+def detect_nix(query: str) -> list[Match]:
+    if not shutil.which("nix"):
+        return []
+    executable = shutil.which(query) if Path(query).name == query else None
+    resolved = str(Path(executable).resolve()) if executable else ""
+    found: list[Match] = []
+    for ident, stores in parse_nix_profile(capture(["nix", "profile", "list"])):
+        owns_command = bool(resolved) and any(
+            resolved == store or resolved.startswith(store.rstrip("/") + "/")
+            for store in stores
+        )
+        if relevant(query, ident) or owns_command:
+            found.append(Match("Nix", ident, ident, "", "user",
+                               provides=str(Path(executable).absolute())
+                               if owns_command and executable else ""))
+    return found
+
+
+def path_after(parts: tuple[str, ...], marker: str) -> list[str]:
+    try:
+        index = parts.index(marker)
+    except ValueError:
+        return []
+    return list(parts[index + 1:])
+
+
+def snap_command_owner(query: str, visible: Path) -> list[Match]:
+    snap_roots = (Path("/snap/bin"), Path("/var/lib/snapd/snap/bin"))
+    if not any(visible.parent == root for root in snap_roots) or not shutil.which("snap"):
+        return []
+    package = visible.name.split(".", 1)[0]
+    for line in capture(["snap", "aliases"]).splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 2 and fields[1] == visible.name:
+            package = fields[0].split(".", 1)[0]
+            break
+    for line in capture(["snap", "list", package]).splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 2 and fields[0] == package:
+            return [Match("Snap", package, package, fields[1], "system",
+                          provides=str(visible))]
+    return []
+
+
+def flatpak_command_owner(visible: Path) -> list[Match]:
+    path_text = str(visible)
+    if "/flatpak/exports/bin/" not in path_text or not shutil.which("flatpak"):
+        return []
+    app_id = visible.name
+    found: list[Match] = []
+    for scope in ("user", "system"):
+        text = capture(["flatpak", "list", "--app", f"--{scope}",
+                        "--columns=application,name,version"])
+        for line in text.splitlines():
+            fields = line.split("\t")
+            if fields and fields[0] == app_id:
+                found.append(Match("Flatpak", app_id,
+                                   fields[1] if len(fields) > 1 else app_id,
+                                   fields[2] if len(fields) > 2 else "", scope,
+                                   provides=str(visible)))
+    return found
+
+
 def detect_executable_owner(query: str) -> list[Match]:
     """Find the package owning a command, or identify a standalone command."""
     if not query or Path(query).name != query:
@@ -130,49 +331,108 @@ def detect_executable_owner(query: str) -> list[Match]:
     executable = shutil.which(query)
     if not executable:
         return []
-    path = str(Path(executable).resolve())
+    visible = Path(executable).absolute()
+    resolved = Path(executable).resolve()
+    path = str(resolved)
     found: list[Match] = []
+
+    managed = snap_command_owner(query, visible) or flatpak_command_owner(visible)
+    if managed:
+        return managed
+    if (visible.parent in {Path("/snap/bin"), Path("/var/lib/snapd/snap/bin")}
+            or "/flatpak/exports/bin/" in str(visible)):
+        return []
+
+    if visible.name.casefold().endswith(".appimage"):
+        scope = "user" if path_is_within(visible, Path.home()) else "system"
+        return [Match("AppImage", str(visible), visible.stem, "", scope, visible)]
+
+    brew_parts = path_after(resolved.parts, "Cellar")
+    brew_cellar = capture(["brew", "--cellar"]).strip() if shutil.which("brew") else ""
+    in_brew_cellar = bool(
+        brew_cellar and path_is_within(resolved, Path(brew_cellar).resolve())
+    )
+    if brew_parts and in_brew_cellar:
+        formula = brew_parts[0]
+        details = capture(["brew", "list", "--formula", "--versions", formula]).strip()
+        if details:
+            fields = details.split()
+            return [Match("Homebrew", formula, formula, " ".join(fields[1:]),
+                          "user", provides=str(visible))]
+
+    pipx_parts = path_after(resolved.parts, "venvs")
+    if pipx_parts and "/pipx/venvs/" in path and shutil.which("pipx"):
+        scope = "user" if path_is_within(visible, Path.home()) else "system"
+        return [Match("Pipx", pipx_parts[0], pipx_parts[0], "", scope,
+                      provides=str(visible))]
+
+    node_parts = path_after(resolved.parts, "node_modules")
+    npm_prefix = capture(["npm", "prefix", "--global"]).strip() if shutil.which("npm") else ""
+    npm_prefix_path = Path(npm_prefix).resolve() if npm_prefix else None
+    npm_exposed = bool(
+        npm_prefix_path and visible.parent.resolve() == npm_prefix_path / "bin"
+    )
+    if node_parts and npm_exposed:
+        package = ("/".join(node_parts[:2]) if node_parts[0].startswith("@")
+                   and len(node_parts) > 1 else node_parts[0])
+        scope = "user" if path_is_within(visible, Path.home()) else "system"
+        return [Match("NPM", package, package, "", scope,
+                      provides=str(visible))]
 
     kind = rpm_manager()
     if kind and shutil.which("rpm"):
         fmt = "%{NAME}\\t%{VERSION}-%{RELEASE}\\n"
-        for line in capture(["rpm", "-qf", "--qf", fmt, path]).splitlines():
-            fields = line.split("\t", 1)
-            if fields and fields[0]:
-                found.append(Match(kind, fields[0], fields[0],
-                                   fields[1] if len(fields) > 1 else "",
-                                   "system", provides=path))
+        for owner_path in dict.fromkeys((path, str(visible))):
+            for line in capture(["rpm", "-qf", "--qf", fmt, owner_path]).splitlines():
+                fields = line.split("\t", 1)
+                if fields and fields[0]:
+                    found.append(Match(kind, fields[0], fields[0],
+                                       fields[1] if len(fields) > 1 else "",
+                                       "system", provides=str(visible)))
 
     if shutil.which("dpkg-query"):
-        owners = capture(["dpkg-query", "-S", path])
-        fmt = "${binary:Package}\\t${Version}\\n"
-        for owner_line in owners.splitlines():
-            owner = owner_line.split(":", 1)[0].strip()
-            if not owner:
-                continue
-            details = capture(["dpkg-query", "-W", "-f=" + fmt, owner]).strip()
-            fields = details.split("\t", 1)
-            if fields and fields[0]:
-                found.append(Match("APT", fields[0], fields[0],
-                                   fields[1] if len(fields) > 1 else "",
-                                   "system", provides=path))
+        fmt = "${db:Status-Abbrev}\\t${binary:Package}\\t${Version}\\n"
+        for owner_path in dict.fromkeys((path, str(visible))):
+            for owner_line in capture(["dpkg-query", "-S", owner_path]).splitlines():
+                owner, separator, _owned_path = owner_line.rpartition(": ")
+                if not separator or not owner:
+                    continue
+                details = capture(["dpkg-query", "-W", "-f=" + fmt, owner]).strip()
+                fields = details.split("\t", 2)
+                installed = fields and len(fields[0]) > 1 and fields[0][1] == "i"
+                if installed and len(fields) >= 2:
+                    found.append(Match("APT", fields[1], fields[1],
+                                       fields[2] if len(fields) > 2 else "",
+                                       "system", provides=str(visible)))
 
     if shutil.which("pacman"):
-        for owner in capture(["pacman", "-Qoq", path]).splitlines():
-            fields = capture(["pacman", "-Q", owner.strip()]).strip().rsplit(maxsplit=1)
-            if fields:
-                found.append(Match("Pacman", fields[0], fields[0],
-                                   fields[1] if len(fields) > 1 else "",
-                                   "system", provides=path))
+        for owner_path in dict.fromkeys((path, str(visible))):
+            for owner in capture(["pacman", "-Qoq", owner_path]).splitlines():
+                fields = capture(["pacman", "-Q", owner.strip()]).strip().rsplit(maxsplit=1)
+                if fields:
+                    found.append(Match("Pacman", fields[0], fields[0],
+                                       fields[1] if len(fields) > 1 else "",
+                                       "system", provides=str(visible)))
     if not found:
-        visible_path = Path(executable).absolute()
-        scope = "user" if visible_path.is_relative_to(Path.home()) else "system"
-        found.append(Match("Standalone", str(visible_path), query, "",
-                           scope, path=visible_path))
+        protected_markers = (
+            "/nix/store/", "/node_modules/", "/pipx/venvs/",
+            "/flatpak/", "/snap/", "/Cellar/",
+        )
+        if any(marker in path for marker in protected_markers):
+            return []
+        scope = "user" if path_is_within(visible, Path.home()) else "system"
+        found.append(Match("Standalone", str(visible), query, "",
+                           scope, path=visible))
     return found
 
 
 def detect_appimages(query: str) -> list[Match]:
+    explicit = Path(query).expanduser()
+    if ("/" in query and explicit.is_file()
+            and explicit.name.casefold().endswith(".appimage")):
+        path = explicit.absolute()
+        scope = "user" if path_is_within(path, Path.home()) else "system"
+        return [Match("AppImage", str(path), path.stem, "", scope, path)]
     roots = [
         Path.home() / "Applications", Path.home() / ".local/bin",
         Path.home() / "Downloads", Path.home() / "Desktop",
@@ -195,7 +455,7 @@ def detect_appimages(query: str) -> list[Match]:
                             and path not in seen):
                         seen.add(path)
                         found.append(Match("AppImage", str(path), path.stem, "",
-                                           "user" if path.is_relative_to(Path.home()) else "system", path))
+                                           "user" if path_is_within(path, Path.home()) else "system", path))
         except OSError:
             continue
     return found
@@ -203,7 +463,8 @@ def detect_appimages(query: str) -> list[Match]:
 
 DETECTORS: tuple[Callable[[str], list[Match]], ...] = (
     detect_flatpak, detect_snap, detect_dpkg, detect_rpm, detect_pacman,
-    detect_appimages, detect_executable_owner,
+    detect_homebrew, detect_pipx, detect_npm, detect_cargo, detect_nix, detect_appimages,
+    detect_executable_owner,
 )
 
 
@@ -232,14 +493,22 @@ def find_matches(query: str) -> list[Match]:
         matches.extend(detector(query))
     unique = {(m.kind, m.ident, m.scope): m for m in matches}
     results = list(unique.values())
-    commands = [
+    command_candidates = [
         item for item in results
         if item.provides or item.kind == "Standalone"
     ]
-    if commands:
+    if command_candidates:
+        managed_paths = {
+            item.provides for item in command_candidates
+            if item.kind != "Standalone" and item.provides
+        }
+        commands = [
+            item for item in command_candidates
+            if item.kind != "Standalone" or str(item.path) not in managed_paths
+        ]
         results = commands + [
             item for item in results
-            if item not in commands and exact_app_match(item, query)
+            if item not in command_candidates and exact_app_match(item, query)
         ]
     return sorted(results, key=lambda item: score(item, query))
 
@@ -247,27 +516,31 @@ def find_matches(query: str) -> list[Match]:
 def choose(matches: list[Match]) -> list[Match]:
     print(f"\nFound {len(matches)} likely installed option{'s' if len(matches) != 1 else ''}:\n")
     for index, item in enumerate(matches, 1):
-        details = " · ".join(value for value in (item.version, item.scope) if value)
-        print(f"  {index:>2}. {item.name}  [{item.kind}]{'  ' + details if details else ''}")
+        details = " · ".join(display(value) for value in (item.version, item.scope) if value)
+        print(f"  {index:>2}. {display(item.name)}  [{display(item.kind)}]"
+              f"{'  ' + details if details else ''}")
         if item.ident != item.name:
-            print(f"      {item.ident}")
+            print(f"      {display(item.ident)}")
         if item.provides:
-            print(f"      provides command: {item.provides}")
+            print(f"      provides command: {display(item.provides)}")
+        if item.kind == "Standalone":
+            print("      note: only this executable can be identified automatically")
     print("\nChoose numbers separated by commas, “a” for all, or Enter to cancel.")
-    raw = input("> ").strip().casefold()
-    if not raw:
-        return []
-    if raw in {"a", "all"}:
-        return matches
-    try:
-        indexes = {int(part.strip()) for part in raw.split(",")}
-    except ValueError:
-        print("That selection was not understood.", file=sys.stderr)
-        return []
-    if not indexes or min(indexes) < 1 or max(indexes) > len(matches):
-        print("Selection is out of range.", file=sys.stderr)
-        return []
-    return [item for index, item in enumerate(matches, 1) if index in indexes]
+    while True:
+        raw = input("> ").strip().casefold()
+        if not raw:
+            return []
+        if raw in {"a", "all"}:
+            return matches
+        try:
+            indexes = {int(part.strip()) for part in raw.split(",")}
+        except ValueError:
+            print("That selection was not understood; try again.", file=sys.stderr)
+            continue
+        if not indexes or min(indexes) < 1 or max(indexes) > len(matches):
+            print("Selection is out of range; try again.", file=sys.stderr)
+            continue
+        return [item for index, item in enumerate(matches, 1) if index in indexes]
 
 
 def data_keys(selected: Iterable[Match]) -> set[str]:
@@ -281,15 +554,36 @@ def data_keys(selected: Iterable[Match]) -> set[str]:
             tail = norm(value.rsplit(".", 1)[-1])
             if len(tail) >= 3:
                 keys.add(tail)
+            versionless = norm(re.sub(
+                r"[-_. ]v?\d+(?:[-_.]\d+)*.*$", "", value,
+                flags=re.IGNORECASE,
+            ))
+            if len(versionless) >= 3:
+                keys.add(versionless)
     return keys
+
+
+def xdg_dir(variable: str, fallback: Path) -> Path:
+    configured = os.environ.get(variable)
+    if not configured:
+        return fallback
+    path = Path(configured).expanduser()
+    return path if path.is_absolute() else fallback
+
+
+def user_data_roots() -> list[Path]:
+    home = Path.home()
+    return [
+        xdg_dir("XDG_CONFIG_HOME", home / ".config"),
+        xdg_dir("XDG_CACHE_HOME", home / ".cache"),
+        xdg_dir("XDG_DATA_HOME", home / ".local/share"),
+        xdg_dir("XDG_STATE_HOME", home / ".local/state"),
+    ]
 
 
 def find_user_data(selected: list[Match]) -> list[Path]:
     keys = data_keys(selected)
-    roots = [
-        Path.home() / ".config", Path.home() / ".cache",
-        Path.home() / ".local/share", Path.home() / ".local/state",
-    ]
+    roots = user_data_roots()
     paths: set[Path] = set()
     for root in roots:
         if not root.is_dir():
@@ -306,14 +600,50 @@ def find_user_data(selected: list[Match]) -> list[Path]:
             candidate = Path.home() / "snap" / item.ident
             if candidate.exists():
                 paths.add(candidate)
+    data_home = xdg_dir("XDG_DATA_HOME", Path.home() / ".local/share")
+    applications = data_home / "applications"
+    if applications.is_dir():
+        selected_files = {
+            str(item.path) for item in selected
+            if item.path and item.kind in {"AppImage", "Standalone"}
+        }
+        try:
+            for desktop_file in applications.glob("*.desktop"):
+                matches_name = norm(desktop_file.stem) in keys
+                references_file = False
+                if selected_files:
+                    try:
+                        if desktop_file.stat().st_size <= 1024 * 1024:
+                            content = desktop_file.read_text(
+                                encoding="utf-8", errors="replace")
+                            references_file = any(
+                                target in content for target in selected_files)
+                    except OSError:
+                        pass
+                if matches_name or references_file:
+                    paths.add(desktop_file)
+        except OSError:
+            pass
+    icons = data_home / "icons"
+    if icons.is_dir():
+        try:
+            for icon in icons.glob("hicolor/*/apps/*"):
+                if icon.is_file() and norm(icon.stem) in keys:
+                    paths.add(icon)
+        except OSError:
+            pass
     return sorted(paths)
 
 
 def privileged(command: list[str]) -> list[str]:
     if os.geteuid() == 0:
         return command
-    sudo = shutil.which("sudo")
-    return ([sudo] if sudo else ["sudo"]) + command
+    for helper in ("sudo", "doas"):
+        if shutil.which(helper):
+            return [helper] + command
+    raise RuntimeError(
+        f"{command[0]} needs administrator privileges, but neither sudo nor doas is installed"
+    )
 
 
 def uninstall_command(item: Match, remove_data: bool) -> list[str]:
@@ -333,12 +663,32 @@ def uninstall_command(item: Match, remove_data: bool) -> list[str]:
     if item.kind == "DNF":
         manager = "dnf5" if shutil.which("dnf5") else "dnf"
         return privileged([manager, "remove", item.ident])
+    if item.kind == "RPM-OSTree":
+        return privileged(["rpm-ostree", "uninstall", item.ident])
     if item.kind == "Zypper":
         return privileged(["zypper", "remove", item.ident])
     if item.kind == "YUM":
         return privileged(["yum", "remove", item.ident])
     if item.kind == "Pacman":
         return privileged(["pacman", "-R", item.ident])
+    if item.kind in {"Homebrew", "Homebrew Cask"}:
+        command = ["brew", "uninstall"]
+        if item.kind == "Homebrew Cask":
+            command.append("--cask")
+        return command + [item.ident]
+    if item.kind == "Cargo":
+        return ["cargo", "uninstall", item.ident]
+    if item.kind == "Pipx":
+        command = ["pipx", "uninstall"]
+        if item.scope == "system":
+            command.append("--global")
+            return privileged(command + [item.ident])
+        return command + [item.ident]
+    if item.kind == "NPM":
+        command = ["npm", "uninstall", "--global", item.ident]
+        return command if item.scope == "user" else privileged(command)
+    if item.kind == "Nix":
+        return ["nix", "profile", "remove", item.ident]
     if item.kind == "AppImage" and item.path:
         command = ["rm", "--", str(item.path)]
         return command if os.access(item.path.parent, os.W_OK) else privileged(command)
@@ -355,27 +705,51 @@ def yes(prompt: str) -> bool:
         return False
 
 
+def preflight_file(item: Match) -> str | None:
+    if item.kind not in {"AppImage", "Standalone"} or not item.path:
+        return None
+    path = item.path
+    if not path.is_absolute():
+        return "target path is not absolute"
+    if not path.exists() and not path.is_symlink():
+        return "target no longer exists"
+    if path.is_dir() and not path.is_symlink():
+        return "target unexpectedly became a directory"
+    if item.kind == "Standalone":
+        current = shutil.which(item.name)
+        if not current or Path(current).absolute() != path:
+            return "the command resolved to a different path since it was selected"
+    return None
+
+
 def remove_paths(paths: list[Path]) -> bool:
     ok = True
-    home = Path.home().resolve()
+    allowed_roots = [root.resolve() for root in user_data_roots()]
+    allowed_roots.append((Path.home() / "snap").resolve())
     for path in paths:
         try:
             resolved_parent = path.parent.resolve()
-            if resolved_parent != home and home not in resolved_parent.parents:
-                raise ValueError("path is outside your home directory")
+            if not any(
+                resolved_parent == root or root in resolved_parent.parents
+                for root in allowed_roots
+            ):
+                raise ValueError("path is outside the approved app-data locations")
             if path.is_symlink() or path.is_file():
                 path.unlink()
             elif path.is_dir():
                 shutil.rmtree(path)
-            print(f"  Removed {path}")
+            else:
+                print(f"  Already removed {display(path)}")
+                continue
+            print(f"  Removed {display(path)}")
         except (OSError, ValueError) as error:
             ok = False
-            print(f"  Could not remove {path}: {error}", file=sys.stderr)
+            print(f"  Could not remove {display(path)}: {display(error)}", file=sys.stderr)
     return ok
 
 
 def run_uninstall(query: str) -> int:
-    print(f"Searching installed apps for “{query}”…")
+    print(f"Searching installed apps for “{display(query)}”…")
     matches = find_matches(query)
     if not matches:
         print("No likely installed apps found.")
@@ -389,20 +763,33 @@ def run_uninstall(query: str) -> int:
         print("Nothing selected.")
         return 0
 
+    for item in selected:
+        error = preflight_file(item)
+        if error:
+            print(f"Cannot safely remove {display(item.name)}: {error}.",
+                  file=sys.stderr)
+            return 1
+
     paths = find_user_data(selected)
     remove_data = False
     if paths or any(item.kind in {"Flatpak", "Snap", "APT"} for item in selected):
         print("\nAlso remove app data and saved configuration?")
         if paths:
             for path in paths:
-                print(f"  {path}")
+                print(f"  {display(path)}")
+        if any(item.kind == "APT" for item in selected):
+            print("  APT will also purge package-managed system configuration.")
         print("This cannot be undone.")
         remove_data = yes("Remove app data? [y/N] ")
 
-    commands = [uninstall_command(item, remove_data) for item in selected]
+    try:
+        commands = [uninstall_command(item, remove_data) for item in selected]
+    except RuntimeError as error:
+        print(display(error) + ".", file=sys.stderr)
+        return 1
     print("\nReady to run:")
     for command in commands:
-        print("  " + shlex.join(command))
+        print("  " + display(shlex.join(command)))
     if remove_data and paths:
         print(f"  and remove {len(paths)} user-data path{'s' if len(paths) != 1 else ''}")
     if not yes("\nContinue? [y/N] "):
@@ -411,11 +798,11 @@ def run_uninstall(query: str) -> int:
 
     failed = False
     for item, command in zip(selected, commands):
-        print(f"\nRemoving {item.name} ({item.kind})…")
+        print(f"\nRemoving {display(item.name)} ({display(item.kind)})…")
         try:
             result = subprocess.run(command, check=False)
         except OSError as error:
-            print(f"Could not run {command[0]}: {error}", file=sys.stderr)
+            print(f"Could not run {display(command[0])}: {display(error)}", file=sys.stderr)
             failed = True
             continue
         if result.returncode:
@@ -436,14 +823,18 @@ def self_uninstall() -> int:
     if not target.is_file():
         print("Cannot locate the installed executable.", file=sys.stderr)
         return 1
-    print(f"This will remove uninstall itself:\n  {target}")
+    print(f"This will remove uninstall itself:\n  {display(target)}")
     if not yes("Continue? [y/N] "):
         print("Cancelled.")
         return 0
     command = ["rm", "--", str(target)]
-    if not os.access(target.parent, os.W_OK):
-        command = privileged(command)
-    return subprocess.run(command, check=False).returncode
+    try:
+        if not os.access(target.parent, os.W_OK):
+            command = privileged(command)
+        return subprocess.run(command, check=False).returncode
+    except (OSError, RuntimeError) as error:
+        print(f"Could not remove uninstall: {display(error)}", file=sys.stderr)
+        return 1
 
 
 def main() -> int:
@@ -456,6 +847,10 @@ def main() -> int:
                         help="remove this command from the system")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     args = parser.parse_args()
+    if os.geteuid() == 0 and os.environ.get("SUDO_USER") not in {None, "", "root"}:
+        print("Run uninstall without sudo; it requests privilege only when needed.",
+              file=sys.stderr)
+        return 2
     if args.self_uninstall:
         return self_uninstall()
     if not args.app:
@@ -467,4 +862,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        raise SystemExit(130)

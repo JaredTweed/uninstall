@@ -17,17 +17,28 @@ Choose numbers separated by commas, “a” for all, or Enter to cancel.
 > 1
 ```
 
-It searches Flatpak, Snap, APT/dpkg, DNF/YUM/RPM, Zypper/RPM, Pacman, and
-common AppImage locations. You choose the exact result, decide separately
-whether its data should go too, see the command that will run, and confirm once
-more. If a command has a different package name—such as `aafire` from
-`aalib`—it asks the system package database which package owns the executable.
-If no package owns it, `uninstall` offers to remove the exact standalone
-executable from your `PATH` instead of suggesting loosely related packages.
+It searches:
+
+- Flatpak, Snap, and AppImage
+- APT/dpkg, DNF/YUM/RPM, rpm-ostree, Zypper/RPM, and Pacman
+- Homebrew, Nix profiles, Cargo, pipx, and global npm packages
+- standalone executables on `PATH`
+
+You choose the exact result, decide separately whether its data should go too,
+see the command that will run, and confirm once more. If a command has a
+different package name—such as `aafire` from `aalib`—it asks the system package
+database which package owns the executable. Manager shims, aliases, symlinks,
+and alternatives are resolved before falling back to standalone removal.
+
+If no manager owns a command, `uninstall` can remove its exact executable from
+`PATH`. It labels this as `Standalone` because files installed alongside that
+executable cannot always be inferred safely.
 
 ## Install
 
-Python 3 and `curl` are the only requirements.
+The installer checks for Python 3.8+, `curl`, and the standard system utilities it
+needs before changing anything. It downloads to a temporary file, verifies the
+CLI can start, and only then installs it.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/JaredTweed/uninstall/main/install.sh | sh
@@ -54,11 +65,20 @@ uninstall uninstall
 uninstall --self-uninstall
 ```
 
-Matching is case-insensitive. Nothing is removed during search, and pressing
-Enter at either prompt cancels. APT's app-data option uses `purge` for packaged
-configuration; Flatpak uses `--delete-data`; Snap uses `--purge`. Exact matching
-directories under `~/.config`, `~/.cache`, `~/.local/share`, and
-`~/.local/state` are shown before deletion.
+Matching is Unicode-aware and case-insensitive. Very short searches require an
+exact match so queries such as `rg` do not produce hundreds of unrelated
+results. Nothing is removed during search, invalid selections can be retried,
+and pressing Enter at a prompt cancels.
+
+APT's app-data option uses `purge` for packaged configuration; Flatpak uses
+`--delete-data`; Snap uses `--purge`. Exact matching directories under the XDG
+config, cache, data, and state locations are shown before deletion. Data is
+kept if any uninstall command fails.
+
+Do not run the whole program with `sudo`; `uninstall` invokes `sudo` or `doas`
+itself only for selected system-wide operations. Shell built-ins and shell
+functions are not installed executables and therefore cannot be removed by
+this tool.
 
 ## Install from a fork
 
