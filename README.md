@@ -21,6 +21,8 @@ It searches:
 
 - Flatpak, Snap, AppImage, and AppImages managed by Gear Lever
 - APT/dpkg, DNF/YUM/RPM, rpm-ostree, Zypper/RPM, and Pacman
+- local `.rpm`, `.deb`, and Arch `.pkg.tar.*` archives that correspond to
+  installed packages
 - Homebrew, Nix profiles, Cargo, pipx, and global npm packages
 - standalone executables on `PATH`
 
@@ -38,6 +40,22 @@ Gear Lever installations are discovered through its machine-readable installed
 app list, including custom AppImage folders. Removal is delegated back to Gear
 Lever so the AppImage, desktop entry, icon, and Gear Lever update metadata are
 handled together.
+
+Software originally installed from a downloaded package file is found through
+the system package database like any other package. You can also pass the
+archive itself:
+
+```sh
+uninstall ~/Downloads/example.rpm
+uninstall ./example.deb
+uninstall ./example.pkg.tar.zst
+```
+
+`uninstall` reads only the archive metadata, verifies that the same package and
+architecture are installed, and then uses the native package manager. If the
+archive is older than the installed package, both versions are shown. An
+unmatched archive is never mistaken for an installed app, and the downloaded
+archive itself is not deleted.
 
 ## Install
 
@@ -65,6 +83,7 @@ Make sure `$HOME/.local/bin` is on your `PATH`.
 ```sh
 uninstall FreeCAD
 uninstall org.freecad.FreeCAD
+uninstall ~/Downloads/example.rpm
 uninstall --why aalib-libs
 uninstall --plan wine
 uninstall --show-dependencies lib

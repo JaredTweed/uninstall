@@ -6,7 +6,7 @@ import tempfile
 import unittest
 import os
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 
 SCRIPT = Path(__file__).parents[1] / "uninstall"
@@ -149,6 +149,88 @@ class UninstallTests(unittest.TestCase):
                 "--remove", str(path), "--yes",
             ],
         )
+
+    @patch.object(MODULE.shutil, "which")
+    @patch.object(MODULE, "capture")
+    def test_rpm_archive_resolves_to_currently_installed_version(
+            self, capture, which):
+        which.side_effect = {
+            "rpm": "/usr/bin/rpm",
+            "dnf5": "/usr/bin/dnf5",
+        }.get
+        capture.side_effect = [
+            "example\t1.0-1\tx86_64\n",
+            "example\t2.0-3\tx86_64\n",
+        ]
+        with tempfile.NamedTemporaryFile(suffix=".rpm") as archive:
+            result = MODULE.detect_package_archive(archive.name)
+            archive_path = Path(archive.name).absolute()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].kind, "DNF")
+        self.assertEqual(result[0].ident, "example")
+        self.assertEqual(result[0].version, "2.0-3")
+        self.assertEqual(result[0].archive_version, "1.0-1")
+        self.assertEqual(result[0].archive, archive_path)
+        self.assertEqual(capture.call_args_list, [
+            call([
+                "rpm", "-qp", "--qf",
+                "%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{ARCH}\\n",
+                "--", str(archive_path),
+            ]),
+            call([
+                "rpm", "-q", "--qf",
+                "%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{ARCH}\\n",
+                "--", "example.x86_64",
+            ]),
+        ])
+
+    @patch.object(MODULE.shutil, "which")
+    @patch.object(MODULE, "capture")
+    def test_deb_archive_resolves_multiarch_installed_package(
+            self, capture, which):
+        which.side_effect = {
+            "dpkg-deb": "/usr/bin/dpkg-deb",
+            "dpkg-query": "/usr/bin/dpkg-query",
+        }.get
+        capture.side_effect = [
+            "example\t1.0-1\tamd64\n",
+            "ii \texample:amd64\t1.1-2\n",
+        ]
+        with tempfile.NamedTemporaryFile(suffix=".deb") as archive:
+            result = MODULE.detect_package_archive(archive.name)
+            archive_path = Path(archive.name).absolute()
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].kind, "APT")
+        self.assertEqual(result[0].ident, "example:amd64")
+        self.assertEqual(result[0].version, "1.1-2")
+        self.assertEqual(result[0].archive_version, "1.0-1")
+        self.assertEqual(capture.call_args_list, [
+            call([
+                "dpkg-deb", "--show",
+                "--showformat=${Package}\\t${Version}\\t${Architecture}\\n",
+                str(archive_path),
+            ]),
+            call([
+                "dpkg-query", "-W",
+                "-f=${db:Status-Abbrev}\\t${binary:Package}\\t${Version}\\n",
+                "example:amd64",
+            ]),
+        ])
+
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/pacman")
+    @patch.object(MODULE, "capture")
+    def test_arch_archive_resolves_installed_package(
+            self, capture, _which):
+        capture.side_effect = [
+            "example 1.0-1\n",
+            "example 1.1-1\n",
+        ]
+        with tempfile.NamedTemporaryFile(suffix=".pkg.tar.zst") as archive:
+            result = MODULE.detect_package_archive(archive.name)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].kind, "Pacman")
+        self.assertEqual(result[0].version, "1.1-1")
+        self.assertEqual(result[0].archive_version, "1.0-1")
 
     @patch.object(MODULE.shutil, "which", return_value="/usr/bin/dpkg-query")
     @patch.object(MODULE, "capture", return_value=(
@@ -327,6 +409,22 @@ class UninstallTests(unittest.TestCase):
         self.assertEqual(planned, ["target"])
         capture_any.assert_called_once_with(
             ["dnf5", "--assumeno", "remove", "target"])
+
+    @patch.object(MODULE, "capture_any", return_value=(0, ""))
+    def test_plain_rpm_fallback_uses_test_transaction(self, capture_any):
+        item = MODULE.Match("RPM", "target", "target")
+        planned, _orphans, available, _notes = (
+            MODULE.native_removal_preview([item]))
+        self.assertTrue(available)
+        self.assertEqual(planned, ["target"])
+        capture_any.assert_called_once_with(
+            ["rpm", "-e", "--test", "target"])
+        with patch.object(
+                MODULE, "privileged", side_effect=lambda command: command):
+            self.assertEqual(
+                MODULE.uninstall_command(item, False),
+                ["rpm", "-e", "target"],
+            )
 
     def test_core_packages_are_always_marked_protected(self):
         self.assertEqual(

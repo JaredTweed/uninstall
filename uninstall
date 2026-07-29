@@ -19,7 +19,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,8 @@ class Match:
     path: Path | None = None
     provides: str = ""
     role: str = "unknown"
+    archive: Path | None = None
+    archive_version: str = ""
 
 
 @dataclass
@@ -137,7 +139,7 @@ def rpm_manager() -> str:
         return "YUM"
     if shutil.which("zypper"):
         return "Zypper"
-    return ""
+    return "RPM" if shutil.which("rpm") else ""
 
 
 def detect_flatpak(query: str) -> list[Match]:
@@ -582,6 +584,93 @@ def detect_appimages(query: str) -> list[Match]:
     return found
 
 
+def detect_package_archive(query: str) -> list[Match]:
+    """Resolve a local package archive to the corresponding installed package."""
+    candidate = Path(query).expanduser()
+    if not candidate.is_file():
+        return []
+    archive = candidate.absolute()
+    lowered = archive.name.casefold()
+
+    if lowered.endswith(".rpm") and shutil.which("rpm"):
+        archive_format = "%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{ARCH}\\n"
+        fields = capture([
+            "rpm", "-qp", "--qf", archive_format, "--", str(archive),
+        ]).strip().split("\t")
+        if len(fields) != 3:
+            return []
+        name, archive_version, architecture = fields
+        installed_format = "%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{ARCH}\\n"
+        installed = capture([
+            "rpm", "-q", "--qf", installed_format,
+            "--", f"{name}.{architecture}",
+        ]).splitlines()
+        for line in installed:
+            installed_fields = line.split("\t")
+            if len(installed_fields) == 3 and installed_fields[0] == name:
+                return [Match(
+                    rpm_manager(), name, name, installed_fields[1], "system",
+                    archive=archive, archive_version=archive_version,
+                )]
+        return []
+
+    if lowered.endswith(".deb") and shutil.which("dpkg-deb"):
+        archive_format = (
+            "${Package}\\t${Version}\\t${Architecture}\\n"
+        )
+        fields = capture([
+            "dpkg-deb", "--show", "--showformat=" + archive_format,
+            str(archive),
+        ]).strip().split("\t")
+        if len(fields) != 3:
+            return []
+        name, archive_version, architecture = fields
+        installed_format = (
+            "${db:Status-Abbrev}\\t${binary:Package}\\t${Version}\\n"
+        )
+        identifiers = (
+            [f"{name}:{architecture}"]
+            if architecture not in {"", "all"} else [name]
+        )
+        for identifier in identifiers:
+            installed = capture([
+                "dpkg-query", "-W", "-f=" + installed_format, identifier,
+            ]).strip().split("\t")
+            is_installed = (
+                len(installed) == 3 and len(installed[0]) > 1
+                and installed[0][1] == "i"
+            )
+            if is_installed:
+                return [Match(
+                    "APT", installed[1], installed[1], installed[2], "system",
+                    archive=archive, archive_version=archive_version,
+                )]
+        return []
+
+    if (".pkg.tar." in lowered and shutil.which("pacman")):
+        archive_fields = capture(
+            ["pacman", "-Qp", str(archive)]).strip().rsplit(maxsplit=1)
+        if len(archive_fields) != 2:
+            return []
+        name, archive_version = archive_fields
+        installed_fields = capture(
+            ["pacman", "-Q", name]).strip().rsplit(maxsplit=1)
+        if len(installed_fields) == 2 and installed_fields[0] == name:
+            return [Match(
+                "Pacman", name, name, installed_fields[1], "system",
+                archive=archive, archive_version=archive_version,
+            )]
+    return []
+
+
+def is_package_archive_query(query: str) -> bool:
+    candidate = Path(query).expanduser()
+    lowered = candidate.name.casefold()
+    return candidate.is_file() and (
+        lowered.endswith((".rpm", ".deb")) or ".pkg.tar." in lowered
+    )
+
+
 DETECTORS: tuple[Callable[[str], list[Match]], ...] = (
     detect_flatpak, detect_snap, detect_dpkg, detect_rpm, detect_pacman,
     detect_homebrew, detect_gearlever, detect_pipx, detect_npm, detect_cargo,
@@ -592,7 +681,7 @@ DETECTORS: tuple[Callable[[str], list[Match]], ...] = (
 def score(match: Match, query: str) -> tuple[int, str, str]:
     needle = norm(query)
     values = (norm(match.ident), norm(match.name))
-    rank = (-1 if match.provides or match.kind == "Standalone"
+    rank = (-1 if match.provides or match.archive or match.kind == "Standalone"
             else 0 if needle in values
             else 1 if any(v.startswith(needle) for v in values) else 2)
     return rank, match.kind, match.name.casefold()
@@ -609,6 +698,9 @@ def exact_app_match(match: Match, query: str) -> bool:
 
 
 def find_matches(query: str) -> list[Match]:
+    archive_matches = detect_package_archive(query)
+    if archive_matches:
+        return sorted(archive_matches, key=lambda item: score(item, query))
     matches: list[Match] = []
     for detector in DETECTORS:
         matches.extend(detector(query))
@@ -732,7 +824,7 @@ def filter_dependency_matches(
     visible: list[Match] = []
     hidden = 0
     for item in matches:
-        forced = bool(item.provides) or exact_app_match(item, query)
+        forced = bool(item.provides or item.archive) or exact_app_match(item, query)
         if item.role == "dependency" and not forced:
             hidden += 1
         else:
@@ -933,7 +1025,8 @@ def dependency_report(item: Match) -> DependencyReport:
     reverse: dict[str, set[str]] = {}
     complete = False
     note = ""
-    if item.kind in {"DNF", "YUM", "Zypper", "RPM-OSTree"} and shutil.which("rpm"):
+    if item.kind in {
+            "DNF", "YUM", "Zypper", "RPM", "RPM-OSTree"} and shutil.which("rpm"):
         reverse, complete = rpm_reverse_graph()
         note = "RPM dependency metadata; weak dependencies may not appear."
     elif item.kind == "APT" and shutil.which("dpkg-query"):
@@ -968,7 +1061,7 @@ def dependency_report(item: Match) -> DependencyReport:
     explicit = explicit_names_for_kind(item.kind)
     paths, paths_complete = root_paths(target, reverse, explicit)
     if not explicit and item.kind in {
-            "APT", "DNF", "Pacman", "YUM", "Zypper", "RPM-OSTree"}:
+            "APT", "DNF", "Pacman", "YUM", "Zypper", "RPM", "RPM-OSTree"}:
         paths_complete = False
         note = (note + " Installation-reason metadata was unavailable.").strip()
     return DependencyReport(
@@ -1080,6 +1173,17 @@ def native_removal_preview(
             else:
                 available = False
                 notes.append("rpm-ostree did not provide a usable dry-run.")
+        elif kind == "RPM":
+            code, _output = capture_any(
+                ["rpm", "-e", "--test"] + identifiers)
+            if code == 0:
+                planned.extend(identifiers)
+            else:
+                available = False
+                notes.append(
+                    "RPM's test transaction rejected the removal, usually because "
+                    "another package requires the target."
+                )
         elif kind == "Snap":
             planned.extend(identifiers)
             available = False
@@ -1163,7 +1267,7 @@ def protection_reason(kind: str, name: str) -> str:
             return "Essential package"
         if len(details) > 1 and details[1].casefold() == "required":
             return "required-priority package"
-    if kind in {"DNF", "YUM", "RPM-OSTree"}:
+    if kind in {"DNF", "YUM", "RPM", "RPM-OSTree"}:
         for pattern in dnf_protected_patterns():
             if fnmatch.fnmatchcase(base, pattern):
                 return "protected/core RPM package"
@@ -1203,7 +1307,7 @@ def build_removal_plan(selected: list[Match]) -> RemovalPlan:
     has_dependents = any(
         report.direct_dependents or report.root_paths for report in reports)
     uncertain_kinds = {
-        "APT", "DNF", "YUM", "Zypper", "Pacman", "RPM-OSTree",
+        "APT", "DNF", "YUM", "Zypper", "RPM", "Pacman", "RPM-OSTree",
         "Homebrew", "Snap", "Standalone",
     }
     if (protected_items or has_dependents
@@ -1286,6 +1390,14 @@ def choose(matches: list[Match]) -> list[Match]:
             print(f"      {display(item.ident)}")
         if item.provides:
             print(f"      provides command: {display(item.provides)}")
+        if item.archive:
+            print(f"      matched package archive: {display(item.archive)}")
+            if (item.archive_version and item.version
+                    and item.archive_version != item.version):
+                print(
+                    f"      warning: archive version {display(item.archive_version)}; "
+                    f"installed version {display(item.version)}"
+                )
         if item.kind == "Standalone":
             print("      note: only this executable can be identified automatically")
     print("\nChoose numbers separated by commas, “a” for all, or Enter to cancel.")
@@ -1441,6 +1553,8 @@ def uninstall_command(item: Match, remove_data: bool) -> list[str]:
         return privileged(["zypper", "remove", item.ident])
     if item.kind == "YUM":
         return privileged(["yum", "remove", item.ident])
+    if item.kind == "RPM":
+        return privileged(["rpm", "-e", item.ident])
     if item.kind == "Pacman":
         return privileged(["pacman", "-R", item.ident])
     if item.kind in {"Homebrew", "Homebrew Cask"}:
@@ -1540,7 +1654,13 @@ def run_uninstall(
             "use --show-dependencies to include them."
         )
     if not matches:
-        print("No likely installed apps found.")
+        if is_package_archive_query(query):
+            print(
+                "No installed package matched this archive. "
+                "The downloaded archive itself was not removed."
+            )
+        else:
+            print("No likely installed apps found.")
         return 1
     try:
         selected = choose(matches)
