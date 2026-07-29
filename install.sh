@@ -1,15 +1,12 @@
 #!/bin/sh
 set -eu
 
-SOURCE_URL=${UNINSTALL_SOURCE_URL:-https://raw.githubusercontent.com/JaredTweed/uninstall/main/uninstall}
+RELEASE_VERSION=0.5.0
+SOURCE_URL=${UNINSTALL_SOURCE_URL:-https://raw.githubusercontent.com/JaredTweed/uninstall/v${RELEASE_VERSION}/uninstall}
 PREFIX=${PREFIX:-/usr/local}
 DESTINATION="$PREFIX/bin/uninstall"
 
-tmp_file=$(mktemp "${TMPDIR:-/tmp}/uninstall.XXXXXX")
-trap 'rm -f "$tmp_file"' EXIT HUP INT TERM
-
-printf '%s\n' "Downloading uninstall…"
-for required_command in curl python3 install mktemp sed; do
+for required_command in chmod curl dirname install mkdir mktemp python3 rm sed; do
     if ! command -v "$required_command" >/dev/null 2>&1; then
         printf '%s\n' "$required_command is required but was not found." >&2
         exit 1
@@ -19,6 +16,11 @@ if ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 8))'; then
     printf '%s\n' "Python 3.8 or newer is required." >&2
     exit 1
 fi
+
+tmp_file=$(mktemp "${TMPDIR:-/tmp}/uninstall.XXXXXX")
+trap 'rm -f "$tmp_file"' EXIT HUP INT TERM
+
+printf '%s\n' "Downloading uninstall ${RELEASE_VERSION}…"
 curl -fsSL "$SOURCE_URL" -o "$tmp_file"
 head_line=$(sed -n '1p' "$tmp_file")
 if [ "$head_line" != '#!/usr/bin/env python3' ]; then
@@ -33,8 +35,8 @@ fi
 
 destination_dir=$(dirname "$DESTINATION")
 if [ ! -d "$destination_dir" ]; then
-    if [ -w "$(dirname "$destination_dir")" ]; then
-        mkdir -p "$destination_dir"
+    if mkdir -p "$destination_dir" 2>/dev/null; then
+        :
     elif command -v sudo >/dev/null 2>&1; then
         sudo install -d -m 755 "$destination_dir"
     else

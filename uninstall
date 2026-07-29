@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -12,11 +13,13 @@ import shutil
 import subprocess
 import sys
 import unicodedata
-from dataclasses import dataclass
+from collections import defaultdict, deque
+from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 
 @dataclass(frozen=True)
@@ -28,6 +31,29 @@ class Match:
     scope: str = ""
     path: Path | None = None
     provides: str = ""
+    role: str = "unknown"
+
+
+@dataclass
+class DependencyReport:
+    target: Match
+    direct_dependents: list[str]
+    root_paths: list[list[str]]
+    complete: bool = True
+    note: str = ""
+
+
+@dataclass
+class RemovalPlan:
+    selected: list[Match]
+    reports: list[DependencyReport]
+    planned_removals: list[str]
+    additional_removals: list[str]
+    orphan_removals: list[str]
+    level: str
+    preview_available: bool
+    protected_items: list[str]
+    notes: list[str]
 
 
 def norm(value: str) -> str:
@@ -80,6 +106,25 @@ def capture(command: list[str]) -> str:
         return result.stdout if result.returncode == 0 else ""
     except (OSError, subprocess.TimeoutExpired):
         return ""
+
+
+def capture_any(command: list[str], timeout: int = 60) -> tuple[int, str]:
+    try:
+        env = os.environ.copy()
+        env["LC_ALL"] = "C"
+        result = subprocess.run(
+            command, text=True, encoding="utf-8", errors="replace",
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=timeout, check=False, env=env,
+        )
+        return result.returncode, result.stdout
+    except subprocess.TimeoutExpired as error:
+        output = error.stdout or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        return 124, output
+    except OSError as error:
+        return 127, str(error)
 
 
 def rpm_manager() -> str:
@@ -513,10 +558,630 @@ def find_matches(query: str) -> list[Match]:
     return sorted(results, key=lambda item: score(item, query))
 
 
+def package_base(name: str) -> str:
+    return name.split(":", 1)[0]
+
+
+def command_lines(command: list[str]) -> tuple[bool, set[str]]:
+    code, output = capture_any(command, timeout=30)
+    return code == 0, {
+        line.strip() for line in output.splitlines() if line.strip()
+    }
+
+
+def annotate_roles(matches: list[Match]) -> list[Match]:
+    by_kind: dict[str, list[Match]] = defaultdict(list)
+    for item in matches:
+        by_kind[item.kind].append(item)
+    roles: dict[tuple[str, str, str], str] = {}
+
+    if by_kind.get("APT") and shutil.which("apt-mark"):
+        ok, automatic = command_lines(["apt-mark", "showauto"])
+        if ok:
+            automatic_bases = {package_base(name) for name in automatic}
+            for item in by_kind["APT"]:
+                role = ("dependency" if package_base(item.ident) in automatic_bases
+                        else "explicit")
+                roles[(item.kind, item.ident, item.scope)] = role
+
+    rpm_kinds = {"DNF"}
+    present_rpm_kinds = rpm_kinds.intersection(by_kind)
+    if present_rpm_kinds:
+        manager = "dnf5" if shutil.which("dnf5") else "dnf"
+        if manager == "dnf5":
+            command = [
+                manager, "repoquery", "--userinstalled",
+                "--queryformat=%{name}\\n",
+            ]
+        else:
+            command = [
+                manager, "repoquery", "--installed", "--userinstalled",
+                "--qf", "%{name}\\n",
+            ]
+        ok, explicit = command_lines(command)
+        if ok:
+            for kind in present_rpm_kinds:
+                for item in by_kind[kind]:
+                    role = "explicit" if item.ident in explicit else "dependency"
+                    roles[(item.kind, item.ident, item.scope)] = role
+
+    if by_kind.get("Pacman") and shutil.which("pacman"):
+        ok, explicit = command_lines(["pacman", "-Qqe"])
+        if ok:
+            for item in by_kind["Pacman"]:
+                role = "explicit" if item.ident in explicit else "dependency"
+                roles[(item.kind, item.ident, item.scope)] = role
+
+    if by_kind.get("Homebrew") and shutil.which("brew"):
+        ok, explicit = command_lines([
+            "brew", "list", "--formula", "--installed-on-request",
+        ])
+        if ok:
+            for item in by_kind["Homebrew"]:
+                role = "explicit" if item.ident in explicit else "dependency"
+                roles[(item.kind, item.ident, item.scope)] = role
+
+    inherently_explicit = {
+        "Flatpak", "Homebrew Cask", "Cargo", "Pipx", "NPM", "Nix",
+        "AppImage", "Standalone",
+    }
+    for item in matches:
+        key = (item.kind, item.ident, item.scope)
+        if key not in roles and item.kind in inherently_explicit:
+            roles[key] = "explicit"
+    return [
+        replace(item, role=roles.get(
+            (item.kind, item.ident, item.scope), "unknown"))
+        for item in matches
+    ]
+
+
+def filter_dependency_matches(
+        matches: list[Match], query: str, show_dependencies: bool,
+) -> tuple[list[Match], int]:
+    if show_dependencies:
+        return matches, 0
+    visible: list[Match] = []
+    hidden = 0
+    for item in matches:
+        forced = bool(item.provides) or exact_app_match(item, query)
+        if item.role == "dependency" and not forced:
+            hidden += 1
+        else:
+            visible.append(item)
+    return visible, hidden
+
+
+@lru_cache(maxsize=1)
+def rpm_reverse_graph() -> tuple[dict[str, set[str]], bool]:
+    text = capture([
+        "rpm", "-qa", "--qf",
+        "P\\t%{NAME}\\n[R\\t%{REQUIRENAME}\\n][S\\t%{PROVIDENAME}\\n]",
+    ])
+    if not text:
+        return {}, False
+    requirement_map: dict[str, set[str]] = defaultdict(set)
+    provide_map: dict[str, set[str]] = defaultdict(set)
+    current = ""
+    for line in text.splitlines():
+        if line.startswith("P\t"):
+            current = line[2:].strip()
+        elif current and line.startswith("R\t"):
+            requirement = line[2:].strip()
+            if requirement and not requirement.startswith("rpmlib("):
+                requirement_map[current].add(requirement)
+        elif current and line.startswith("S\t"):
+            provided = line[2:].strip()
+            if provided:
+                provide_map[current].add(provided)
+    providers: dict[str, set[str]] = defaultdict(set)
+    for package, capabilities in provide_map.items():
+        providers[package].add(package)
+        for capability in capabilities:
+            providers[capability].add(package)
+    reverse: dict[str, set[str]] = defaultdict(set)
+    for dependent, requirements in requirement_map.items():
+        for requirement in requirements:
+            for provider in providers.get(requirement, set()):
+                if provider != dependent:
+                    reverse[provider].add(dependent)
+    return dict(reverse), True
+
+
+def split_debian_relationships(value: str) -> list[list[str]]:
+    groups: list[list[str]] = []
+    for group in value.split(","):
+        alternatives: list[str] = []
+        for alternative in group.split("|"):
+            name = re.sub(r"\s*\(.*?\)", "", alternative).strip()
+            name = re.sub(r"\s*\[.*?\]", "", name).strip()
+            if name:
+                alternatives.append(name)
+        if alternatives:
+            groups.append(alternatives)
+    return groups
+
+
+@lru_cache(maxsize=1)
+def apt_reverse_graph() -> tuple[dict[str, set[str]], bool]:
+    fmt = (
+        "P\\t${db:Status-Abbrev}\\t${binary:Package}\\t${Depends}\\t${Pre-Depends}"
+        "\\t${Provides}\\n"
+    )
+    text = capture(["dpkg-query", "-W", "-f=" + fmt])
+    if not text:
+        return {}, False
+    installed_names: set[str] = set()
+    records: list[tuple[str, str, str, str]] = []
+    virtuals: dict[str, set[str]] = defaultdict(set)
+    for line in text.splitlines():
+        fields = line.split("\t", 5)
+        is_installed = len(fields) > 1 and len(fields[1]) > 1 and fields[1][1] == "i"
+        if len(fields) < 6 or fields[0] != "P" or not is_installed:
+            continue
+        package = fields[2]
+        installed_names.update({package, package_base(package)})
+        records.append((package, fields[3], fields[4], fields[5]))
+        for provided in fields[5].split(","):
+            capability = re.sub(r"\s*\(.*?\)", "", provided).strip()
+            if capability:
+                virtuals[capability].add(package)
+    reverse: dict[str, set[str]] = defaultdict(set)
+    for dependent, depends, pre_depends, _provides in records:
+        for alternatives in split_debian_relationships(
+                ",".join(value for value in (depends, pre_depends) if value)):
+            candidate_providers: set[str] = set()
+            for alternative in alternatives:
+                if alternative in installed_names:
+                    candidate_providers.add(alternative)
+                elif package_base(alternative) in installed_names:
+                    candidate_providers.add(package_base(alternative))
+                candidate_providers.update(virtuals.get(alternative, set()))
+            for provider in candidate_providers:
+                provider_base = package_base(provider)
+                if provider_base != package_base(dependent):
+                    reverse[provider_base].add(package_base(dependent))
+    return dict(reverse), True
+
+
+def parse_pacman_info(text: str) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    last_key = ""
+    for line in text.splitlines():
+        if not line.strip():
+            if current:
+                records.append(current)
+                current = {}
+                last_key = ""
+            continue
+        if ":" in line and not line[0].isspace():
+            key, value = line.split(":", 1)
+            last_key = key.strip()
+            current[last_key] = value.strip()
+        elif current and last_key:
+            current[last_key] += " " + line.strip()
+    if current:
+        records.append(current)
+    return records
+
+
+@lru_cache(maxsize=1)
+def pacman_reverse_graph() -> tuple[dict[str, set[str]], bool]:
+    text = capture(["pacman", "-Qi"])
+    if not text:
+        return {}, False
+    reverse: dict[str, set[str]] = defaultdict(set)
+    for record in parse_pacman_info(text):
+        package = record.get("Name", "")
+        required_by = record.get("Required By", "")
+        if not package or required_by == "None":
+            continue
+        for dependent in required_by.split():
+            reverse[package].add(dependent)
+    return dict(reverse), True
+
+
+def root_paths(
+        target: str, reverse: dict[str, set[str]], explicit: set[str],
+        max_roots: int = 8, max_depth: int = 10,
+) -> tuple[list[list[str]], bool]:
+    roots: list[list[str]] = []
+    queue: deque[list[str]] = deque([[target]])
+    visited_depth: dict[str, int] = {target: 0}
+    complete = True
+    while queue and len(roots) < max_roots:
+        path = queue.popleft()
+        node = path[-1]
+        depth = len(path) - 1
+        for dependent in sorted(reverse.get(node, set())):
+            if dependent in path:
+                continue
+            next_path = path + [dependent]
+            if dependent in explicit and dependent != target:
+                roots.append(list(reversed(next_path)))
+                if len(roots) >= max_roots:
+                    complete = not queue
+                    break
+            elif depth + 1 < max_depth:
+                previous = visited_depth.get(dependent)
+                if previous is None or depth + 1 <= previous:
+                    visited_depth[dependent] = depth + 1
+                    queue.append(next_path)
+            else:
+                complete = False
+    if queue:
+        complete = False
+    return roots, complete
+
+
+@lru_cache(maxsize=None)
+def explicit_names_for_kind(kind: str) -> set[str]:
+    if kind == "APT" and shutil.which("apt-mark"):
+        ok, names = command_lines(["apt-mark", "showmanual"])
+        return {package_base(name) for name in names} if ok else set()
+    if kind == "DNF":
+        manager = "dnf5" if shutil.which("dnf5") else "dnf"
+        command = ([manager, "repoquery", "--userinstalled",
+                    "--queryformat=%{name}\\n"]
+                   if manager == "dnf5" else
+                   [manager, "repoquery", "--installed", "--userinstalled",
+                    "--qf", "%{name}\\n"])
+        ok, names = command_lines(command)
+        return names if ok else set()
+    if kind == "Pacman" and shutil.which("pacman"):
+        ok, names = command_lines(["pacman", "-Qqe"])
+        return names if ok else set()
+    if kind == "Homebrew" and shutil.which("brew"):
+        ok, names = command_lines([
+            "brew", "list", "--formula", "--installed-on-request",
+        ])
+        return names if ok else set()
+    return set()
+
+
+def dependency_report(item: Match) -> DependencyReport:
+    target = package_base(item.ident)
+    reverse: dict[str, set[str]] = {}
+    complete = False
+    note = ""
+    if item.kind in {"DNF", "YUM", "Zypper", "RPM-OSTree"} and shutil.which("rpm"):
+        reverse, complete = rpm_reverse_graph()
+        note = "RPM dependency metadata; weak dependencies may not appear."
+    elif item.kind == "APT" and shutil.which("dpkg-query"):
+        reverse, complete = apt_reverse_graph()
+        note = "APT dependency metadata; alternatives can make paths ambiguous."
+    elif item.kind == "Pacman" and shutil.which("pacman"):
+        reverse, complete = pacman_reverse_graph()
+    elif item.kind == "Homebrew" and shutil.which("brew"):
+        direct_ok, direct = command_lines([
+            "brew", "uses", "--installed", item.ident,
+        ])
+        recursive_ok, recursive = command_lines([
+            "brew", "uses", "--installed", "--recursive", item.ident,
+        ])
+        explicit = explicit_names_for_kind(item.kind)
+        roots = sorted(recursive.intersection(explicit))[:8]
+        return DependencyReport(
+            item, sorted(direct), [[root, "…", target] for root in roots],
+            direct_ok and recursive_ok,
+            "Homebrew reports recursive root causes without exact path edges.",
+        )
+    else:
+        return DependencyReport(
+            item, [], [], False,
+            "This installation method does not expose a system dependency graph.",
+        )
+    explicit = explicit_names_for_kind(item.kind)
+    paths, paths_complete = root_paths(target, reverse, explicit)
+    if not explicit and item.kind in {
+            "APT", "DNF", "Pacman", "YUM", "Zypper", "RPM-OSTree"}:
+        paths_complete = False
+        note = (note + " Installation-reason metadata was unavailable.").strip()
+    return DependencyReport(
+        item, sorted(reverse.get(target, set())), paths,
+        complete and paths_complete, note,
+    )
+
+
+def parse_dnf_preview(output: str) -> tuple[list[str], list[str]]:
+    removals: list[str] = []
+    orphans: list[str] = []
+    section = ""
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        lowered = line.casefold()
+        if lowered in {
+            "removing:", "removing dependent packages:",
+            "removing unused dependencies:",
+        }:
+            section = lowered
+            continue
+        if not line:
+            if section:
+                section = ""
+            continue
+        if not section or lowered.startswith(("package ", "transaction ")):
+            continue
+        package = line.split()[0]
+        if package and package not in {"Removing:", "After"}:
+            removals.append(package)
+            if section == "removing unused dependencies:":
+                orphans.append(package)
+    return list(dict.fromkeys(removals)), list(dict.fromkeys(orphans))
+
+
+def native_removal_preview(
+        selected: list[Match],
+) -> tuple[list[str], list[str], bool, list[str]]:
+    planned: list[str] = []
+    orphans: list[str] = []
+    available = True
+    notes: list[str] = []
+    by_kind: dict[str, list[str]] = defaultdict(list)
+    for item in selected:
+        by_kind[item.kind].append(item.ident)
+    for kind, identifiers in by_kind.items():
+        if kind in {"DNF", "YUM"}:
+            manager = ("dnf5" if shutil.which("dnf5")
+                       else "dnf" if kind == "DNF" else "yum")
+            code, output = capture_any(
+                [manager, "--assumeno", "remove"] + identifiers)
+            removed, unused = parse_dnf_preview(output)
+            if removed:
+                planned.extend(removed)
+                orphans.extend(unused)
+            else:
+                available = False
+                notes.append(f"{kind} could not produce a removal transaction preview.")
+            if code == 124:
+                notes.append(f"{kind} preview timed out.")
+        elif kind == "APT":
+            code, output = capture_any(
+                ["apt-get", "--simulate", "remove"] + identifiers)
+            removed = [
+                line.split()[1] for line in output.splitlines()
+                if line.startswith("Remv ") and len(line.split()) > 1
+            ]
+            if code == 0:
+                planned.extend(removed or identifiers)
+                if os.geteuid() != 0:
+                    notes.append(
+                        "APT warns that a non-root simulation can miss unreadable configuration."
+                    )
+            else:
+                available = False
+                notes.append("APT simulation failed; its final prompt remains authoritative.")
+        elif kind == "Pacman":
+            code, output = capture_any(
+                ["pacman", "-R", "--print", "--print-format", "%n"] + identifiers)
+            removed = [
+                line.strip() for line in output.splitlines()
+                if line.strip() and " " not in line.strip()
+            ]
+            if code == 0:
+                planned.extend(removed or identifiers)
+            else:
+                available = False
+                notes.append(
+                    "Pacman rejected the preview, usually because another package requires the target."
+                )
+        elif kind == "Zypper":
+            code, output = capture_any(
+                ["zypper", "--non-interactive", "--dry-run", "remove"]
+                + identifiers)
+            if code == 0:
+                planned.extend(identifiers)
+                available = False
+                notes.append(
+                    "Zypper completed a dry-run, but its extra removals could not be parsed reliably."
+                )
+            else:
+                available = False
+                notes.append("Zypper dry-run failed.")
+        elif kind == "RPM-OSTree":
+            code, _output = capture_any(
+                ["rpm-ostree", "uninstall", "--dry-run"] + identifiers)
+            if code == 0:
+                planned.extend(identifiers)
+            else:
+                available = False
+                notes.append("rpm-ostree did not provide a usable dry-run.")
+        elif kind == "Snap":
+            planned.extend(identifiers)
+            available = False
+            notes.append(
+                "Snap bases and content providers are checked by snapd only during removal."
+            )
+        elif kind in {
+            "Flatpak", "Homebrew Cask", "Cargo", "Pipx",
+            "NPM", "Nix", "AppImage",
+        }:
+            planned.extend(identifiers)
+        elif kind == "Homebrew":
+            planned.extend(identifiers)
+            available = False
+            notes.append("Homebrew will perform its installed-dependent check during removal.")
+        elif kind == "Standalone":
+            planned.extend(identifiers)
+            available = False
+            notes.append("Standalone files have no package dependency metadata.")
+        else:
+            available = False
+            notes.append(f"No read-only transaction preview is available for {kind}.")
+    return (
+        list(dict.fromkeys(planned)),
+        list(dict.fromkeys(orphans)),
+        available,
+        notes,
+    )
+
+
+@lru_cache(maxsize=1)
+def apt_held_packages() -> set[str]:
+    if not shutil.which("apt-mark"):
+        return set()
+    ok, names = command_lines(["apt-mark", "showhold"])
+    return {package_base(name) for name in names} if ok else set()
+
+
+@lru_cache(maxsize=1)
+def dnf_protected_patterns() -> set[str]:
+    patterns = {
+        "dnf", "dnf5", "rpm", "systemd", "systemd-udev",
+        "kernel", "kernel-core", "kernel-modules", "glibc",
+    }
+    for directory in (Path("/etc/dnf/protected.d"), Path("/etc/yum/protected.d")):
+        if not directory.is_dir():
+            continue
+        try:
+            for config in directory.glob("*.conf"):
+                for line in config.read_text(
+                        encoding="utf-8", errors="replace").splitlines():
+                    value = line.strip()
+                    if value and not value.startswith("#"):
+                        patterns.add(value)
+        except OSError:
+            continue
+    return patterns
+
+
+def protection_reason(kind: str, name: str) -> str:
+    base = package_base(name)
+    universal_core = {
+        "apt", "dpkg", "pacman", "rpm", "dnf", "dnf5", "sudo",
+        "systemd", "systemd-udev", "filesystem", "basesystem",
+        "glibc", "libc6",
+    }
+    if base in universal_core or base.startswith("kernel"):
+        return "core system package"
+    if kind == "APT":
+        if base in apt_held_packages():
+            return "held by APT"
+        details = capture([
+            "dpkg-query", "-W", "-f=${Essential}\\t${Priority}", name,
+        ]).strip().split("\t", 1)
+        if details and details[0].casefold() == "yes":
+            return "Essential package"
+        if len(details) > 1 and details[1].casefold() == "required":
+            return "required-priority package"
+    if kind in {"DNF", "YUM", "RPM-OSTree"}:
+        for pattern in dnf_protected_patterns():
+            if fnmatch.fnmatchcase(base, pattern):
+                return "protected/core RPM package"
+    if kind == "Pacman":
+        try:
+            text = Path("/etc/pacman.conf").read_text(
+                encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        for line in text.splitlines():
+            if line.strip().startswith("HoldPkg") and "=" in line:
+                held = line.split("=", 1)[1].split()
+                if any(fnmatch.fnmatchcase(base, pattern) for pattern in held):
+                    return "held by Pacman configuration"
+    return ""
+
+
+def build_removal_plan(selected: list[Match]) -> RemovalPlan:
+    reports = [dependency_report(item) for item in selected]
+    planned, orphans, preview_available, notes = native_removal_preview(selected)
+    requested = {package_base(item.ident) for item in selected}
+    additional = [
+        name for name in planned
+        if package_base(name) not in requested
+    ]
+    protected_items: list[str] = []
+    kinds = {item.kind for item in selected}
+    protection_kind = next(iter(kinds)) if len(kinds) == 1 else ""
+    selected_kinds = {
+        package_base(item.ident): item.kind for item in selected
+    }
+    for name in planned:
+        reason = protection_reason(
+            selected_kinds.get(package_base(name), protection_kind), name)
+        if reason:
+            protected_items.append(f"{name} ({reason})")
+    has_dependents = any(
+        report.direct_dependents or report.root_paths for report in reports)
+    uncertain_kinds = {
+        "APT", "DNF", "YUM", "Zypper", "Pacman", "RPM-OSTree",
+        "Homebrew", "Snap", "Standalone",
+    }
+    if (protected_items or has_dependents
+            or any(name not in orphans for name in additional)):
+        level = "HIGH"
+    elif orphans or any(item.role == "dependency" for item in selected):
+        level = "CAUTION"
+    elif not preview_available and any(
+            item.kind in uncertain_kinds for item in selected):
+        level = "UNKNOWN"
+    else:
+        level = "SAFE"
+    notes.append(
+        "This plan is a snapshot; the package manager's final transaction remains authoritative."
+    )
+    return RemovalPlan(
+        selected, reports, planned or [item.ident for item in selected],
+        additional, orphans, level, preview_available, protected_items, notes,
+    )
+
+
+def show_dependency_reports(reports: list[DependencyReport]) -> None:
+    for report in reports:
+        item = report.target
+        print(f"\n{display(item.name)} [{display(item.kind)}]")
+        print(f"  Installation role: {display(item.role)}")
+        if report.direct_dependents:
+            print("  Directly required by: "
+                  + ", ".join(display(name) for name in report.direct_dependents[:12]))
+            if len(report.direct_dependents) > 12:
+                print(f"  …and {len(report.direct_dependents) - 12} more")
+        if report.root_paths:
+            print("  Root causes:")
+            for path in report.root_paths:
+                print("    " + " → ".join(display(node) for node in path))
+        if not report.complete:
+            print("  Dependency explanation may be incomplete.")
+        if report.note:
+            print(f"  Note: {display(report.note)}")
+
+
+def show_removal_plan(plan: RemovalPlan) -> None:
+    print("\nDependency and removal plan")
+    print(f"  Impact: {plan.level}")
+    show_dependency_reports(plan.reports)
+    print("\n  Planned removals:")
+    root_names = {
+        path[0] for report in plan.reports for path in report.root_paths if path
+    }
+    for name in plan.planned_removals:
+        if name in plan.orphan_removals:
+            suffix = " (unused dependency)"
+        elif package_base(name) in root_names:
+            suffix = " (explicit root application)"
+        elif name in plan.additional_removals:
+            suffix = " (additional dependent package)"
+        else:
+            suffix = ""
+        print(f"    {display(name)}{suffix}")
+    if plan.protected_items:
+        print("  Protected or critical packages:")
+        for item in plan.protected_items:
+            print(f"    {display(item)}")
+    if not plan.additional_removals:
+        print("  No additional package removals were found.")
+    for note in plan.notes:
+        print(f"  Note: {display(note)}")
+
+
 def choose(matches: list[Match]) -> list[Match]:
     print(f"\nFound {len(matches)} likely installed option{'s' if len(matches) != 1 else ''}:\n")
     for index, item in enumerate(matches, 1):
-        details = " · ".join(display(value) for value in (item.version, item.scope) if value)
+        role = (item.role if item.role == "dependency"
+                else "role unknown" if item.role == "unknown" else "")
+        details = " · ".join(
+            display(value) for value in (item.version, item.scope, role) if value)
         print(f"  {index:>2}. {display(item.name)}  [{display(item.kind)}]"
               f"{'  ' + details if details else ''}")
         if item.ident != item.name:
@@ -748,9 +1413,20 @@ def remove_paths(paths: list[Path]) -> bool:
     return ok
 
 
-def run_uninstall(query: str) -> int:
+def run_uninstall(
+        query: str, show_dependencies: bool = False,
+        plan_only: bool = False, why_only: bool = False,
+) -> int:
     print(f"Searching installed apps for “{display(query)}”…")
-    matches = find_matches(query)
+    matches = annotate_roles(find_matches(query))
+    matches, hidden_dependencies = filter_dependency_matches(
+        matches, query, show_dependencies or why_only)
+    if hidden_dependencies:
+        print(
+            f"Hidden {hidden_dependencies} fuzzy dependency match"
+            f"{'es' if hidden_dependencies != 1 else ''}; "
+            "use --show-dependencies to include them."
+        )
     if not matches:
         print("No likely installed apps found.")
         return 1
@@ -763,12 +1439,22 @@ def run_uninstall(query: str) -> int:
         print("Nothing selected.")
         return 0
 
+    if why_only:
+        show_dependency_reports([dependency_report(item) for item in selected])
+        return 0
+
     for item in selected:
         error = preflight_file(item)
         if error:
             print(f"Cannot safely remove {display(item.name)}: {error}.",
                   file=sys.stderr)
             return 1
+
+    plan = build_removal_plan(selected)
+    show_removal_plan(plan)
+    if plan_only:
+        print("\nPlan only; nothing was changed.")
+        return 0
 
     paths = find_user_data(selected)
     remove_data = False
@@ -792,7 +1478,20 @@ def run_uninstall(query: str) -> int:
         print("  " + display(shlex.join(command)))
     if remove_data and paths:
         print(f"  and remove {len(paths)} user-data path{'s' if len(paths) != 1 else ''}")
-    if not yes("\nContinue? [y/N] "):
+    if plan.level in {"HIGH", "UNKNOWN"}:
+        expected = ("REMOVE " + selected[0].ident if len(selected) == 1
+                    else "REMOVE ALL")
+        try:
+            confirmation = input(
+                f"\n{plan.level.title()}-impact transaction. "
+                f"Type “{expected}” to continue: "
+            ).strip()
+        except EOFError:
+            confirmation = ""
+        if confirmation != expected:
+            print("Cancelled.")
+            return 0
+    elif not yes("\nContinue? [y/N] "):
         print("Cancelled.")
         return 0
 
@@ -845,6 +1544,12 @@ def main() -> int:
     parser.add_argument("app", nargs="?", help="app name to find")
     parser.add_argument("--self-uninstall", action="store_true",
                         help="remove this command from the system")
+    parser.add_argument("--show-dependencies", action="store_true",
+                        help="include fuzzy matches installed as dependencies")
+    parser.add_argument("--why", action="store_true",
+                        help="explain why the selected package is installed; change nothing")
+    parser.add_argument("--plan", action="store_true",
+                        help="show dependency and transaction impact; change nothing")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     args = parser.parse_args()
     if os.geteuid() == 0 and os.environ.get("SUDO_USER") not in {None, "", "root"}:
@@ -858,7 +1563,10 @@ def main() -> int:
         return 2
     if norm(args.app) == "uninstall":
         return self_uninstall()
-    return run_uninstall(args.app)
+    return run_uninstall(
+        args.app, show_dependencies=args.show_dependencies,
+        plan_only=args.plan, why_only=args.why,
+    )
 
 
 if __name__ == "__main__":

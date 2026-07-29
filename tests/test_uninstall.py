@@ -1,5 +1,6 @@
 import importlib.util
 import importlib.machinery
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).parents[1] / "uninstall"
+INSTALLER = Path(__file__).parents[1] / "install.sh"
 LOADER = importlib.machinery.SourceFileLoader("uninstall_cli", str(SCRIPT))
 SPEC = importlib.util.spec_from_loader("uninstall_cli", LOADER)
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -18,6 +20,42 @@ SPEC.loader.exec_module(MODULE)
 
 
 class UninstallTests(unittest.TestCase):
+    def setUp(self):
+        MODULE.rpm_reverse_graph.cache_clear()
+        MODULE.apt_reverse_graph.cache_clear()
+        MODULE.pacman_reverse_graph.cache_clear()
+        MODULE.explicit_names_for_kind.cache_clear()
+        MODULE.apt_held_packages.cache_clear()
+        MODULE.dnf_protected_patterns.cache_clear()
+
+    def test_installer_creates_a_completely_new_custom_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory) / "new" / "prefix"
+            environment = os.environ.copy()
+            environment.update({
+                "PREFIX": str(prefix),
+                "UNINSTALL_SOURCE_URL": SCRIPT.as_uri(),
+            })
+            result = subprocess.run(
+                ["sh", str(INSTALLER)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            installed = prefix / "bin" / "uninstall"
+            self.assertTrue(installed.is_file())
+            self.assertTrue(os.access(installed, os.X_OK))
+            version = subprocess.run(
+                [str(installed), "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(version.returncode, 0, version.stderr)
+            self.assertIn(MODULE.VERSION, version.stdout)
+
     def test_matching_ignores_case_and_punctuation(self):
         self.assertTrue(MODULE.relevant("FreeCAD", "org.freecad.FreeCAD"))
         self.assertTrue(MODULE.relevant("visual studio", "visual-studio-code"))
@@ -114,6 +152,172 @@ class UninstallTests(unittest.TestCase):
             [(item.kind, item.name) for item in result],
             [("Standalone", "edit"), ("Flatpak", "Edit")],
         )
+
+    @patch.object(MODULE, "capture_any")
+    @patch.object(MODULE.shutil, "which")
+    def test_apt_roles_distinguish_explicit_from_dependency(
+            self, which, capture_any):
+        which.side_effect = {"apt-mark": "/usr/bin/apt-mark"}.get
+        capture_any.return_value = (0, "libfoo\n")
+        matches = [
+            MODULE.Match("APT", "wine", "wine"),
+            MODULE.Match("APT", "libfoo:amd64", "libfoo:amd64"),
+        ]
+        result = MODULE.annotate_roles(matches)
+        self.assertEqual([item.role for item in result], ["explicit", "dependency"])
+
+    def test_fuzzy_dependencies_are_collapsed_but_exact_ones_are_not(self):
+        dependency = MODULE.Match(
+            "DNF", "libedit", "libedit", role="dependency")
+        visible, hidden = MODULE.filter_dependency_matches(
+            [dependency], "edit", False)
+        self.assertEqual((visible, hidden), ([], 1))
+        visible, hidden = MODULE.filter_dependency_matches(
+            [dependency], "libedit", False)
+        self.assertEqual((visible, hidden), ([dependency], 0))
+
+    @patch.object(MODULE, "capture")
+    def test_rpm_capability_graph_finds_real_reverse_dependencies(self, capture):
+        capture.return_value = (
+            "P\tlibfoo\nS\tlibfoo\nS\tlibfoo.so.1()(64bit)\n"
+            "P\twine-core\nR\tlibfoo.so.1()(64bit)\nS\twine-core\n"
+            "P\twine\nR\twine-core\nS\twine\n"
+        )
+        reverse, complete = MODULE.rpm_reverse_graph()
+        self.assertTrue(complete)
+        self.assertEqual(reverse["libfoo"], {"wine-core"})
+        self.assertEqual(reverse["wine-core"], {"wine"})
+
+    def test_root_cause_paths_stop_at_explicit_applications(self):
+        reverse = {
+            "libfoo": {"wine-core", "tex-engine"},
+            "wine-core": {"wine"},
+            "tex-engine": {"texlive"},
+        }
+        paths, complete = MODULE.root_paths(
+            "libfoo", reverse, {"wine", "texlive"})
+        self.assertTrue(complete)
+        self.assertEqual(
+            paths,
+            [["texlive", "tex-engine", "libfoo"],
+             ["wine", "wine-core", "libfoo"]],
+        )
+
+    @patch.object(MODULE, "capture")
+    def test_apt_graph_understands_alternative_dependencies(self, capture):
+        capture.return_value = (
+            "P\tii \tlibfoo:amd64\t\t\tvirtual-foo\n"
+            "P\tii \twine\tvirtual-foo | other (>= 2), libc6\t\t\n"
+            "P\trc \tremoved-app\tlibfoo\t\t\n"
+        )
+        reverse, complete = MODULE.apt_reverse_graph()
+        self.assertTrue(complete)
+        self.assertEqual(reverse["libfoo"], {"wine"})
+
+    def test_dnf_preview_separates_unused_dependencies(self):
+        output = (
+            "Removing:\n"
+            " target x86_64 1 repo 1 MiB\n"
+            "Removing dependent packages:\n"
+            " wine x86_64 1 repo 2 MiB\n"
+            "Removing unused dependencies:\n"
+            " helper x86_64 1 repo 3 MiB\n\n"
+            "Transaction Summary:\n"
+        )
+        self.assertEqual(
+            MODULE.parse_dnf_preview(output),
+            (["target", "wine", "helper"], ["helper"]),
+        )
+
+    @patch.object(MODULE, "capture_any")
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/dnf5")
+    def test_dnf_native_preview_is_read_only(self, _which, capture_any):
+        capture_any.return_value = (
+            1,
+            "Removing:\n target x86_64 1 repo 1 MiB\n\n"
+            "Transaction Summary:\nOperation aborted by the user.\n",
+        )
+        item = MODULE.Match("DNF", "target", "target")
+        planned, _orphans, available, _notes = (
+            MODULE.native_removal_preview([item]))
+        self.assertTrue(available)
+        self.assertEqual(planned, ["target"])
+        capture_any.assert_called_once_with(
+            ["dnf5", "--assumeno", "remove", "target"])
+
+    def test_core_packages_are_always_marked_protected(self):
+        self.assertEqual(
+            MODULE.protection_reason("APT", "systemd"),
+            "core system package",
+        )
+
+    @patch.object(MODULE, "protection_reason", return_value="Essential package")
+    @patch.object(MODULE, "native_removal_preview")
+    @patch.object(MODULE, "dependency_report")
+    def test_protected_package_makes_plan_high_impact(
+            self, dependency_report, native_preview, _protection):
+        item = MODULE.Match("APT", "core", "core", role="explicit")
+        dependency_report.return_value = MODULE.DependencyReport(
+            item, [], [], True)
+        native_preview.return_value = (["core"], [], True, [])
+        plan = MODULE.build_removal_plan([item])
+        self.assertEqual(plan.level, "HIGH")
+        self.assertEqual(
+            plan.protected_items, ["core (Essential package)"])
+
+    @patch.object(MODULE, "protection_reason", return_value="")
+    @patch.object(MODULE, "native_removal_preview")
+    @patch.object(MODULE, "dependency_report")
+    def test_dependent_application_makes_plan_high_impact(
+            self, dependency_report, native_preview, _protection):
+        item = MODULE.Match(
+            "DNF", "libfoo", "libfoo", role="dependency")
+        dependency_report.return_value = MODULE.DependencyReport(
+            item, ["wine-core"], [["wine", "wine-core", "libfoo"]])
+        native_preview.return_value = (
+            ["libfoo", "wine-core", "wine"], [], True, [])
+        plan = MODULE.build_removal_plan([item])
+        self.assertEqual(plan.level, "HIGH")
+        self.assertEqual(plan.additional_removals, ["wine-core", "wine"])
+
+    @patch.object(MODULE.subprocess, "run")
+    @patch.object(MODULE, "find_user_data", return_value=[])
+    @patch.object(MODULE, "build_removal_plan")
+    @patch.object(MODULE, "filter_dependency_matches")
+    @patch.object(MODULE, "annotate_roles")
+    @patch.object(MODULE, "find_matches")
+    def test_high_impact_requires_typed_confirmation_not_yes(
+            self, find_matches, annotate, filter_matches, build_plan,
+            _find_data, run):
+        item = MODULE.Match("Cargo", "tool", "tool", role="explicit")
+        find_matches.return_value = [item]
+        annotate.return_value = [item]
+        filter_matches.return_value = ([item], 0)
+        build_plan.return_value = MODULE.RemovalPlan(
+            [item], [MODULE.DependencyReport(item, ["other"], [])],
+            ["tool", "other"], ["other"], [], "HIGH", True, [], [])
+        with patch("builtins.input", side_effect=["1", "y"]):
+            self.assertEqual(MODULE.run_uninstall("tool"), 0)
+        run.assert_not_called()
+
+    @patch.object(MODULE.subprocess, "run")
+    @patch.object(MODULE, "build_removal_plan")
+    @patch.object(MODULE, "filter_dependency_matches")
+    @patch.object(MODULE, "annotate_roles")
+    @patch.object(MODULE, "find_matches")
+    def test_plan_mode_never_executes_removal(
+            self, find_matches, annotate, filter_matches, build_plan, run):
+        item = MODULE.Match("Cargo", "tool", "tool", role="explicit")
+        find_matches.return_value = [item]
+        annotate.return_value = [item]
+        filter_matches.return_value = ([item], 0)
+        build_plan.return_value = MODULE.RemovalPlan(
+            [item], [MODULE.DependencyReport(item, [], [])],
+            ["tool"], [], [], "SAFE", True, [], [])
+        with patch("builtins.input", return_value="1"):
+            self.assertEqual(
+                MODULE.run_uninstall("tool", plan_only=True), 0)
+        run.assert_not_called()
 
     @patch.object(MODULE.shutil, "which")
     @patch.object(MODULE, "capture")
@@ -362,7 +566,10 @@ class UninstallTests(unittest.TestCase):
     @patch.object(MODULE.sys, "argv", ["uninstall", "uninstall-helper"])
     def test_longer_name_remains_a_normal_search(self, run_uninstall):
         self.assertEqual(MODULE.main(), 0)
-        run_uninstall.assert_called_once_with("uninstall-helper")
+        run_uninstall.assert_called_once_with(
+            "uninstall-helper", show_dependencies=False,
+            plan_only=False, why_only=False,
+        )
 
     @patch.object(MODULE.os, "geteuid", return_value=0)
     @patch.object(MODULE.sys, "argv", ["uninstall", "freecad"])

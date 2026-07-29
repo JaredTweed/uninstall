@@ -37,8 +37,8 @@ executable cannot always be inferred safely.
 ## Install
 
 The installer checks for Python 3.8+, `curl`, and the standard system utilities it
-needs before changing anything. It downloads to a temporary file, verifies the
-CLI can start, and only then installs it.
+needs before changing anything. It downloads the matching pinned release to a
+temporary file, verifies the CLI can start, and only then installs it.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/JaredTweed/uninstall/main/install.sh | sh
@@ -60,6 +60,9 @@ Make sure `$HOME/.local/bin` is on your `PATH`.
 ```sh
 uninstall FreeCAD
 uninstall org.freecad.FreeCAD
+uninstall --why aalib-libs
+uninstall --plan wine
+uninstall --show-dependencies lib
 uninstall --help
 uninstall uninstall
 uninstall --self-uninstall
@@ -67,8 +70,38 @@ uninstall --self-uninstall
 
 Matching is Unicode-aware and case-insensitive. Very short searches require an
 exact match so queries such as `rg` do not produce hundreds of unrelated
-results. Nothing is removed during search, invalid selections can be retried,
-and pressing Enter at a prompt cancels.
+results. Fuzzy matches that the native manager records as automatic
+dependencies are collapsed by default; exact matches and command owners are
+never hidden. Use `--show-dependencies` to expand them.
+
+Before any app-data question or removal, `uninstall` builds a read-only
+dependency and transaction plan. For APT, DNF/RPM, Pacman, and Homebrew it
+reports direct dependents and traces best-effort paths back to explicitly
+installed root applications:
+
+```text
+libfoo [DNF]
+  Installation role: dependency
+  Directly required by: wine-core
+  Root causes:
+    wine → wine-core → libfoo
+```
+
+Native simulations determine the packages actually scheduled for removal.
+Impact is labelled `SAFE`, `CAUTION`, `HIGH`, or `UNKNOWN`. High- and
+unknown-impact operations require typing the exact confirmation phrase rather
+than answering `y`. Essential, held, protected, and core packages receive an
+additional warning. `--why` explains dependency paths without creating a
+transaction; `--plan` includes the native transaction preview and then exits.
+
+Dependency explanations are necessarily best effort: alternatives, weak
+dependencies, package groups, and declarative systems do not always preserve
+the human reason an item was installed. When metadata or a dry-run is
+unavailable the result says `UNKNOWN`; it never silently claims the operation
+is safe. The package manager's final transaction is always authoritative.
+
+Nothing is removed during search or planning, invalid selections can be
+retried, and pressing Enter at a prompt cancels.
 
 APT's app-data option uses `purge` for packaged configuration; Flatpak uses
 `--delete-data`; Snap uses `--purge`. Exact matching directories under the XDG
