@@ -14,12 +14,12 @@ import subprocess
 import sys
 import unicodedata
 from collections import defaultdict, deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 
 @dataclass(frozen=True)
@@ -43,6 +43,10 @@ class DependencyReport:
     root_paths: list[list[str]]
     complete: bool = True
     note: str = ""
+    weak_relations: list[tuple[str, str]] = field(default_factory=list)
+    relationship_paths: list[tuple[list[str], list[str]]] = field(
+        default_factory=list)
+    history_reason: str = ""
 
 
 @dataclass
@@ -749,6 +753,29 @@ def command_lines(command: list[str]) -> tuple[bool, set[str]]:
     }
 
 
+@lru_cache(maxsize=1)
+def dnf_install_reasons() -> tuple[bool, dict[str, str]]:
+    manager = "dnf5" if shutil.which("dnf5") else "dnf"
+    if not shutil.which(manager):
+        return False, {}
+    command = (
+        [manager, "repoquery", "--installed",
+         "--queryformat=%{name}|%{reason}\\n"]
+        if manager == "dnf5" else
+        [manager, "repoquery", "--installed",
+         "--qf", "%{name}|%{reason}\\n"]
+    )
+    code, output = capture_any(command, timeout=30)
+    if code != 0:
+        return False, {}
+    reasons: dict[str, str] = {}
+    for line in output.splitlines():
+        name, separator, reason = line.partition("|")
+        if separator and name.strip() and reason.strip():
+            reasons[name.strip()] = reason.strip()
+    return True, reasons
+
+
 def annotate_roles(matches: list[Match]) -> list[Match]:
     by_kind: dict[str, list[Match]] = defaultdict(list)
     for item in matches:
@@ -767,23 +794,37 @@ def annotate_roles(matches: list[Match]) -> list[Match]:
     rpm_kinds = {"DNF"}
     present_rpm_kinds = rpm_kinds.intersection(by_kind)
     if present_rpm_kinds:
-        manager = "dnf5" if shutil.which("dnf5") else "dnf"
-        if manager == "dnf5":
-            command = [
-                manager, "repoquery", "--userinstalled",
-                "--queryformat=%{name}\\n",
-            ]
-        else:
-            command = [
-                manager, "repoquery", "--installed", "--userinstalled",
-                "--qf", "%{name}\\n",
-            ]
-        ok, explicit = command_lines(command)
+        ok, reasons = dnf_install_reasons()
         if ok:
+            role_names = {
+                "user": "explicit",
+                "external user": "explicit",
+                "group": "group",
+                "dependency": "dependency",
+                "weak dependency": "weak dependency",
+            }
             for kind in present_rpm_kinds:
                 for item in by_kind[kind]:
-                    role = "explicit" if item.ident in explicit else "dependency"
-                    roles[(item.kind, item.ident, item.scope)] = role
+                    reason = reasons.get(item.ident)
+                    if reason:
+                        roles[(item.kind, item.ident, item.scope)] = (
+                            role_names.get(reason.casefold(), reason.casefold()))
+        else:
+            manager = "dnf5" if shutil.which("dnf5") else "dnf"
+            command = (
+                [manager, "repoquery", "--userinstalled",
+                 "--queryformat=%{name}\\n"]
+                if manager == "dnf5" else
+                [manager, "repoquery", "--installed", "--userinstalled",
+                 "--qf", "%{name}\\n"]
+            )
+            explicit_ok, explicit = command_lines(command)
+            if explicit_ok:
+                for kind in present_rpm_kinds:
+                    for item in by_kind[kind]:
+                        role = (
+                            "explicit" if item.ident in explicit else "dependency")
+                        roles[(item.kind, item.ident, item.scope)] = role
 
     if by_kind.get("Pacman") and shutil.which("pacman"):
         ok, explicit = command_lines(["pacman", "-Qqe"])
@@ -825,47 +866,88 @@ def filter_dependency_matches(
     hidden = 0
     for item in matches:
         forced = bool(item.provides or item.archive) or exact_app_match(item, query)
-        if item.role == "dependency" and not forced:
+        if item.role in {"dependency", "weak dependency"} and not forced:
             hidden += 1
         else:
             visible.append(item)
+    if hidden and not visible:
+        return matches, 0
     return visible, hidden
 
 
 @lru_cache(maxsize=1)
-def rpm_reverse_graph() -> tuple[dict[str, set[str]], bool]:
+def rpm_dependency_graph() -> tuple[
+        dict[str, set[str]], dict[str, set[str]],
+        dict[tuple[str, str], set[str]], bool,
+]:
     text = capture([
         "rpm", "-qa", "--qf",
-        "P\\t%{NAME}\\n[R\\t%{REQUIRENAME}\\n][S\\t%{PROVIDENAME}\\n]",
+        "P\\t%{NAME}\\n"
+        "[R\\t%{REQUIRENAME}\\n]"
+        "[W\\t%{RECOMMENDNAME}\\n]"
+        "[G\\t%{SUGGESTNAME}\\n]"
+        "[U\\t%{SUPPLEMENTNAME}\\n]"
+        "[E\\t%{ENHANCENAME}\\n]"
+        "[S\\t%{PROVIDENAME}\\n]",
     ])
     if not text:
-        return {}, False
-    requirement_map: dict[str, set[str]] = defaultdict(set)
+        return {}, {}, {}, False
+    dependency_maps: dict[str, dict[str, set[str]]] = {
+        relation: defaultdict(set)
+        for relation in (
+            "requires", "recommends", "suggests", "supplements", "enhances")
+    }
+    line_relations = {
+        "R": "requires",
+        "W": "recommends",
+        "G": "suggests",
+        "U": "supplements",
+        "E": "enhances",
+    }
     provide_map: dict[str, set[str]] = defaultdict(set)
+    packages: set[str] = set()
     current = ""
     for line in text.splitlines():
         if line.startswith("P\t"):
             current = line[2:].strip()
-        elif current and line.startswith("R\t"):
-            requirement = line[2:].strip()
-            if requirement and not requirement.startswith("rpmlib("):
-                requirement_map[current].add(requirement)
+            if current:
+                packages.add(current)
+        elif (current and len(line) > 2 and line[1] == "\t"
+              and line[0] in line_relations):
+            capability = line[2:].strip()
+            if capability and not capability.startswith("rpmlib("):
+                dependency_maps[line_relations[line[0]]][current].add(capability)
         elif current and line.startswith("S\t"):
             provided = line[2:].strip()
             if provided:
                 provide_map[current].add(provided)
     providers: dict[str, set[str]] = defaultdict(set)
-    for package, capabilities in provide_map.items():
+    for package in packages:
         providers[package].add(package)
-        for capability in capabilities:
+        for capability in provide_map.get(package, set()):
             providers[capability].add(package)
-    reverse: dict[str, set[str]] = defaultdict(set)
-    for dependent, requirements in requirement_map.items():
-        for requirement in requirements:
-            for provider in providers.get(requirement, set()):
-                if provider != dependent:
-                    reverse[provider].add(dependent)
-    return dict(reverse), True
+    hard_reverse: dict[str, set[str]] = defaultdict(set)
+    all_reverse: dict[str, set[str]] = defaultdict(set)
+    relations: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for relation, dependency_map in dependency_maps.items():
+        for dependent, capabilities in dependency_map.items():
+            for capability in capabilities:
+                for provider in providers.get(capability, set()):
+                    if provider == dependent:
+                        continue
+                    all_reverse[provider].add(dependent)
+                    relations[(provider, dependent)].add(relation)
+                    if relation == "requires":
+                        hard_reverse[provider].add(dependent)
+    return (
+        dict(hard_reverse), dict(all_reverse), dict(relations), True,
+    )
+
+
+@lru_cache(maxsize=1)
+def rpm_reverse_graph() -> tuple[dict[str, set[str]], bool]:
+    hard_reverse, _all_reverse, _relations, complete = rpm_dependency_graph()
+    return hard_reverse, complete
 
 
 def split_debian_relationships(value: str) -> list[list[str]]:
@@ -995,12 +1077,95 @@ def root_paths(
     return roots, complete
 
 
+def relationship_root_paths(
+        target: str, reverse: dict[str, set[str]],
+        relations: dict[tuple[str, str], set[str]], explicit: set[str],
+) -> tuple[list[tuple[list[str], list[str]]], bool]:
+    paths, complete = root_paths(target, reverse, explicit)
+    priority = {
+        "requires": 0,
+        "recommends": 1,
+        "suggests": 2,
+        "supplements": 3,
+        "enhances": 4,
+    }
+    detailed: list[tuple[list[str], list[str]]] = []
+    for nodes in paths:
+        labels: list[str] = []
+        for parent, child in zip(nodes, nodes[1:]):
+            choices = relations.get((child, parent), {"related to"})
+            labels.append(min(
+                choices, key=lambda value: priority.get(value, 99)))
+        detailed.append((nodes, labels))
+    return detailed, complete
+
+
+@lru_cache(maxsize=64)
+def dnf_history_reason(target: str) -> str:
+    if not shutil.which("dnf5"):
+        return ""
+    text = capture([
+        "dnf5", "history", "list",
+        f"--contains-pkgs={target}", "--json",
+    ])
+    try:
+        transactions = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(transactions, list):
+        return ""
+    valid_transactions = [
+        transaction for transaction in transactions
+        if isinstance(transaction, dict)
+        and isinstance(transaction.get("id"), int)
+    ]
+    for transaction in sorted(
+            valid_transactions, key=lambda value: value["id"]):
+        transaction_id = transaction["id"]
+        try:
+            details = json.loads(capture([
+                "dnf5", "history", "info", str(transaction_id), "--json",
+            ]))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(details, list) or not details:
+            continue
+        detail = details[0]
+        if not isinstance(detail, dict):
+            continue
+        for package in detail.get("packages", []):
+            if not isinstance(package, dict):
+                continue
+            nevra = package.get("nevra", "")
+            action = str(package.get("action", ""))
+            if (not isinstance(nevra, str) or not nevra.startswith(target + "-")
+                    or action.casefold() != "install"):
+                continue
+            command = str(
+                detail.get("description")
+                or transaction.get("command_line")
+                or "unknown command"
+            )
+            reason = str(package.get("reason") or "unknown reason")
+            return (
+                f"DNF transaction {transaction_id}: {command} "
+                f"(recorded reason: {reason})"
+            )
+    return ""
+
+
 @lru_cache(maxsize=None)
 def explicit_names_for_kind(kind: str) -> set[str]:
     if kind == "APT" and shutil.which("apt-mark"):
         ok, names = command_lines(["apt-mark", "showmanual"])
         return {package_base(name) for name in names} if ok else set()
     if kind == "DNF":
+        reasons_ok, reasons = dnf_install_reasons()
+        if reasons_ok:
+            return {
+                name for name, reason in reasons.items()
+                if reason.casefold() in {"user", "external user", "group"}
+            }
         manager = "dnf5" if shutil.which("dnf5") else "dnf"
         command = ([manager, "repoquery", "--userinstalled",
                     "--queryformat=%{name}\\n"]
@@ -1023,12 +1188,17 @@ def explicit_names_for_kind(kind: str) -> set[str]:
 def dependency_report(item: Match) -> DependencyReport:
     target = package_base(item.ident)
     reverse: dict[str, set[str]] = {}
+    all_reverse: dict[str, set[str]] = {}
+    relation_map: dict[tuple[str, str], set[str]] = {}
     complete = False
     note = ""
     if item.kind in {
             "DNF", "YUM", "Zypper", "RPM", "RPM-OSTree"} and shutil.which("rpm"):
-        reverse, complete = rpm_reverse_graph()
-        note = "RPM dependency metadata; weak dependencies may not appear."
+        reverse, all_reverse, relation_map, complete = rpm_dependency_graph()
+        note = (
+            "Current RPM dependency metadata; rich conditional relationships "
+            "can still be ambiguous."
+        )
     elif item.kind == "APT" and shutil.which("dpkg-query"):
         reverse, complete = apt_reverse_graph()
         note = "APT dependency metadata; alternatives can make paths ambiguous."
@@ -1060,13 +1230,34 @@ def dependency_report(item: Match) -> DependencyReport:
         )
     explicit = explicit_names_for_kind(item.kind)
     paths, paths_complete = root_paths(target, reverse, explicit)
+    relationship_paths: list[tuple[list[str], list[str]]] = []
+    relationship_paths_complete = True
+    weak_relations: list[tuple[str, str]] = []
+    if relation_map:
+        all_paths, relationship_paths_complete = relationship_root_paths(
+            target, all_reverse, relation_map, explicit)
+        relationship_paths = [
+            path for path in all_paths
+            if any(relation != "requires" for relation in path[1])
+        ]
+        for dependent in sorted(all_reverse.get(target, set())):
+            for relation in sorted(
+                    relation_map.get((target, dependent), set()) - {"requires"}):
+                weak_relations.append((dependent, relation))
     if not explicit and item.kind in {
             "APT", "DNF", "Pacman", "YUM", "Zypper", "RPM", "RPM-OSTree"}:
         paths_complete = False
         note = (note + " Installation-reason metadata was unavailable.").strip()
     return DependencyReport(
-        item, sorted(reverse.get(target, set())), paths,
-        complete and paths_complete, note,
+        target=item,
+        direct_dependents=sorted(reverse.get(target, set())),
+        root_paths=paths,
+        complete=complete and paths_complete and relationship_paths_complete,
+        note=note,
+        weak_relations=weak_relations,
+        relationship_paths=relationship_paths,
+        history_reason=(
+            dnf_history_reason(target) if item.kind == "DNF" else ""),
     )
 
 
@@ -1313,7 +1504,9 @@ def build_removal_plan(selected: list[Match]) -> RemovalPlan:
     if (protected_items or has_dependents
             or any(name not in orphans for name in additional)):
         level = "HIGH"
-    elif orphans or any(item.role == "dependency" for item in selected):
+    elif orphans or any(
+            item.role in {"dependency", "weak dependency"}
+            for item in selected):
         level = "CAUTION"
     elif not preview_available and any(
             item.kind in uncertain_kinds for item in selected):
@@ -1334,15 +1527,32 @@ def show_dependency_reports(reports: list[DependencyReport]) -> None:
         item = report.target
         print(f"\n{display(item.name)} [{display(item.kind)}]")
         print(f"  Installation role: {display(item.role)}")
+        if report.history_reason:
+            print(f"  Installed because: {display(report.history_reason)}")
         if report.direct_dependents:
             print("  Directly required by: "
                   + ", ".join(display(name) for name in report.direct_dependents[:12]))
             if len(report.direct_dependents) > 12:
                 print(f"  …and {len(report.direct_dependents) - 12} more")
+        if report.weak_relations:
+            print("  Current weak relationships:")
+            for dependent, relation in report.weak_relations[:12]:
+                print(
+                    f"    {display(dependent)} {display(relation)} this package")
+            if len(report.weak_relations) > 12:
+                print(f"    …and {len(report.weak_relations) - 12} more")
         if report.root_paths:
-            print("  Root causes:")
+            print("  Current hard-dependency roots:")
             for path in report.root_paths:
                 print("    " + " → ".join(display(node) for node in path))
+        if report.relationship_paths:
+            print("  Current weak-dependency roots:")
+            for nodes, relations in report.relationship_paths:
+                rendered = display(nodes[0])
+                for relation, node in zip(relations, nodes[1:]):
+                    rendered += (
+                        f" —{display(relation)}→ {display(node)}")
+                print("    " + rendered)
         if not report.complete:
             print("  Dependency explanation may be incomplete.")
         if report.note:
@@ -1377,11 +1587,14 @@ def show_removal_plan(plan: RemovalPlan) -> None:
         print(f"  Note: {display(note)}")
 
 
-def choose(matches: list[Match]) -> list[Match]:
+def choose(matches: list[Match], auto_select: bool = False) -> list[Match]:
     print(f"\nFound {len(matches)} likely installed option{'s' if len(matches) != 1 else ''}:\n")
     for index, item in enumerate(matches, 1):
-        role = (item.role if item.role == "dependency"
-                else "role unknown" if item.role == "unknown" else "")
+        role = (
+            "" if item.role == "explicit"
+            else "role unknown" if item.role == "unknown"
+            else item.role
+        )
         details = " · ".join(
             display(value) for value in (item.version, item.scope, role) if value)
         print(f"  {index:>2}. {display(item.name)}  [{display(item.kind)}]"
@@ -1400,6 +1613,9 @@ def choose(matches: list[Match]) -> list[Match]:
                 )
         if item.kind == "Standalone":
             print("      note: only this executable can be identified automatically")
+    if auto_select and len(matches) == 1:
+        print("\nAutomatically selected the only result (read-only mode).")
+        return matches
     print("\nChoose numbers separated by commas, “a” for all, or Enter to cancel.")
     while True:
         raw = input("> ").strip().casefold()
@@ -1646,7 +1862,7 @@ def run_uninstall(
     print(f"Searching installed apps for “{display(query)}”…")
     matches = annotate_roles(find_matches(query))
     matches, hidden_dependencies = filter_dependency_matches(
-        matches, query, show_dependencies or why_only)
+        matches, query, show_dependencies or why_only or plan_only)
     if hidden_dependencies:
         print(
             f"Hidden {hidden_dependencies} fuzzy dependency match"
@@ -1663,7 +1879,9 @@ def run_uninstall(
             print("No likely installed apps found.")
         return 1
     try:
-        selected = choose(matches)
+        selected = choose(
+            matches, auto_select=(
+                len(matches) == 1 and (why_only or plan_only)))
     except (EOFError, KeyboardInterrupt):
         print("\nCancelled.")
         return 130
@@ -1671,7 +1889,7 @@ def run_uninstall(
         print("Nothing selected.")
         return 0
 
-    if why_only:
+    if why_only and not plan_only:
         show_dependency_reports([dependency_report(item) for item in selected])
         return 0
 
@@ -1791,8 +2009,13 @@ def main() -> int:
     if args.self_uninstall:
         return self_uninstall()
     if not args.app:
-        parser.print_help()
-        return 2
+        try:
+            args.app = input("What app or command do you want to uninstall? ").strip()
+        except EOFError:
+            args.app = ""
+        if not args.app:
+            print("Nothing entered.")
+            return 0
     if norm(args.app) == "uninstall":
         return self_uninstall()
     return run_uninstall(

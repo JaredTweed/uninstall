@@ -21,6 +21,9 @@ SPEC.loader.exec_module(MODULE)
 
 class UninstallTests(unittest.TestCase):
     def setUp(self):
+        MODULE.dnf_install_reasons.cache_clear()
+        MODULE.dnf_history_reason.cache_clear()
+        MODULE.rpm_dependency_graph.cache_clear()
         MODULE.rpm_reverse_graph.cache_clear()
         MODULE.apt_reverse_graph.cache_clear()
         MODULE.pacman_reverse_graph.cache_clear()
@@ -334,24 +337,51 @@ class UninstallTests(unittest.TestCase):
     def test_fuzzy_dependencies_are_collapsed_but_exact_ones_are_not(self):
         dependency = MODULE.Match(
             "DNF", "libedit", "libedit", role="dependency")
+        application = MODULE.Match(
+            "DNF", "cosmic-edit", "cosmic-edit", role="explicit")
         visible, hidden = MODULE.filter_dependency_matches(
-            [dependency], "edit", False)
-        self.assertEqual((visible, hidden), ([], 1))
+            [dependency, application], "edit", False)
+        self.assertEqual((visible, hidden), ([application], 1))
         visible, hidden = MODULE.filter_dependency_matches(
             [dependency], "libedit", False)
         self.assertEqual((visible, hidden), ([dependency], 0))
+        visible, hidden = MODULE.filter_dependency_matches(
+            [dependency], "edit", False)
+        self.assertEqual((visible, hidden), ([dependency], 0))
+
+    @patch.object(MODULE, "capture_any")
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/dnf5")
+    def test_dnf_role_preserves_weak_dependency_reason(
+            self, _which, capture_any):
+        capture_any.return_value = (
+            0, "dosbox-staging|Weak Dependency\nwine|User\n")
+        matches = [
+            MODULE.Match("DNF", "dosbox-staging", "dosbox-staging"),
+            MODULE.Match("DNF", "wine", "wine"),
+        ]
+        result = MODULE.annotate_roles(matches)
+        self.assertEqual(
+            [item.role for item in result],
+            ["weak dependency", "explicit"],
+        )
 
     @patch.object(MODULE, "capture")
     def test_rpm_capability_graph_finds_real_reverse_dependencies(self, capture):
         capture.return_value = (
             "P\tlibfoo\nS\tlibfoo\nS\tlibfoo.so.1()(64bit)\n"
             "P\twine-core\nR\tlibfoo.so.1()(64bit)\nS\twine-core\n"
-            "P\twine\nR\twine-core\nS\twine\n"
+            "P\twine\nR\twine-core\nW\tdosbox-staging\nS\twine\n"
+            "P\tdosbox-staging\nS\tdosbox-staging\n"
         )
         reverse, complete = MODULE.rpm_reverse_graph()
         self.assertTrue(complete)
         self.assertEqual(reverse["libfoo"], {"wine-core"})
         self.assertEqual(reverse["wine-core"], {"wine"})
+        hard, combined, relations, _complete = MODULE.rpm_dependency_graph()
+        self.assertNotIn("dosbox-staging", hard)
+        self.assertEqual(combined["dosbox-staging"], {"wine"})
+        self.assertEqual(
+            relations[("dosbox-staging", "wine")], {"recommends"})
 
     def test_root_cause_paths_stop_at_explicit_applications(self):
         reverse = {
@@ -366,6 +396,46 @@ class UninstallTests(unittest.TestCase):
             paths,
             [["texlive", "tex-engine", "libfoo"],
              ["wine", "wine-core", "libfoo"]],
+        )
+
+    def test_relationship_paths_retain_weak_edge_labels(self):
+        reverse = {
+            "dosbox-staging": {"wine"},
+        }
+        relations = {
+            ("dosbox-staging", "wine"): {"recommends"},
+        }
+        paths, complete = MODULE.relationship_root_paths(
+            "dosbox-staging", reverse, relations, {"wine"})
+        self.assertTrue(complete)
+        self.assertEqual(
+            paths,
+            [(["wine", "dosbox-staging"], ["recommends"])],
+        )
+
+    @patch.object(MODULE, "capture")
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/dnf5")
+    def test_dnf_history_reports_original_install_command(
+            self, _which, capture):
+        capture.side_effect = [
+            MODULE.json.dumps([{
+                "id": 193,
+                "command_line": "dnf install wine",
+            }]),
+            MODULE.json.dumps([{
+                "id": 193,
+                "description": "dnf install wine",
+                "packages": [{
+                    "nevra": "dosbox-staging-0:0.82.2-3.fc42.x86_64",
+                    "action": "Install",
+                    "reason": "Weak Dependency",
+                }],
+            }]),
+        ]
+        self.assertEqual(
+            MODULE.dnf_history_reason("dosbox-staging"),
+            "DNF transaction 193: dnf install wine "
+            "(recorded reason: Weak Dependency)",
         )
 
     @patch.object(MODULE, "capture")
@@ -756,6 +826,15 @@ class UninstallTests(unittest.TestCase):
         with patch("builtins.input", side_effect=["2", ""]):
             self.assertEqual(MODULE.choose(matches), [])
 
+    def test_read_only_mode_auto_selects_one_result(self):
+        item = MODULE.Match("DNF", "dosbox-staging", "dosbox-staging")
+        with patch("builtins.input", side_effect=AssertionError(
+                "read-only unique result must not prompt")):
+            self.assertEqual(
+                MODULE.choose([item], auto_select=True),
+                [item],
+            )
+
     @patch.object(MODULE, "self_uninstall", return_value=0)
     @patch.object(MODULE.sys, "argv", ["uninstall", "uninstall"])
     def test_uninstall_uninstall_is_self_uninstall(self, self_uninstall):
@@ -769,6 +848,16 @@ class UninstallTests(unittest.TestCase):
         run_uninstall.assert_called_once_with(
             "uninstall-helper", show_dependencies=False,
             plan_only=False, why_only=False,
+        )
+
+    @patch.object(MODULE, "run_uninstall", return_value=0)
+    @patch.object(MODULE.sys, "argv", ["uninstall", "--why"])
+    def test_no_argument_prompts_for_an_app(self, run_uninstall):
+        with patch("builtins.input", return_value="DOSbox"):
+            self.assertEqual(MODULE.main(), 0)
+        run_uninstall.assert_called_once_with(
+            "DOSbox", show_dependencies=False,
+            plan_only=False, why_only=True,
         )
 
     @patch.object(MODULE.os, "geteuid", return_value=0)

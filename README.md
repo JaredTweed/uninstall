@@ -94,9 +94,10 @@ uninstall --self-uninstall
 
 Matching is Unicode-aware and case-insensitive. Very short searches require an
 exact match so queries such as `rg` do not produce hundreds of unrelated
-results. Fuzzy matches that the native manager records as automatic
-dependencies are collapsed by default; exact matches and command owners are
-never hidden. Use `--show-dependencies` to expand them.
+results. Fuzzy dependency matches are collapsed when normal application
+matches exist, but a dependency-only result is still shown. Exact matches and
+command owners are never hidden. Use `--show-dependencies` to expand every
+mixed result.
 
 Before any app-data question or removal, `uninstall` builds a read-only
 dependency and transaction plan. For APT, DNF/RPM, Pacman, and Homebrew it
@@ -111,6 +112,25 @@ libfoo [DNF]
     wine → wine-core → libfoo
 ```
 
+On DNF systems, `--why` distinguishes user, group, hard-dependency, and
+weak-dependency installation reasons. It reports current RPM `Recommends`,
+`Suggests`, `Supplements`, and `Enhances` relationships separately from hard
+requirements, and uses DNF5 history to show the original command and recorded
+transaction reason when available:
+
+```text
+dosbox-staging [DNF]
+  Installation role: weak dependency
+  Installed because: DNF transaction 193: dnf install wine
+  Current weak relationships:
+    wine recommends this package
+```
+
+When a read-only `--why` or `--plan` lookup has exactly one result, it is
+selected automatically. Running `uninstall` without an app prompts for one.
+Combining `--why --plan` produces the full plan because `--plan` is the more
+detailed, still read-only operation.
+
 Native simulations determine the packages actually scheduled for removal.
 Impact is labelled `SAFE`, `CAUTION`, `HIGH`, or `UNKNOWN`. High- and
 unknown-impact operations require typing the exact confirmation phrase rather
@@ -118,11 +138,12 @@ than answering `y`. Essential, held, protected, and core packages receive an
 additional warning. `--why` explains dependency paths without creating a
 transaction; `--plan` includes the native transaction preview and then exits.
 
-Dependency explanations are necessarily best effort: alternatives, weak
-dependencies, package groups, and declarative systems do not always preserve
-the human reason an item was installed. When metadata or a dry-run is
-unavailable the result says `UNKNOWN`; it never silently claims the operation
-is safe. The package manager's final transaction is always authoritative.
+Dependency explanations are necessarily best effort: alternatives, rich
+conditional dependencies, pruned transaction history, package groups, and
+declarative systems do not always preserve the human reason an item was
+installed. When metadata or a dry-run is unavailable the result says `UNKNOWN`;
+it never silently claims the operation is safe. The package manager's final
+transaction is always authoritative.
 
 Nothing is removed during search or planning, invalid selections can be
 retried, and pressing Enter at a prompt cancels.
