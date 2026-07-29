@@ -1,10 +1,12 @@
 import importlib.util
 import importlib.machinery
+import io
 import subprocess
 import sys
 import tempfile
 import unittest
 import os
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import call, patch
 
@@ -21,6 +23,8 @@ SPEC.loader.exec_module(MODULE)
 
 class UninstallTests(unittest.TestCase):
     def setUp(self):
+        MODULE.rpm_ostree_layered_packages.cache_clear()
+        MODULE.zypper_userinstalled.cache_clear()
         MODULE.dnf_install_reasons.cache_clear()
         MODULE.dnf_history_reason.cache_clear()
         MODULE.rpm_dependency_graph.cache_clear()
@@ -59,6 +63,34 @@ class UninstallTests(unittest.TestCase):
             self.assertEqual(version.returncode, 0, version.stderr)
             self.assertIn(MODULE.VERSION, version.stdout)
 
+    def test_installer_rejects_a_source_with_the_wrong_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "wrong-version"
+            source.write_text(
+                SCRIPT.read_text(encoding="utf-8").replace(
+                    f'VERSION = "{MODULE.VERSION}"',
+                    'VERSION = "999.0.0"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            source.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update({
+                "PREFIX": str(root / "prefix"),
+                "UNINSTALL_SOURCE_URL": source.as_uri(),
+            })
+            result = subprocess.run(
+                ["sh", str(INSTALLER)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("version mismatch", result.stderr)
+
     def test_matching_ignores_case_and_punctuation(self):
         self.assertTrue(MODULE.relevant("FreeCAD", "org.freecad.FreeCAD"))
         self.assertTrue(MODULE.relevant("visual studio", "visual-studio-code"))
@@ -69,6 +101,18 @@ class UninstallTests(unittest.TestCase):
 
     def test_terminal_control_characters_are_neutralized(self):
         self.assertEqual(MODULE.display("safe\x1b[31m\nname"), "safe?[31m?name")
+
+    def test_ascii_locale_does_not_crash_on_friendly_help_text(self):
+        environment = os.environ.copy()
+        environment.update({"LC_ALL": "C", "PYTHONUTF8": "0"})
+        result = subprocess.run(
+            [str(SCRIPT), "--help"],
+            check=False,
+            capture_output=True,
+            env=environment,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"--why", result.stdout)
 
     @patch.object(MODULE.shutil, "which", return_value="/usr/bin/flatpak")
     @patch.object(MODULE, "capture")
@@ -291,6 +335,49 @@ class UninstallTests(unittest.TestCase):
             ["rm", "--", "/home/test/.local/bin/edit"],
         )
 
+    @patch.object(MODULE.Path, "home", return_value=Path("/home/test"))
+    @patch.object(MODULE.shutil, "which")
+    def test_unowned_system_command_is_never_treated_as_standalone(
+            self, which, _home):
+        which.side_effect = {
+            "mystery": "/usr/bin/mystery",
+        }.get
+        self.assertEqual(
+            MODULE.detect_executable_owner("mystery"),
+            [],
+        )
+        self.assertEqual(
+            MODULE.unidentified_system_command("mystery"),
+            "/usr/bin/mystery",
+        )
+
+    @patch.object(MODULE.shutil, "which")
+    def test_extensionless_appimage_command_removes_image_and_symlink(
+            self, which):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "Applications" / "editor"
+            image.parent.mkdir()
+            image.write_bytes(
+                b"\x7fELF" + b"\0" * 4 + b"AI\x02" + b"\0" * 8)
+            image.chmod(0o755)
+            link = root / "bin" / "edit"
+            link.parent.mkdir()
+            link.symlink_to(image)
+            which.side_effect = {
+                "edit": str(link),
+            }.get
+            with patch.object(MODULE.Path, "home", return_value=root):
+                result = MODULE.detect_executable_owner("edit")
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0].kind, "AppImage")
+            self.assertEqual(result[0].path, image)
+            self.assertEqual(result[0].provides, str(link))
+            self.assertEqual(
+                MODULE.uninstall_command(result[0], False),
+                ["rm", "--", str(image), str(link)],
+            )
+
     @patch.object(MODULE, "DETECTORS")
     def test_exact_command_suppresses_loose_package_matches(self, detectors):
         detectors.__iter__.return_value = iter([
@@ -320,6 +407,26 @@ class UninstallTests(unittest.TestCase):
             lambda _query: [generic, managed],
         ])
         self.assertEqual(MODULE.find_matches(str(path)), [managed])
+
+    @patch.object(MODULE, "DETECTORS")
+    def test_package_owner_wins_over_generic_appimage(self, detectors):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "edit"
+            image_path.touch()
+            command_path = root / "bin" / "edit"
+            command_path.parent.mkdir()
+            command_path.symlink_to(image_path)
+            managed = MODULE.Match(
+                "DNF", "packaged-editor", "packaged-editor",
+                provides=str(command_path),
+            )
+            appimage = MODULE.Match(
+                "AppImage", str(image_path), "edit", path=image_path)
+            detectors.__iter__.return_value = iter([
+                lambda _query: [appimage, managed],
+            ])
+            self.assertEqual(MODULE.find_matches("edit"), [managed])
 
     @patch.object(MODULE, "capture_any")
     @patch.object(MODULE.shutil, "which")
@@ -365,6 +472,69 @@ class UninstallTests(unittest.TestCase):
             ["weak dependency", "explicit"],
         )
 
+    @patch.object(MODULE, "capture_any")
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/zypper")
+    def test_zypper_roles_use_machine_readable_install_reasons(
+            self, _which, capture_any):
+        capture_any.return_value = (
+            0,
+            '<?xml version="1.0"?><stream><package-list>'
+            '<solvable kind="package" name="editor"/>'
+            '</package-list></stream>',
+        )
+        matches = [
+            MODULE.Match("Zypper", "editor", "editor"),
+            MODULE.Match("Zypper", "libeditor", "libeditor"),
+        ]
+        result = MODULE.annotate_roles(matches)
+        self.assertEqual(
+            [item.role for item in result],
+            ["explicit", "dependency"],
+        )
+
+    @patch.object(MODULE, "capture")
+    @patch.object(MODULE.shutil, "which")
+    def test_rpm_ostree_inventory_contains_only_layered_requests(
+            self, which, capture):
+        which.side_effect = {
+            "rpm-ostree": "/usr/bin/rpm-ostree",
+        }.get
+        capture.return_value = MODULE.json.dumps({
+            "deployments": [{
+                "booted": True,
+                "requested-packages": ["layered-app", "inactive-request"],
+                "packages": ["layered-app"],
+            }],
+        })
+        ok, names = MODULE.rpm_ostree_layered_packages()
+        self.assertTrue(ok)
+        self.assertEqual(names, {"layered-app", "inactive-request"})
+
+    @patch.object(MODULE, "rpm_manager", return_value="RPM-OSTree")
+    @patch.object(MODULE.shutil, "which")
+    @patch.object(MODULE, "capture")
+    def test_rpm_ostree_base_command_is_not_mistaken_for_standalone(
+            self, capture, which, _manager):
+        which.side_effect = {
+            "base-tool": "/usr/bin/base-tool",
+            "rpm": "/usr/bin/rpm",
+            "rpm-ostree": "/usr/bin/rpm-ostree",
+        }.get
+        capture.side_effect = [
+            "base-package\t1.0-1\n",
+            MODULE.json.dumps({
+                "deployments": [{
+                    "booted": True,
+                    "requested-packages": [],
+                    "packages": [],
+                }],
+            }),
+        ]
+        self.assertEqual(
+            MODULE.detect_executable_owner("base-tool"),
+            [],
+        )
+
     @patch.object(MODULE, "capture")
     def test_rpm_capability_graph_finds_real_reverse_dependencies(self, capture):
         capture.return_value = (
@@ -382,6 +552,25 @@ class UninstallTests(unittest.TestCase):
         self.assertEqual(combined["dosbox-staging"], {"wine"})
         self.assertEqual(
             relations[("dosbox-staging", "wine")], {"recommends"})
+
+    @patch.object(MODULE, "capture")
+    def test_rpm_reverse_weak_dependencies_point_to_the_install_cause(
+            self, capture):
+        capture.return_value = (
+            "P\tbase-app\nS\tbase-app\n"
+            "P\taddon\nU\tbase-app\nS\taddon\n"
+        )
+        _hard, combined, relations, complete = MODULE.rpm_dependency_graph()
+        self.assertTrue(complete)
+        self.assertEqual(combined["addon"], {"base-app"})
+        self.assertEqual(
+            relations[("addon", "base-app")], {"is supplemented by"})
+        paths, _complete = MODULE.relationship_root_paths(
+            "addon", combined, relations, {"base-app"})
+        self.assertEqual(
+            paths,
+            [(["base-app", "addon"], ["is supplemented by"])],
+        )
 
     def test_root_cause_paths_stop_at_explicit_applications(self):
         reverse = {
@@ -412,6 +601,26 @@ class UninstallTests(unittest.TestCase):
             paths,
             [(["wine", "dosbox-staging"], ["recommends"])],
         )
+
+    def test_dependency_output_does_not_repeat_a_direct_weak_path(self):
+        item = MODULE.Match(
+            "DNF", "dosbox-staging", "dosbox-staging",
+            role="weak dependency",
+        )
+        report = MODULE.DependencyReport(
+            item, [], [], True,
+            weak_relations=[("wine", "recommends")],
+            relationship_paths=[
+                (["wine", "dosbox-staging"], ["recommends"]),
+            ],
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            MODULE.show_dependency_reports([report])
+        rendered = output.getvalue()
+        self.assertEqual(
+            rendered.count("wine --recommends--> dosbox-staging"), 1)
+        self.assertNotIn("Other optional relationships", rendered)
 
     @patch.object(MODULE, "capture")
     @patch.object(MODULE.shutil, "which", return_value="/usr/bin/dnf5")
@@ -547,7 +756,7 @@ class UninstallTests(unittest.TestCase):
         build_plan.return_value = MODULE.RemovalPlan(
             [item], [MODULE.DependencyReport(item, ["other"], [])],
             ["tool", "other"], ["other"], [], "HIGH", True, [], [])
-        with patch("builtins.input", side_effect=["1", "y"]):
+        with patch("builtins.input", return_value="y"):
             self.assertEqual(MODULE.run_uninstall("tool"), 0)
         run.assert_not_called()
 
@@ -564,8 +773,9 @@ class UninstallTests(unittest.TestCase):
         filter_matches.return_value = ([item], 0)
         build_plan.return_value = MODULE.RemovalPlan(
             [item], [MODULE.DependencyReport(item, [], [])],
-            ["tool"], [], [], "SAFE", True, [], [])
-        with patch("builtins.input", return_value="1"):
+            ["tool"], [], [], "LOW", True, [], [])
+        with patch("builtins.input", side_effect=AssertionError(
+                "a unique read-only result must not prompt")):
             self.assertEqual(
                 MODULE.run_uninstall("tool", plan_only=True), 0)
         run.assert_not_called()
@@ -658,11 +868,36 @@ class UninstallTests(unittest.TestCase):
     @patch.object(MODULE, "capture")
     def test_pipx_packages_can_be_found_without_knowing_exposed_command(
             self, capture, _which):
-        capture.side_effect = ["httpie 3.2.4\n", ""]
+        capture.side_effect = ["", "httpie 3.2.4\n", "", ""]
         result = MODULE.detect_pipx("httpie")
         self.assertEqual(
             (result[0].kind, result[0].ident, result[0].version),
             ("Pipx", "httpie", "3.2.4"),
+        )
+
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/pipx")
+    @patch.object(MODULE, "capture")
+    def test_pipx_prefers_machine_readable_inventory(self, capture, _which):
+        capture.side_effect = [
+            MODULE.json.dumps({
+                "pipx_spec_version": "0.1",
+                "venvs": {
+                    "httpie": {
+                        "metadata": {
+                            "main_package": {
+                                "package": "httpie",
+                                "package_version": "3.2.4",
+                            },
+                        },
+                    },
+                },
+            }),
+            "{}",
+        ]
+        result = MODULE.detect_pipx("httpie")
+        self.assertEqual(
+            (result[0].ident, result[0].version),
+            ("httpie", "3.2.4"),
         )
 
     @patch.object(MODULE.shutil, "which")
@@ -693,6 +928,20 @@ class UninstallTests(unittest.TestCase):
              ("2", ["/nix/store/def-tool", "/nix/store/ghi-lib"])],
         )
 
+    def test_nix_profile_json_parser_handles_current_schema(self):
+        text = MODULE.json.dumps({
+            "version": 3,
+            "elements": {
+                "hello": {
+                    "storePaths": ["/nix/store/abc-hello"],
+                },
+            },
+        })
+        self.assertEqual(
+            MODULE.parse_nix_profile_json(text),
+            [("hello", ["/nix/store/abc-hello"])],
+        )
+
     def test_commands_are_exact_and_do_not_use_a_shell(self):
         item = MODULE.Match("Flatpak", "org.freecad.FreeCAD", "FreeCAD",
                             "1.0", "user")
@@ -701,6 +950,45 @@ class UninstallTests(unittest.TestCase):
             ["flatpak", "uninstall", "-y", "--user", "--delete-data",
              "org.freecad.FreeCAD"],
         )
+
+    def test_homebrew_cask_cleanup_uses_zap(self):
+        item = MODULE.Match(
+            "Homebrew Cask", "firefox", "firefox", scope="user")
+        self.assertEqual(
+            MODULE.uninstall_command(item, True),
+            ["brew", "uninstall", "--cask", "--zap", "firefox"],
+        )
+
+    @patch.object(MODULE.os, "geteuid", return_value=0)
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/dnf5")
+    def test_same_backend_selections_run_as_one_transaction(
+            self, _which, _euid):
+        selected = [
+            MODULE.Match("DNF", "first", "first"),
+            MODULE.Match("DNF", "second", "second"),
+        ]
+        self.assertEqual(
+            MODULE.build_uninstall_batches(selected, False),
+            [(
+                selected,
+                ["dnf5", "remove", "first", "second"],
+            )],
+        )
+
+    def test_snap_cleanup_means_purge_not_manual_home_deletion(self):
+        item = MODULE.Match("Snap", "example", "example", scope="system")
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            snap_data = home / "snap" / "example"
+            snap_data.mkdir(parents=True)
+            with patch.object(MODULE.Path, "home", return_value=home):
+                self.assertNotIn(snap_data, MODULE.find_user_data([item]))
+        with patch.object(
+                MODULE, "privileged", side_effect=lambda command: command):
+            self.assertEqual(
+                MODULE.uninstall_command(item, True),
+                ["snap", "remove", "--purge", "example"],
+            )
 
     def test_user_data_only_matches_exact_directory_name(self):
         selected = [MODULE.Match("APT", "freecad", "freecad")]
@@ -790,9 +1078,35 @@ class UninstallTests(unittest.TestCase):
         find_matches.return_value = [item]
         find_user_data.return_value = [Path("/home/test/.config/Example")]
         run.return_value.returncode = 1
-        with patch("builtins.input", side_effect=["1", "y", "y"]):
+        with patch("builtins.input", side_effect=["y", "a", "y"]):
             self.assertEqual(MODULE.run_uninstall("Example"), 1)
         remove_paths.assert_not_called()
+        self.assertIn("--delete-data", run.call_args.args[0])
+
+    def test_user_can_choose_individual_cleanup_paths(self):
+        paths = [Path("/tmp/first"), Path("/tmp/second")]
+        with patch("builtins.input", return_value="2"):
+            self.assertEqual(
+                MODULE.choose_cleanup_paths(paths),
+                [paths[1]],
+            )
+
+    def test_manager_cleanup_choices_are_independent(self):
+        selected = [
+            MODULE.Match(
+                "Flatpak", "org.example.App", "Example", scope="user"),
+            MODULE.Match("APT", "example", "example"),
+        ]
+        with patch("builtins.input", side_effect=["y", "n"]):
+            cleanup_kinds, paths = MODULE.ask_cleanup(selected, [])
+        self.assertEqual(cleanup_kinds, {"Flatpak"})
+        self.assertEqual(paths, [])
+        with patch.object(
+                MODULE, "privileged", side_effect=lambda command: command):
+            batches = MODULE.build_uninstall_batches(
+                selected, cleanup_kinds)
+        self.assertIn("--delete-data", batches[0][1])
+        self.assertEqual(batches[1][1][:2], ["apt-get", "remove"])
 
     @patch.object(MODULE.subprocess, "run")
     @patch.object(MODULE, "find_user_data", return_value=[])
@@ -802,7 +1116,7 @@ class UninstallTests(unittest.TestCase):
         find_matches.return_value = [
             MODULE.Match("Cargo", "tool", "tool", scope="user")
         ]
-        with patch("builtins.input", side_effect=["1", ""]):
+        with patch("builtins.input", return_value=""):
             self.assertEqual(MODULE.run_uninstall("tool"), 0)
         run.assert_not_called()
 
@@ -840,6 +1154,19 @@ class UninstallTests(unittest.TestCase):
     def test_uninstall_uninstall_is_self_uninstall(self, self_uninstall):
         self.assertEqual(MODULE.main(), 0)
         self_uninstall.assert_called_once_with()
+
+    @patch.object(MODULE, "self_uninstall", return_value=0)
+    @patch.object(MODULE, "run_uninstall", return_value=0)
+    @patch.object(
+        MODULE.sys, "argv", ["uninstall", "uninstall", "--why"])
+    def test_uninstall_why_does_not_trigger_self_removal(
+            self, run_uninstall, self_uninstall):
+        self.assertEqual(MODULE.main(), 0)
+        self_uninstall.assert_not_called()
+        run_uninstall.assert_called_once_with(
+            "uninstall", show_dependencies=False,
+            plan_only=False, why_only=True,
+        )
 
     @patch.object(MODULE, "run_uninstall", return_value=0)
     @patch.object(MODULE.sys, "argv", ["uninstall", "uninstall-helper"])

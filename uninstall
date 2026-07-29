@@ -13,13 +13,14 @@ import shutil
 import subprocess
 import sys
 import unicodedata
+import xml.etree.ElementTree as ET
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 
 
 @dataclass(frozen=True)
@@ -79,12 +80,49 @@ def display(value: object) -> str:
     )
 
 
+def configure_output() -> None:
+    """Never crash merely because a terminal uses an ASCII-only locale."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(errors="replace")
+            except (LookupError, OSError):
+                pass
+
+
 def path_is_within(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)
         return True
     except ValueError:
         return False
+
+
+def safe_standalone_location(path: Path) -> bool:
+    """Allow direct deletion only in user/admin application locations."""
+    absolute = path.absolute()
+    if path_is_within(absolute, Path.home()):
+        return True
+    return any(
+        path_is_within(absolute, root)
+        for root in (Path("/usr/local"), Path("/opt"))
+    )
+
+
+def is_appimage_file(path: Path) -> bool:
+    """Recognize type 1/2 AppImages even when their filename has no extension."""
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(11)
+    except OSError:
+        return False
+    return (
+        len(header) >= 11
+        and header[:4] == b"\x7fELF"
+        and header[8:10] == b"AI"
+        and header[10] in {1, 2}
+    )
 
 
 def relevant(query: str, *values: str) -> bool:
@@ -146,6 +184,48 @@ def rpm_manager() -> str:
     return "RPM" if shutil.which("rpm") else ""
 
 
+@lru_cache(maxsize=1)
+def rpm_ostree_layered_packages() -> tuple[bool, set[str]]:
+    if not shutil.which("rpm-ostree"):
+        return False, set()
+    try:
+        payload = json.loads(capture(["rpm-ostree", "status", "--json"]))
+    except (json.JSONDecodeError, TypeError):
+        return False, set()
+    deployments = payload.get("deployments", []) if isinstance(payload, dict) else []
+    if not isinstance(deployments, list) or not deployments:
+        return False, set()
+    deployment = next(
+        (
+            item for item in deployments
+            if isinstance(item, dict) and item.get("booted") is True
+        ),
+        deployments[0],
+    )
+    if not isinstance(deployment, dict):
+        return False, set()
+    names: set[str] = set()
+    for key in ("requested-packages", "packages"):
+        values = deployment.get(key, [])
+        if isinstance(values, list):
+            names.update(value for value in values if isinstance(value, str))
+    for key in (
+            "requested-local-packages",
+            "requested-local-fileoverride-packages"):
+        values = deployment.get(key, [])
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            queried = capture([
+                "rpm", "-q", "--qf", "%{NAME}\\n", "--", value,
+            ]).strip()
+            if queried:
+                names.update(queried.splitlines())
+    return True, names
+
+
 def detect_flatpak(query: str) -> list[Match]:
     if not shutil.which("flatpak"):
         return []
@@ -194,11 +274,20 @@ def detect_rpm(query: str) -> list[Match]:
     kind = rpm_manager()
     if not kind:
         return []
+    layered_ok, layered = (
+        rpm_ostree_layered_packages()
+        if kind == "RPM-OSTree" else (True, set())
+    )
+    if kind == "RPM-OSTree" and not layered_ok:
+        return []
     fmt = "%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{SUMMARY}\\n"
     found: list[Match] = []
     for line in capture(["rpm", "-qa", "--qf", fmt]).splitlines():
         fields = line.split("\t", 2)
-        if len(fields) >= 2 and relevant(query, fields[0], fields[2] if len(fields) > 2 else ""):
+        if (len(fields) >= 2
+                and (kind != "RPM-OSTree" or fields[0] in layered)
+                and relevant(
+                    query, fields[0], fields[2] if len(fields) > 2 else "")):
             found.append(Match(kind, fields[0], fields[0], fields[1], "system"))
     return found
 
@@ -309,12 +398,46 @@ def detect_pipx(query: str) -> list[Match]:
         return []
     found: list[Match] = []
     for scope, extra in (("user", []), ("system", ["--global"])):
-        command = ["pipx", "list", "--short"] + extra
-        for line in capture(command).splitlines():
+        text = capture(["pipx", "list", "--json"] + extra)
+        parsed = False
+        try:
+            payload = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        venvs = payload.get("venvs", {}) if isinstance(payload, dict) else {}
+        if isinstance(venvs, dict):
+            for environment, metadata in venvs.items():
+                if not isinstance(environment, str) or not isinstance(metadata, dict):
+                    continue
+                details = metadata.get("metadata", metadata)
+                main = (
+                    details.get("main_package", {})
+                    if isinstance(details, dict) else {}
+                )
+                package = (
+                    main.get("package", environment)
+                    if isinstance(main, dict) else environment
+                )
+                version = (
+                    main.get("package_version", "")
+                    if isinstance(main, dict) else ""
+                )
+                if not isinstance(package, str):
+                    package = environment
+                if not isinstance(version, str):
+                    version = ""
+                if relevant(query, environment, package):
+                    found.append(Match(
+                        "Pipx", environment, package, version, scope))
+            parsed = bool(text)
+        if parsed:
+            continue
+        for line in capture(["pipx", "list", "--short"] + extra).splitlines():
             fields = line.split()
             if fields and relevant(query, fields[0]):
-                found.append(Match("Pipx", fields[0], fields[0],
-                                   fields[1] if len(fields) > 1 else "", scope))
+                found.append(Match(
+                    "Pipx", fields[0], fields[0],
+                    fields[1] if len(fields) > 1 else "", scope))
     return found
 
 
@@ -388,13 +511,41 @@ def parse_nix_profile(text: str) -> list[tuple[str, list[str]]]:
     return entries
 
 
+def parse_nix_profile_json(text: str) -> list[tuple[str, list[str]]]:
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    elements = payload.get("elements", payload)
+    if not isinstance(elements, dict):
+        return []
+    entries: list[tuple[str, list[str]]] = []
+    for ident, metadata in elements.items():
+        if not isinstance(ident, str) or not isinstance(metadata, dict):
+            continue
+        raw_paths = metadata.get("storePaths", metadata.get("store_paths", []))
+        stores = [
+            path for path in raw_paths
+            if isinstance(path, str)
+        ] if isinstance(raw_paths, list) else []
+        if stores:
+            entries.append((ident, stores))
+    return entries
+
+
 def detect_nix(query: str) -> list[Match]:
     if not shutil.which("nix"):
         return []
     executable = shutil.which(query) if Path(query).name == query else None
     resolved = str(Path(executable).resolve()) if executable else ""
     found: list[Match] = []
-    for ident, stores in parse_nix_profile(capture(["nix", "profile", "list"])):
+    text = capture(["nix", "profile", "list", "--json"])
+    entries = parse_nix_profile_json(text)
+    if not entries:
+        entries = parse_nix_profile(capture(["nix", "profile", "list"]))
+    for ident, stores in entries:
         owns_command = bool(resolved) and any(
             resolved == store or resolved.startswith(store.rstrip("/") + "/")
             for store in stores
@@ -462,6 +613,8 @@ def detect_executable_owner(query: str) -> list[Match]:
     resolved = Path(executable).resolve()
     path = str(resolved)
     found: list[Match] = []
+    base_image_owner = False
+    appimage_candidate: Match | None = None
 
     managed = snap_command_owner(query, visible) or flatpak_command_owner(visible)
     if managed:
@@ -470,9 +623,17 @@ def detect_executable_owner(query: str) -> list[Match]:
             or "/flatpak/exports/bin/" in str(visible)):
         return []
 
-    if visible.name.casefold().endswith(".appimage"):
-        scope = "user" if path_is_within(visible, Path.home()) else "system"
-        return [Match("AppImage", str(visible), visible.stem, "", scope, visible)]
+    appimage_magic = is_appimage_file(resolved)
+    if ((appimage_magic
+            or (visible.name.casefold().endswith(".appimage")
+                and not visible.is_symlink()))
+            and safe_standalone_location(visible)):
+        target = resolved if visible.is_symlink() else visible
+        scope = "user" if path_is_within(target, Path.home()) else "system"
+        appimage_candidate = Match(
+            "AppImage", str(target), target.stem, "", scope, target,
+            provides=str(visible) if visible != target else "",
+        )
 
     brew_parts = path_after(resolved.parts, "Cellar")
     brew_cellar = capture(["brew", "--cellar"]).strip() if shutil.which("brew") else ""
@@ -513,6 +674,11 @@ def detect_executable_owner(query: str) -> list[Match]:
             for line in capture(["rpm", "-qf", "--qf", fmt, owner_path]).splitlines():
                 fields = line.split("\t", 1)
                 if fields and fields[0]:
+                    if kind == "RPM-OSTree":
+                        layered_ok, layered = rpm_ostree_layered_packages()
+                        if not layered_ok or fields[0] not in layered:
+                            base_image_owner = True
+                            continue
                     found.append(Match(kind, fields[0], fields[0],
                                        fields[1] if len(fields) > 1 else "",
                                        "system", provides=str(visible)))
@@ -540,6 +706,12 @@ def detect_executable_owner(query: str) -> list[Match]:
                     found.append(Match("Pacman", fields[0], fields[0],
                                        fields[1] if len(fields) > 1 else "",
                                        "system", provides=str(visible)))
+    if found:
+        return found
+    if base_image_owner:
+        return []
+    if appimage_candidate:
+        return [appimage_candidate]
     if not found:
         protected_markers = (
             "/nix/store/", "/node_modules/", "/pipx/venvs/",
@@ -548,18 +720,65 @@ def detect_executable_owner(query: str) -> list[Match]:
         if any(marker in path for marker in protected_markers):
             return []
         scope = "user" if path_is_within(visible, Path.home()) else "system"
-        found.append(Match("Standalone", str(visible), query, "",
-                           scope, path=visible))
+        if safe_standalone_location(visible):
+            found.append(Match("Standalone", str(visible), query, "",
+                               scope, path=visible))
     return found
+
+
+def unidentified_system_command(query: str) -> str:
+    if not query or Path(query).name != query:
+        return ""
+    executable = shutil.which(query)
+    if not executable:
+        return ""
+    visible = Path(executable).absolute()
+    return "" if safe_standalone_location(visible) else str(visible)
+
+
+def rpm_ostree_base_match(query: str) -> str:
+    """Return an exact base-image RPM match that normal uninstall must not stage."""
+    if rpm_manager() != "RPM-OSTree" or not shutil.which("rpm"):
+        return ""
+    layered_ok, layered = rpm_ostree_layered_packages()
+    if not layered_ok:
+        return ""
+    candidates: list[str] = []
+    executable = shutil.which(query) if Path(query).name == query else ""
+    if executable:
+        visible = Path(executable).absolute()
+        candidates.extend(dict.fromkeys((
+            str(visible.resolve()), str(visible),
+        )))
+    elif Path(query).name == query:
+        candidates.append(query)
+    for candidate in candidates:
+        option = "-qf" if "/" in candidate else "-q"
+        name = capture([
+            "rpm", option, "--qf", "%{NAME}\\n", "--", candidate,
+        ]).strip().splitlines()
+        if name and name[0] not in layered:
+            return name[0]
+    return ""
 
 
 def detect_appimages(query: str) -> list[Match]:
     explicit = Path(query).expanduser()
     if ("/" in query and explicit.is_file()
-            and explicit.name.casefold().endswith(".appimage")):
-        path = explicit.absolute()
+            and (explicit.name.casefold().endswith(".appimage")
+                 or is_appimage_file(explicit))):
+        visible = explicit.absolute()
+        resolved = visible.resolve()
+        path = (
+            resolved
+            if visible.is_symlink() and is_appimage_file(resolved)
+            else visible
+        )
         scope = "user" if path_is_within(path, Path.home()) else "system"
-        return [Match("AppImage", str(path), path.stem, "", scope, path)]
+        return [Match(
+            "AppImage", str(path), path.stem, "", scope, path,
+            provides=str(visible) if visible != path else "",
+        )]
     roots = [
         Path.home() / "Applications", Path.home() / ".local/bin",
         Path.home() / "Downloads", Path.home() / "Desktop",
@@ -612,8 +831,13 @@ def detect_package_archive(query: str) -> list[Match]:
         for line in installed:
             installed_fields = line.split("\t")
             if len(installed_fields) == 3 and installed_fields[0] == name:
+                kind = rpm_manager()
+                if kind == "RPM-OSTree":
+                    layered_ok, layered = rpm_ostree_layered_packages()
+                    if not layered_ok or name not in layered:
+                        return []
                 return [Match(
-                    rpm_manager(), name, name, installed_fields[1], "system",
+                    kind, name, name, installed_fields[1], "system",
                     archive=archive, archive_version=archive_version,
                 )]
         return []
@@ -731,13 +955,24 @@ def find_matches(query: str) -> list[Match]:
             item.provides for item in command_candidates
             if item.kind != "Standalone" and item.provides
         }
+        managed_resolved_paths: set[str] = set()
+        for value in managed_paths:
+            try:
+                managed_resolved_paths.add(str(Path(value).resolve()))
+            except OSError:
+                continue
         commands = [
             item for item in command_candidates
             if item.kind != "Standalone" or str(item.path) not in managed_paths
         ]
         results = commands + [
             item for item in results
-            if item not in command_candidates and exact_app_match(item, query)
+            if (item not in command_candidates
+                and exact_app_match(item, query)
+                and not (
+                    item.kind == "AppImage" and item.path
+                    and str(item.path.resolve()) in managed_resolved_paths
+                ))
         ]
     return sorted(results, key=lambda item: score(item, query))
 
@@ -751,6 +986,34 @@ def command_lines(command: list[str]) -> tuple[bool, set[str]]:
     return code == 0, {
         line.strip() for line in output.splitlines() if line.strip()
     }
+
+
+@lru_cache(maxsize=1)
+def zypper_userinstalled() -> tuple[bool, set[str]]:
+    command = [
+        "zypper", "--no-refresh", "--xmlout", "packages",
+        "--installed-only", "--userinstalled",
+    ]
+    code, output = capture_any(command, timeout=30)
+    if code != 0:
+        return False, set()
+    names: set[str] = set()
+    try:
+        root = ET.fromstring(output)
+    except ET.ParseError:
+        root = None
+    if root is not None:
+        for element in root.iter():
+            name = element.attrib.get("name", "")
+            kind = element.attrib.get("kind", "package")
+            if name and kind in {"", "package"}:
+                names.add(name)
+    if not names:
+        for line in output.splitlines():
+            fields = [field.strip() for field in line.split("|")]
+            if len(fields) >= 4 and fields[0].startswith("i"):
+                names.add(fields[2])
+    return True, names
 
 
 @lru_cache(maxsize=1)
@@ -798,7 +1061,8 @@ def annotate_roles(matches: list[Match]) -> list[Match]:
         if ok:
             role_names = {
                 "user": "explicit",
-                "external user": "explicit",
+                "external user": "external",
+                "external": "external",
                 "group": "group",
                 "dependency": "dependency",
                 "weak dependency": "weak dependency",
@@ -826,6 +1090,23 @@ def annotate_roles(matches: list[Match]) -> list[Match]:
                             "explicit" if item.ident in explicit else "dependency")
                         roles[(item.kind, item.ident, item.scope)] = role
 
+    if by_kind.get("Zypper") and shutil.which("zypper"):
+        ok, explicit = zypper_userinstalled()
+        if ok:
+            for item in by_kind["Zypper"]:
+                roles[(item.kind, item.ident, item.scope)] = (
+                    "explicit" if item.ident in explicit else "dependency")
+
+    if by_kind.get("YUM") and shutil.which("yum"):
+        ok, explicit = command_lines([
+            "yum", "repoquery", "--installed", "--userinstalled",
+            "--qf", "%{name}\\n",
+        ])
+        if ok:
+            for item in by_kind["YUM"]:
+                roles[(item.kind, item.ident, item.scope)] = (
+                    "explicit" if item.ident in explicit else "dependency")
+
     if by_kind.get("Pacman") and shutil.which("pacman"):
         ok, explicit = command_lines(["pacman", "-Qqe"])
         if ok:
@@ -844,7 +1125,7 @@ def annotate_roles(matches: list[Match]) -> list[Match]:
 
     inherently_explicit = {
         "Flatpak", "Homebrew Cask", "Cargo", "Pipx", "NPM", "Nix",
-        "AppImage", "Gear Lever", "Standalone",
+        "AppImage", "Gear Lever", "Standalone", "RPM-OSTree",
     }
     for item in matches:
         key = (item.kind, item.ident, item.scope)
@@ -935,8 +1216,21 @@ def rpm_dependency_graph() -> tuple[
                 for provider in providers.get(capability, set()):
                     if provider == dependent:
                         continue
-                    all_reverse[provider].add(dependent)
-                    relations[(provider, dependent)].add(relation)
+                    if relation == "supplements":
+                        # "A Supplements: B" means B can cause A to be
+                        # installed, the reverse direction of Recommends.
+                        all_reverse[dependent].add(provider)
+                        relations[(dependent, provider)].add(
+                            "is supplemented by")
+                    elif relation == "enhances":
+                        # Enhances is the reverse-direction counterpart to
+                        # Suggests.
+                        all_reverse[dependent].add(provider)
+                        relations[(dependent, provider)].add(
+                            "is enhanced by")
+                    else:
+                        all_reverse[provider].add(dependent)
+                        relations[(provider, dependent)].add(relation)
                     if relation == "requires":
                         hard_reverse[provider].add(dependent)
     return (
@@ -1086,8 +1380,8 @@ def relationship_root_paths(
         "requires": 0,
         "recommends": 1,
         "suggests": 2,
-        "supplements": 3,
-        "enhances": 4,
+        "is supplemented by": 3,
+        "is enhanced by": 4,
     }
     detailed: list[tuple[list[str], list[str]]] = []
     for nodes in paths:
@@ -1164,7 +1458,8 @@ def explicit_names_for_kind(kind: str) -> set[str]:
         if reasons_ok:
             return {
                 name for name, reason in reasons.items()
-                if reason.casefold() in {"user", "external user", "group"}
+                if reason.casefold() in {
+                    "user", "external", "external user", "group"}
             }
         manager = "dnf5" if shutil.which("dnf5") else "dnf"
         command = ([manager, "repoquery", "--userinstalled",
@@ -1182,6 +1477,18 @@ def explicit_names_for_kind(kind: str) -> set[str]:
             "brew", "list", "--formula", "--installed-on-request",
         ])
         return names if ok else set()
+    if kind == "Zypper" and shutil.which("zypper"):
+        ok, names = zypper_userinstalled()
+        return names if ok else set()
+    if kind == "YUM" and shutil.which("yum"):
+        ok, names = command_lines([
+            "yum", "repoquery", "--installed", "--userinstalled",
+            "--qf", "%{name}\\n",
+        ])
+        return names if ok else set()
+    if kind == "RPM-OSTree":
+        ok, names = rpm_ostree_layered_packages()
+        return names if ok else set()
     return set()
 
 
@@ -1196,12 +1503,12 @@ def dependency_report(item: Match) -> DependencyReport:
             "DNF", "YUM", "Zypper", "RPM", "RPM-OSTree"} and shutil.which("rpm"):
         reverse, all_reverse, relation_map, complete = rpm_dependency_graph()
         note = (
-            "Current RPM dependency metadata; rich conditional relationships "
-            "can still be ambiguous."
+            "Paths use current RPM metadata; complex conditional "
+            "dependencies can be ambiguous."
         )
     elif item.kind == "APT" and shutil.which("dpkg-query"):
         reverse, complete = apt_reverse_graph()
-        note = "APT dependency metadata; alternatives can make paths ambiguous."
+        note = "Paths use current APT metadata; alternatives can be ambiguous."
     elif item.kind == "Pacman" and shutil.which("pacman"):
         reverse, complete = pacman_reverse_graph()
     elif item.kind == "Homebrew" and shutil.which("brew"):
@@ -1214,7 +1521,7 @@ def dependency_report(item: Match) -> DependencyReport:
         explicit = explicit_names_for_kind(item.kind)
         roots = sorted(recursive.intersection(explicit))[:8]
         return DependencyReport(
-            item, sorted(direct), [[root, "…", target] for root in roots],
+            item, sorted(direct), [[root, "...", target] for root in roots],
             direct_ok and recursive_ok,
             "Homebrew reports recursive root causes without exact path edges.",
         )
@@ -1222,6 +1529,14 @@ def dependency_report(item: Match) -> DependencyReport:
         return DependencyReport(
             item, [], [], True,
             "Gear Lever manages this installation as a single AppImage.",
+        )
+    elif item.kind in {
+            "Flatpak", "AppImage", "Standalone", "Cargo", "Pipx", "NPM", "Nix",
+            "Homebrew Cask"}:
+        return DependencyReport(
+            item, [], [], True,
+            "This is a top-level or self-contained installation; "
+            "no system-package dependency path applies.",
         )
     else:
         return DependencyReport(
@@ -1381,9 +1696,21 @@ def native_removal_preview(
             notes.append(
                 "Snap bases and content providers are checked by snapd only during removal."
             )
+        elif kind == "Flatpak":
+            planned.extend(identifiers)
+            notes.append(
+                "Flatpak can also remove app-specific related extensions; "
+                "shared runtimes are not removed by this command."
+            )
+        elif kind == "Nix":
+            planned.extend(identifiers)
+            notes.append(
+                "Nix removes the profile entries; unreachable store paths "
+                "remain until garbage collection."
+            )
         elif kind in {
-            "Flatpak", "Homebrew Cask", "Cargo", "Pipx",
-            "NPM", "Nix", "AppImage", "Gear Lever",
+            "Homebrew Cask", "Cargo", "Pipx",
+            "NPM", "AppImage", "Gear Lever",
         }:
             planned.extend(identifiers)
             if kind == "Gear Lever":
@@ -1442,9 +1769,12 @@ def dnf_protected_patterns() -> set[str]:
 def protection_reason(kind: str, name: str) -> str:
     base = package_base(name)
     universal_core = {
-        "apt", "dpkg", "pacman", "rpm", "dnf", "dnf5", "sudo",
-        "systemd", "systemd-udev", "filesystem", "basesystem",
-        "glibc", "libc6",
+        "apk-tools", "apt", "base-files", "base-passwd", "basesystem",
+        "bash", "busybox", "coreutils", "dnf", "dnf5", "doas", "dpkg",
+        "filesystem", "glibc", "init", "libc6", "login", "musl", "openrc",
+        "pacman", "passwd", "portage", "rpm", "setup", "shadow",
+        "shadow-utils", "sudo", "systemd", "systemd-udev", "util-linux",
+        "xbps", "xbps-install", "yum", "zypper",
     }
     if base in universal_core or base.startswith("kernel"):
         return "core system package"
@@ -1486,15 +1816,17 @@ def build_removal_plan(selected: list[Match]) -> RemovalPlan:
     ]
     protected_items: list[str] = []
     kinds = {item.kind for item in selected}
-    protection_kind = next(iter(kinds)) if len(kinds) == 1 else ""
     selected_kinds = {
         package_base(item.ident): item.kind for item in selected
     }
     for name in planned:
-        reason = protection_reason(
-            selected_kinds.get(package_base(name), protection_kind), name)
-        if reason:
-            protected_items.append(f"{name} ({reason})")
+        package_kind = selected_kinds.get(package_base(name))
+        candidate_kinds = [package_kind] if package_kind else sorted(kinds)
+        for kind in candidate_kinds:
+            reason = protection_reason(kind or "", name)
+            if reason:
+                protected_items.append(f"{name} ({reason})")
+                break
     has_dependents = any(
         report.direct_dependents or report.root_paths for report in reports)
     uncertain_kinds = {
@@ -1512,7 +1844,7 @@ def build_removal_plan(selected: list[Match]) -> RemovalPlan:
             item.kind in uncertain_kinds for item in selected):
         level = "UNKNOWN"
     else:
-        level = "SAFE"
+        level = "LOW"
     notes.append(
         "This plan is a snapshot; the package manager's final transaction remains authoritative."
     )
@@ -1522,67 +1854,135 @@ def build_removal_plan(selected: list[Match]) -> RemovalPlan:
     )
 
 
-def show_dependency_reports(reports: list[DependencyReport]) -> None:
+ROLE_EXPLANATIONS = {
+    "explicit": "explicit (installed at the user's request)",
+    "external": "external (installed outside DNF)",
+    "group": "group (installed as part of a package group)",
+    "dependency": "dependency (installed automatically)",
+    "weak dependency": "weak dependency (installed automatically; optional)",
+    "unknown": "unknown (the package manager did not provide a reason)",
+}
+
+
+def render_relationship_path(nodes: list[str], relations: list[str]) -> str:
+    rendered = display(nodes[0])
+    for relation, node in zip(relations, nodes[1:]):
+        rendered += f" --{display(relation)}--> {display(node)}"
+    return rendered
+
+
+def show_dependency_reports(
+        reports: list[DependencyReport], heading: str = "",
+) -> None:
+    if heading:
+        print(f"\n{heading}")
     for report in reports:
         item = report.target
         print(f"\n{display(item.name)} [{display(item.kind)}]")
-        print(f"  Installation role: {display(item.role)}")
+        role = ROLE_EXPLANATIONS.get(item.role, item.role)
+        print(f"  Installed as: {display(role)}")
         if report.history_reason:
-            print(f"  Installed because: {display(report.history_reason)}")
-        if report.direct_dependents:
-            print("  Directly required by: "
-                  + ", ".join(display(name) for name in report.direct_dependents[:12]))
-            if len(report.direct_dependents) > 12:
-                print(f"  …and {len(report.direct_dependents) - 12} more")
-        if report.weak_relations:
-            print("  Current weak relationships:")
-            for dependent, relation in report.weak_relations[:12]:
+            print(f"  Original install: {display(report.history_reason)}")
+
+        if report.root_paths:
+            print("  Required dependency paths:")
+            for path in report.root_paths:
+                print("    " + " --requires--> ".join(
+                    display(node) for node in path))
+        if report.relationship_paths:
+            print("  Optional dependency paths:")
+            for nodes, relations in report.relationship_paths:
+                print("    " + render_relationship_path(nodes, relations))
+
+        covered_hard = {
+            nodes[-2] for nodes in report.root_paths if len(nodes) >= 2
+        }
+        uncovered_hard = [
+            name for name in report.direct_dependents
+            if name not in covered_hard
+        ]
+        if uncovered_hard:
+            print("  Also required directly by: "
+                  + ", ".join(display(name) for name in uncovered_hard[:12]))
+            if len(uncovered_hard) > 12:
+                print(f"    ...and {len(uncovered_hard) - 12} more")
+
+        covered_weak = {
+            nodes[-2] for nodes, _relations in report.relationship_paths
+            if len(nodes) >= 2
+        }
+        uncovered_weak = [
+            (dependent, relation)
+            for dependent, relation in report.weak_relations
+            if dependent not in covered_weak
+        ]
+        if uncovered_weak:
+            print("  Other optional relationships:")
+            for dependent, relation in uncovered_weak[:12]:
                 print(
                     f"    {display(dependent)} {display(relation)} this package")
-            if len(report.weak_relations) > 12:
-                print(f"    …and {len(report.weak_relations) - 12} more")
-        if report.root_paths:
-            print("  Current hard-dependency roots:")
-            for path in report.root_paths:
-                print("    " + " → ".join(display(node) for node in path))
-        if report.relationship_paths:
-            print("  Current weak-dependency roots:")
-            for nodes, relations in report.relationship_paths:
-                rendered = display(nodes[0])
-                for relation, node in zip(relations, nodes[1:]):
-                    rendered += (
-                        f" —{display(relation)}→ {display(node)}")
-                print("    " + rendered)
+            if len(uncovered_weak) > 12:
+                print(f"    ...and {len(uncovered_weak) - 12} more")
         if not report.complete:
-            print("  Dependency explanation may be incomplete.")
+            print("  Coverage: incomplete; some dependency metadata was unavailable.")
         if report.note:
             print(f"  Note: {display(report.note)}")
 
 
+IMPACT_EXPLANATIONS = {
+    "LOW": "only the requested software is expected to be removed",
+    "CAUTION": "review automatically installed or now-unused dependencies",
+    "HIGH": "dependent, root, or protected packages may be affected",
+    "UNKNOWN": "a reliable package-manager preview was unavailable",
+}
+
+
 def show_removal_plan(plan: RemovalPlan) -> None:
-    print("\nDependency and removal plan")
-    print(f"  Impact: {plan.level}")
+    print("\nRemoval preview (nothing has been changed)")
+    explanation = IMPACT_EXPLANATIONS.get(plan.level, "")
+    print(
+        f"  Risk: {plan.level}"
+        f"{' - ' + explanation if explanation else ''}"
+    )
     show_dependency_reports(plan.reports)
-    print("\n  Planned removals:")
-    root_names = {
-        path[0] for report in plan.reports for path in report.root_paths if path
-    }
-    for name in plan.planned_removals:
-        if name in plan.orphan_removals:
-            suffix = " (unused dependency)"
-        elif package_base(name) in root_names:
-            suffix = " (explicit root application)"
-        elif name in plan.additional_removals:
-            suffix = " (additional dependent package)"
-        else:
-            suffix = ""
-        print(f"    {display(name)}{suffix}")
+
+    requested = {package_base(item.ident) for item in plan.selected}
+    requested_removals = [
+        name for name in plan.planned_removals
+        if package_base(name) in requested
+    ]
+    unused = [
+        name for name in plan.planned_removals
+        if name in plan.orphan_removals
+    ]
+    dependents = [
+        name for name in plan.additional_removals
+        if name not in plan.orphan_removals
+    ]
+    other = [
+        name for name in plan.planned_removals
+        if (name not in requested_removals
+            and name not in unused and name not in dependents)
+    ]
+    print(
+        f"\n  Expected removals "
+        f"({len(plan.planned_removals)} removal"
+        f"{'s' if len(plan.planned_removals) != 1 else ''}):"
+    )
+    for title, names in (
+            ("Requested", requested_removals),
+            ("Also removed because they depend on the request", dependents),
+            ("Also removed because they become unused", unused),
+            ("Other removals reported by the package manager", other)):
+        if not names:
+            continue
+        print(f"    {title}:")
+        for name in names:
+            print(f"      {display(name)}")
     if plan.protected_items:
-        print("  Protected or critical packages:")
+        print("  Protected or critical packages involved:")
         for item in plan.protected_items:
             print(f"    {display(item)}")
-    if not plan.additional_removals:
-        print("  No additional package removals were found.")
     for note in plan.notes:
         print(f"  Note: {display(note)}")
 
@@ -1595,7 +1995,7 @@ def choose(matches: list[Match], auto_select: bool = False) -> list[Match]:
             else "role unknown" if item.role == "unknown"
             else item.role
         )
-        details = " · ".join(
+        details = " | ".join(
             display(value) for value in (item.version, item.scope, role) if value)
         print(f"  {index:>2}. {display(item.name)}  [{display(item.kind)}]"
               f"{'  ' + details if details else ''}")
@@ -1614,9 +2014,9 @@ def choose(matches: list[Match], auto_select: bool = False) -> list[Match]:
         if item.kind == "Standalone":
             print("      note: only this executable can be identified automatically")
     if auto_select and len(matches) == 1:
-        print("\nAutomatically selected the only result (read-only mode).")
+        print("\nAutomatically selected the only result.")
         return matches
-    print("\nChoose numbers separated by commas, “a” for all, or Enter to cancel.")
+    print("\nChoose numbers separated by commas, 'a' for all, or Enter to cancel.")
     while True:
         raw = input("> ").strip().casefold()
         if not raw:
@@ -1686,11 +2086,6 @@ def find_user_data(selected: list[Match]) -> list[Path]:
                     paths.add(child)
         except OSError:
             pass
-    for item in selected:
-        if item.kind == "Snap":
-            candidate = Path.home() / "snap" / item.ident
-            if candidate.exists():
-                paths.add(candidate)
     data_home = xdg_dir("XDG_DATA_HOME", Path.home() / ".local/share")
     applications = data_home / "applications"
     if applications.is_dir():
@@ -1777,6 +2172,8 @@ def uninstall_command(item: Match, remove_data: bool) -> list[str]:
         command = ["brew", "uninstall"]
         if item.kind == "Homebrew Cask":
             command.append("--cask")
+            if remove_data:
+                command.append("--zap")
         return command + [item.ident]
     if item.kind == "Cargo":
         return ["cargo", "uninstall", item.ident]
@@ -1797,12 +2194,148 @@ def uninstall_command(item: Match, remove_data: bool) -> list[str]:
             raise RuntimeError("Gear Lever is no longer available")
         return command + ["--remove", str(item.path), "--yes"]
     if item.kind == "AppImage" and item.path:
-        command = ["rm", "--", str(item.path)]
+        targets = [str(item.path)]
+        if item.provides:
+            exposed = Path(item.provides)
+            try:
+                if exposed.is_symlink() and exposed.resolve() == item.path.resolve():
+                    targets.append(str(exposed))
+            except OSError:
+                pass
+        command = ["rm", "--"] + targets
         return command if os.access(item.path.parent, os.W_OK) else privileged(command)
     if item.kind == "Standalone" and item.path:
         command = ["rm", "--", str(item.path)]
         return command if os.access(item.path.parent, os.W_OK) else privileged(command)
     raise ValueError(f"Unsupported package kind: {item.kind}")
+
+
+def build_uninstall_batches(
+        selected: list[Match], remove_data: bool | set[str],
+) -> list[tuple[list[Match], list[str]]]:
+    """Group packages when the real command safely accepts the same transaction."""
+    groupable = {
+        "Flatpak", "Snap", "APT", "DNF", "RPM-OSTree", "Zypper",
+        "YUM", "RPM", "Pacman", "Homebrew", "Homebrew Cask",
+        "NPM", "Nix", "Standalone",
+    }
+    grouped: dict[tuple[str, str], list[Match]] = {}
+    order: list[tuple[str, str]] = []
+    for index, item in enumerate(selected):
+        key = (
+            (item.kind, item.scope)
+            if item.kind in groupable else
+            (f"{item.kind}:{index}", item.scope)
+        )
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(item)
+
+    batches: list[tuple[list[Match], list[str]]] = []
+    for key in order:
+        items = grouped[key]
+        manager_cleanup = (
+            remove_data
+            if isinstance(remove_data, bool)
+            else items[0].kind in remove_data
+        )
+        command = uninstall_command(items[0], manager_cleanup)
+        for item in items[1:]:
+            value = (
+                str(item.path)
+                if item.kind in {"AppImage", "Standalone"} and item.path
+                else item.ident
+            )
+            command.append(value)
+        batches.append((items, command))
+    return batches
+
+
+def choose_cleanup_paths(paths: list[Path]) -> list[Path]:
+    if not paths:
+        return []
+    print("\nPossible user-data paths:")
+    for index, path in enumerate(paths, 1):
+        print(f"  {index:>2}. {display(path)}")
+    print(
+        "These are exact name or executable-path matches, not guarantees. "
+        "Review them carefully."
+    )
+    print("Deleting a selected path cannot be undone.")
+    print(
+        "Choose paths to delete (numbers separated by commas), "
+        "'a' for all, or Enter to keep all."
+    )
+    while True:
+        try:
+            raw = input("> ").strip().casefold()
+        except EOFError:
+            return []
+        if not raw:
+            return []
+        if raw in {"a", "all"}:
+            return paths
+        try:
+            indexes = {int(part.strip()) for part in raw.split(",")}
+        except ValueError:
+            print("That selection was not understood; try again.", file=sys.stderr)
+            continue
+        if not indexes or min(indexes) < 1 or max(indexes) > len(paths):
+            print("Selection is out of range; try again.", file=sys.stderr)
+            continue
+        return [
+            path for index, path in enumerate(paths, 1)
+            if index in indexes
+        ]
+
+
+def ask_cleanup(
+        selected: list[Match], paths: list[Path],
+) -> tuple[set[str], list[Path]]:
+    kinds = {item.kind for item in selected}
+    managed_cleanup = kinds.intersection({
+        "Flatpak", "Snap", "APT", "Homebrew Cask",
+    })
+    cleanup_kinds: set[str] = set()
+    if managed_cleanup:
+        print("\nOptional package-manager cleanup:")
+        print("  These options can remove saved configuration or recovery data.")
+        descriptions = (
+            (
+                "Flatpak",
+                "delete sandbox data under ~/.var/app and "
+                "permission-store entries.",
+            ),
+            (
+                "APT",
+                "purge package-managed system configuration; "
+                "this does not purge files in your home directory.",
+            ),
+            (
+                "Snap",
+                "skip the automatic recovery snapshot. "
+                "Existing snapshots are not deleted.",
+            ),
+            (
+                "Homebrew Cask",
+                "use --zap for associated files. "
+                "A cask may declare files shared with other apps.",
+            ),
+        )
+        for kind, description in descriptions:
+            if kind not in kinds:
+                continue
+            print(f"  {kind}: {description}")
+            if yes(f"Use {kind} cleanup? [y/N] "):
+                cleanup_kinds.add(kind)
+    selected_paths = choose_cleanup_paths(paths)
+    if selected_paths:
+        print(
+            "Selected user-data paths will be deleted only after "
+            "every uninstall command succeeds."
+        )
+    return cleanup_kinds, selected_paths
 
 
 def yes(prompt: str) -> bool:
@@ -1859,7 +2392,7 @@ def run_uninstall(
         query: str, show_dependencies: bool = False,
         plan_only: bool = False, why_only: bool = False,
 ) -> int:
-    print(f"Searching installed apps for “{display(query)}”…")
+    print(f'Searching installed software for "{display(query)}"...')
     matches = annotate_roles(find_matches(query))
     matches, hidden_dependencies = filter_dependency_matches(
         matches, query, show_dependencies or why_only or plan_only)
@@ -1870,18 +2403,44 @@ def run_uninstall(
             "use --show-dependencies to include them."
         )
     if not matches:
+        base_image_package = (
+            "" if is_package_archive_query(query)
+            else rpm_ostree_base_match(query)
+        )
+        unidentified_path = (
+            "" if is_package_archive_query(query) or base_image_package
+            else unidentified_system_command(query)
+        )
         if is_package_archive_query(query):
             print(
                 "No installed package matched this archive. "
                 "The downloaded archive itself was not removed."
+            )
+        elif base_image_package:
+            print(
+                f"{display(base_image_package)} is part of the "
+                "rpm-ostree base OS image, "
+                "not a layered app. It was not offered as a normal removal."
+            )
+            print(
+                "Changing the base image requires the advanced "
+                "'rpm-ostree override remove' workflow."
+            )
+        elif unidentified_path:
+            print(
+                f"The command exists at {display(unidentified_path)}, but no "
+                "supported package manager proved ownership."
+            )
+            print(
+                "It was not offered as a standalone file because deleting "
+                "system-directory commands directly is unsafe."
             )
         else:
             print("No likely installed apps found.")
         return 1
     try:
         selected = choose(
-            matches, auto_select=(
-                len(matches) == 1 and (why_only or plan_only)))
+            matches, auto_select=len(matches) == 1)
     except (EOFError, KeyboardInterrupt):
         print("\nCancelled.")
         return 130
@@ -1890,7 +2449,11 @@ def run_uninstall(
         return 0
 
     if why_only and not plan_only:
-        show_dependency_reports([dependency_report(item) for item in selected])
+        print("\nTracing installation reasons and current dependencies...")
+        show_dependency_reports(
+            [dependency_report(item) for item in selected],
+            heading="Why this software is installed",
+        )
         return 0
 
     for item in selected:
@@ -1900,6 +2463,7 @@ def run_uninstall(
                   file=sys.stderr)
             return 1
 
+    print("\nBuilding a read-only removal preview...")
     plan = build_removal_plan(selected)
     show_removal_plan(plan)
     if plan_only:
@@ -1907,34 +2471,28 @@ def run_uninstall(
         return 0
 
     paths = find_user_data(selected)
-    remove_data = False
-    if paths or any(item.kind in {"Flatpak", "Snap", "APT"} for item in selected):
-        print("\nAlso remove app data and saved configuration?")
-        if paths:
-            for path in paths:
-                print(f"  {display(path)}")
-        if any(item.kind == "APT" for item in selected):
-            print("  APT will also purge package-managed system configuration.")
-        print("This cannot be undone.")
-        remove_data = yes("Remove app data? [y/N] ")
+    cleanup_kinds, paths_to_remove = ask_cleanup(selected, paths)
 
     try:
-        commands = [uninstall_command(item, remove_data) for item in selected]
+        batches = build_uninstall_batches(selected, cleanup_kinds)
     except RuntimeError as error:
         print(display(error) + ".", file=sys.stderr)
         return 1
     print("\nReady to run:")
-    for command in commands:
+    for _items, command in batches:
         print("  " + display(shlex.join(command)))
-    if remove_data and paths:
-        print(f"  and remove {len(paths)} user-data path{'s' if len(paths) != 1 else ''}")
+    if paths_to_remove:
+        print(
+            f"  and remove {len(paths_to_remove)} user-data path"
+            f"{'s' if len(paths_to_remove) != 1 else ''}"
+        )
     if plan.level in {"HIGH", "UNKNOWN"}:
         expected = ("REMOVE " + selected[0].ident if len(selected) == 1
                     else "REMOVE ALL")
         try:
             confirmation = input(
                 f"\n{plan.level.title()}-impact transaction. "
-                f"Type “{expected}” to continue: "
+                f"Type '{expected}' to continue: "
             ).strip()
         except EOFError:
             confirmation = ""
@@ -1946,8 +2504,10 @@ def run_uninstall(
         return 0
 
     failed = False
-    for item, command in zip(selected, commands):
-        print(f"\nRemoving {display(item.name)} ({display(item.kind)})…")
+    for items, command in batches:
+        names = ", ".join(display(item.name) for item in items)
+        kinds = ", ".join(dict.fromkeys(display(item.kind) for item in items))
+        print(f"\nRemoving {names} ({kinds})...")
         try:
             result = subprocess.run(command, check=False)
         except OSError as error:
@@ -1957,10 +2517,10 @@ def run_uninstall(
         if result.returncode:
             print(f"Removal failed with exit code {result.returncode}.", file=sys.stderr)
             failed = True
-    if remove_data and paths:
+    if paths_to_remove:
         if failed:
             print("\nApp data was kept because an uninstall command failed.")
-        elif not remove_paths(paths):
+        elif not remove_paths(paths_to_remove):
             failed = True
     print("\nFinished." if not failed else "\nFinished with errors.")
     return 1 if failed else 0
@@ -1989,17 +2549,32 @@ def self_uninstall() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="uninstall",
-        description="Find and safely uninstall Linux apps, however they were installed.",
+        description=(
+            "Find, explain, preview, and safely remove installed Linux software."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  uninstall FreeCAD          find and remove it\n"
+            "  uninstall DOSbox --why     explain why it is installed\n"
+            "  uninstall wine --plan      preview every package removal\n"
+            "  uninstall ./example.rpm    resolve a local archive\n"
+            "\n"
+            "--why answers 'Why is this installed?'; "
+            "--plan answers 'What would removal do?'"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("app", nargs="?", help="app name to find")
+    parser.add_argument(
+        "app", nargs="?",
+        help="app name, command, package ID, or local package archive")
     parser.add_argument("--self-uninstall", action="store_true",
-                        help="remove this command from the system")
+                        help="remove the uninstall command itself")
     parser.add_argument("--show-dependencies", action="store_true",
-                        help="include fuzzy matches installed as dependencies")
+                        help="include fuzzy library/dependency search matches")
     parser.add_argument("--why", action="store_true",
-                        help="explain why the selected package is installed; change nothing")
+                        help="explain why software is installed; make no changes")
     parser.add_argument("--plan", action="store_true",
-                        help="show dependency and transaction impact; change nothing")
+                        help="preview the removal transaction; make no changes")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     args = parser.parse_args()
     if os.geteuid() == 0 and os.environ.get("SUDO_USER") not in {None, "", "root"}:
@@ -2007,6 +2582,8 @@ def main() -> int:
               file=sys.stderr)
         return 2
     if args.self_uninstall:
+        if args.app or args.show_dependencies or args.why or args.plan:
+            parser.error("--self-uninstall cannot be combined with an app or another mode")
         return self_uninstall()
     if not args.app:
         try:
@@ -2016,7 +2593,8 @@ def main() -> int:
         if not args.app:
             print("Nothing entered.")
             return 0
-    if norm(args.app) == "uninstall":
+    if norm(args.app) == "uninstall" and not (
+            args.show_dependencies or args.why or args.plan):
         return self_uninstall()
     return run_uninstall(
         args.app, show_dependencies=args.show_dependencies,
@@ -2025,8 +2603,14 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    configure_output()
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
         print("\nCancelled.", file=sys.stderr)
         raise SystemExit(130)
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        finally:
+            raise SystemExit(0)
