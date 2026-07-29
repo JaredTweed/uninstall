@@ -10,7 +10,7 @@ Found 1 likely installed option:
 
    1. dosbox-staging  [DNF]  0.82.2-5.fc44 | system | weak dependency | 16 MiB
       provides command: /usr/bin/dosbox
-      Why installed: wine recommends it; DNF transaction 193: dnf install wine (recorded reason: Weak Dependency)
+      Why installed: wine recommends it; DNF transaction 193: dnf install wine (recorded reason: Weak Dependency; source repository: updates)
 
 Automatically selected the only result.
 
@@ -121,15 +121,15 @@ matches exist, but a dependency-only result is still shown. Exact matches and
 command owners are never hidden. Use `--show-dependencies` to expand every
 mixed result.
 
-Each result has one concise `Why installed` line. For APT, DNF/RPM, Pacman,
-and Homebrew, `uninstall` traces dependencies back to an explicitly installed
-application when the package database has enough information. On DNF it also
-distinguishes user, group, hard-dependency, and weak-dependency reasons and
-includes the original DNF5 transaction for automatically installed packages
-when history is available:
+Each result has one concise `Why installed` line. For APT, DNF/YUM, Pacman,
+Zypper, and Homebrew, `uninstall` traces dependencies back to an explicitly
+installed application when the package database has enough information. On
+DNF it also distinguishes user, group, hard-dependency, and weak-dependency
+reasons and includes the original DNF5 transaction for automatically installed
+packages when history is available:
 
 ```text
-Why installed: wine recommends it; DNF transaction 193: dnf install wine (recorded reason: Weak Dependency)
+Why installed: wine recommends it; DNF transaction 193: dnf install wine (recorded reason: Weak Dependency; source repository: updates)
 ```
 
 For packages installed through a DNF environment or group, cached installed
@@ -143,7 +143,31 @@ Why installed: installed through COSMIC Desktop Environment → COSMIC Desktop S
 Group metadata is queried cache-only, so explaining an installation never
 refreshes repositories or imports signing keys. If several groups could have
 caused the installation, `uninstall` reports the generic group reason instead
-of guessing.
+of guessing. Exceptionally long retained commands are reduced to their
+decisive install target and explicitly marked as abbreviated.
+
+The same line uses the strongest locally recorded provenance available for
+every supported backend:
+
+- APT history (including rotated compressed logs), `apt-mark` state, and
+  current dependency roots
+- Pacman and Zypper history, explicit/dependency state, repositories, and
+  current dependency roots
+- legacy DNF/YUM transaction history, plain RPM database metadata, and
+  rpm-ostree layered-package state
+- Flatpak remote and install history; Snap channel, publisher, and retained
+  snapd changes; Homebrew tap and install-receipt state
+- Nix profile source attributes, Cargo registry or Git source, pipx package
+  specification, and npm's retained resolved package URL
+- Gear Lever update metadata and exact managed path, or an explicit statement
+  that an AppImage or standalone executable has no known installation history
+
+Current state and historical evidence are worded separately. For example,
+`marked manually installed by APT` describes current state, while an APT
+history command describes a retained event. Missing history is stated as
+unavailable rather than replaced with a guess. Likewise, passing a matching
+`.rpm`, `.deb`, or Arch archive does not make it the claimed original source
+unless retained history supports that conclusion.
 
 Before asking for confirmation, native simulations determine what the package
 manager expects to remove. Routine internal details stay out of the way.

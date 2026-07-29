@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import gzip
 import json
+import lzma
 import os
 import re
 import shlex
@@ -20,7 +22,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable
 
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,7 @@ class Match:
     archive_version: str = ""
     reason: str = ""
     size_bytes: int | None = None
+    origin: str = ""
 
 
 @dataclass
@@ -72,6 +75,7 @@ class DnfInstallRecord:
     reason: str
     groups: tuple[str, ...] = ()
     environments: tuple[str, ...] = ()
+    repository: str = ""
 
 
 def norm(value: str) -> str:
@@ -560,9 +564,17 @@ def detect_gearlever(query: str) -> list[Match]:
                 pass
         raw_version = metadata.get("current_version")
         version = raw_version if isinstance(raw_version, str) else ""
+        origin = next((
+            value for value in (
+                metadata.get("update_url"),
+                metadata.get("source_url"),
+                metadata.get("url"),
+            )
+            if isinstance(value, str) and value
+        ), "")
         found.append(Match(
             "Gear Lever", str(path), name, version, "user", path,
-            provides=provides,
+            provides=provides, origin=origin,
         ))
     return found
 
@@ -1298,7 +1310,7 @@ def annotate_roles(matches: list[Match]) -> list[Match]:
                 roles[(item.kind, item.ident, item.scope)] = role
 
     inherently_explicit = {
-        "Flatpak", "Homebrew Cask", "Cargo", "Pipx", "NPM", "Nix",
+        "Flatpak", "Snap", "Homebrew Cask", "Cargo", "Pipx", "NPM", "Nix",
         "AppImage", "Gear Lever", "Standalone", "RPM-OSTree",
     }
     for item in matches:
@@ -1569,6 +1581,20 @@ def relationship_root_paths(
 
 
 @lru_cache(maxsize=64)
+def dnf_history_transaction(transaction_id: int) -> dict[str, object] | None:
+    try:
+        details = json.loads(capture([
+            "dnf5", "history", "info", str(transaction_id), "--json",
+        ]))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(details, list) or not details:
+        return None
+    detail = details[0]
+    return detail if isinstance(detail, dict) else None
+
+
+@lru_cache(maxsize=64)
 def dnf_install_record(target: str) -> DnfInstallRecord | None:
     if not shutil.which("dnf5"):
         return None
@@ -1590,23 +1616,20 @@ def dnf_install_record(target: str) -> DnfInstallRecord | None:
     for transaction in sorted(
             valid_transactions, key=lambda value: value["id"]):
         transaction_id = transaction["id"]
-        try:
-            details = json.loads(capture([
-                "dnf5", "history", "info", str(transaction_id), "--json",
-            ]))
-        except (json.JSONDecodeError, TypeError):
+        detail = dnf_history_transaction(transaction_id)
+        if not detail:
             continue
-        if not isinstance(details, list) or not details:
+        packages = detail.get("packages", [])
+        if not isinstance(packages, list):
             continue
-        detail = details[0]
-        if not isinstance(detail, dict):
-            continue
-        for package in detail.get("packages", []):
+        for package in packages:
             if not isinstance(package, dict):
                 continue
             nevra = package.get("nevra", "")
             action = str(package.get("action", ""))
-            if (not isinstance(nevra, str) or not nevra.startswith(target + "-")
+            if (not isinstance(nevra, str)
+                    or not re.match(
+                        rf"^{re.escape(target)}-\d+:", nevra)
                     or action.casefold() != "install"):
                 continue
             command = str(
@@ -1615,23 +1638,27 @@ def dnf_install_record(target: str) -> DnfInstallRecord | None:
                 or "unknown command"
             )
             reason = str(package.get("reason") or "unknown reason")
+            repository = str(package.get("repository") or "")
+            raw_groups = detail.get("groups", [])
+            raw_environments = detail.get("environments", [])
             groups = tuple(
                 str(group.get("group"))
-                for group in detail.get("groups", [])
+                for group in raw_groups
                 if isinstance(group, dict)
                 and str(group.get("action", "")).casefold() == "install"
                 and isinstance(group.get("group"), str)
-            )
+            ) if isinstance(raw_groups, list) else ()
             environments = tuple(
                 str(environment.get("environment"))
-                for environment in detail.get("environments", [])
+                for environment in raw_environments
                 if isinstance(environment, dict)
                 and str(
                     environment.get("action", "")).casefold() == "install"
                 and isinstance(environment.get("environment"), str)
-            )
+            ) if isinstance(raw_environments, list) else ()
             return DnfInstallRecord(
-                transaction_id, command, reason, groups, environments)
+                transaction_id, command, reason, groups, environments,
+                repository)
     return None
 
 
@@ -1640,56 +1667,101 @@ def dnf_history_reason(target: str) -> str:
     record = dnf_install_record(target)
     if not record:
         return ""
+    repository = (
+        f"; source repository: {record.repository}"
+        if record.repository and not record.repository.startswith("@")
+        else ""
+    )
     return (
-        f"DNF transaction {record.transaction_id}: {record.command} "
-        f"(recorded reason: {record.reason})"
+        f"DNF transaction {record.transaction_id}: "
+        f"{compact_history_command(record.command)} "
+        f"(recorded reason: {record.reason}{repository})"
     )
 
 
-@lru_cache(maxsize=64)
-def dnf_group_memberships(target: str) -> tuple[tuple[str, str], ...]:
+@lru_cache(maxsize=1)
+def dnf_installed_group_inventory(
+) -> tuple[tuple[str, str, tuple[str, ...]], ...]:
     if not shutil.which("dnf5"):
         return ()
     output = capture([
         "dnf5", "-q", "-C", "group", "info",
-        "--installed", "--hidden", f"--contains-pkgs={target}",
+        "--installed", "--hidden",
     ])
-    memberships: list[tuple[str, str]] = []
+    inventory: list[tuple[str, str, tuple[str, ...]]] = []
     for details in parse_pacman_info(output):
         group_id = details.get("Id", "")
-        if group_id:
-            memberships.append((group_id, details.get("Name", group_id)))
-    return tuple(memberships)
+        if not group_id:
+            continue
+        packages: list[str] = []
+        for key in (
+                "Mandatory packages", "Default packages",
+                "Optional packages", "Conditional packages"):
+            packages.extend(
+                token for token in details.get(key, "").split()
+                if token != ":"
+            )
+        inventory.append((
+            group_id,
+            details.get("Name", group_id),
+            tuple(packages),
+        ))
+    return tuple(inventory)
+
+
+@lru_cache(maxsize=64)
+def dnf_group_memberships(target: str) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (group_id, name)
+        for group_id, name, packages in dnf_installed_group_inventory()
+        if target in packages
+    )
+
+
+@lru_cache(maxsize=64)
+def dnf_installed_environment_inventory(
+) -> tuple[tuple[str, str, tuple[str, ...]], ...]:
+    if not shutil.which("dnf5"):
+        return ()
+    output = capture([
+        "dnf5", "-q", "-C", "environment", "info",
+        "--installed",
+    ])
+    inventory: list[tuple[str, str, tuple[str, ...]]] = []
+    for details in parse_pacman_info(output):
+        environment_id = details.get("Id", "")
+        if not environment_id:
+            continue
+        groups = tuple(
+            token
+            for key in ("Required groups", "Optional groups")
+            for token in details.get(key, "").split()
+            if token != ":"
+        )
+        inventory.append((
+            environment_id,
+            details.get("Name", environment_id),
+            groups,
+        ))
+    return tuple(inventory)
 
 
 @lru_cache(maxsize=64)
 def dnf_environment_details(
         environment_id: str,
 ) -> tuple[str, tuple[str, ...]]:
-    if not shutil.which("dnf5"):
-        return "", ()
-    output = capture([
-        "dnf5", "-q", "-C", "environment", "info",
-        "--installed", environment_id,
-    ])
-    records = parse_pacman_info(output)
-    if not records:
-        return "", ()
-    details = records[0]
-    groups = tuple(
-        details.get(key, "").split()
-        for key in ("Required groups", "Optional groups")
-    )
-    return (
-        details.get("Name", environment_id),
-        tuple(group for collection in groups for group in collection),
-    )
+    return next((
+        (name, groups)
+        for ident, name, groups in dnf_installed_environment_inventory()
+        if ident == environment_id
+    ), ("", ()))
 
 
 def dnf_group_install_reason(target: str) -> str:
     record = dnf_install_record(target)
     transaction = (
-        f"DNF transaction {record.transaction_id}: {record.command}"
+        f"DNF transaction {record.transaction_id}: "
+        f"{compact_history_command(record.command)}"
         if record else ""
     )
     if not record:
@@ -1857,61 +1929,755 @@ def dependency_report(item: Match) -> DependencyReport:
 
 
 def compact_dependency_cause(report: DependencyReport) -> str:
-    if report.relationship_paths:
-        nodes, relations = report.relationship_paths[0]
+    causes: list[str] = []
+    for nodes, relations in report.relationship_paths:
         if len(nodes) == 2 and relations:
             parent = display(nodes[0])
             relation = relations[0]
             if relation in {"requires", "recommends", "suggests"}:
-                return f"{parent} {relation} it"
+                causes.append(f"{parent} {relation} it")
+                continue
             if relation == "is supplemented by":
-                return f"it supplements {parent}"
+                causes.append(f"it supplements {parent}")
+                continue
             if relation == "is enhanced by":
-                return f"it enhances {parent}"
-        return "dependency path " + render_relationship_path(nodes, relations)
-    if report.root_paths:
-        path = report.root_paths[0]
+                causes.append(f"it enhances {parent}")
+                continue
+        causes.append(
+            "dependency path " + render_relationship_path(nodes, relations))
+    for path in report.root_paths:
         if len(path) == 2:
-            return f"{display(path[0])} requires it"
-        return "required through " + " -> ".join(
-            display(node) for node in path)
-    if report.direct_dependents:
+            causes.append(f"{display(path[0])} requires it")
+        else:
+            causes.append("required through " + " -> ".join(
+                display(node) for node in path))
+    if not causes and report.direct_dependents:
         names = ", ".join(display(name) for name in report.direct_dependents[:3])
-        return f"required directly by {names}"
-    if report.weak_relations:
+        causes.append(f"required directly by {names}")
+    if not causes and report.weak_relations:
         dependent, relation = report.weak_relations[0]
-        return f"{display(dependent)} {display(relation)} it"
+        causes.append(f"{display(dependent)} {display(relation)} it")
+    causes = list(dict.fromkeys(causes))
+    if len(causes) > 2:
+        return f"{causes[0]} and {causes[1]} (+{len(causes) - 2} other roots)"
+    return " and ".join(causes)
+
+
+def compact_history_command(command: str, limit: int = 180) -> str:
+    """Keep retained installer commands useful without flooding one line."""
+    command = " ".join(command.split())
+    if len(command) <= limit:
+        return command
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = []
+    manager_index = next((
+        index for index, token in enumerate(tokens)
+        if Path(token).name in {
+            "apt", "apt-get", "dnf", "dnf5", "yum", "pacman", "zypper"}
+    ), None)
+    if manager_index is not None:
+        manager = Path(tokens[manager_index]).name
+        tail = tokens[manager_index + 1:]
+        action_index = next((
+            index for index, token in enumerate(tail)
+            if token in {"install", "in", "-S"}
+        ), None)
+        if action_index is not None:
+            action = tail[action_index]
+            candidates = tail[action_index + 1:]
+            group_targets = [
+                token for token in candidates if token.startswith("@")]
+            target = next((
+                token for token in group_targets
+                if "environment" in token.casefold()
+            ), group_targets[0] if group_targets else "")
+            if not target:
+                target = next((
+                    token for token in candidates
+                    if token and not token.startswith("-")
+                ), "")
+            if target:
+                return (
+                    f"{manager} {action} {target} "
+                    "(original command abbreviated)"
+                )
+    suffix = "… (original command abbreviated)"
+    return command[:max(1, limit - len(suffix))].rstrip() + suffix
+
+
+def recorded_event(
+        source: str, event: tuple[str, str] | None,
+) -> str:
+    if not event:
+        return f"{source}; original installation event unavailable"
+    date, command = event
+    when = f" on {date}" if date else ""
+    return f"{source}; recorded{when}: {compact_history_command(command)}"
+
+
+def read_history_file(path: Path) -> str:
+    try:
+        if path.suffix == ".gz":
+            with gzip.open(
+                    path, "rt", encoding="utf-8",
+                    errors="replace") as stream:
+                return stream.read()
+        if path.suffix == ".xz":
+            with lzma.open(
+                    path, "rt", encoding="utf-8",
+                    errors="replace") as stream:
+                return stream.read()
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def parse_apt_history(
+        text: str, target: str,
+) -> list[tuple[str, str]]:
+    events: list[tuple[str, str]] = []
+    package_pattern = re.compile(
+        rf"(?<![A-Za-z0-9+.-]){re.escape(package_base(target))}"
+        r"(?::[A-Za-z0-9_-]+)?\s+\(",
+    )
+    for block in re.split(r"\n\s*\n", text):
+        fields: dict[str, str] = {}
+        current_key = ""
+        for line in block.splitlines():
+            if ": " in line and not line[0].isspace():
+                current_key, value = line.split(": ", 1)
+                fields[current_key] = value.strip()
+            elif current_key and line[:1].isspace():
+                fields[current_key] += " " + line.strip()
+        package_lines = " ".join(
+            fields.get(key, "")
+            for key in ("Install", "Reinstall", "Upgrade")
+        )
+        command = fields.get("Commandline", "")
+        if command and package_pattern.search(package_lines):
+            events.append((fields.get("Start-Date", ""), command))
+    return events
+
+
+@lru_cache(maxsize=64)
+def apt_history_event(target: str) -> tuple[str, str] | None:
+    events: list[tuple[str, str]] = []
+    try:
+        paths = list(Path("/var/log/apt").glob("history.log*"))
+    except OSError:
+        paths = []
+    for path in paths:
+        text = read_history_file(path)
+        events.extend(parse_apt_history(text, target))
+    return min(events, key=lambda item: item[0]) if events else None
+
+
+def parse_pacman_history(
+        text: str, target: str,
+) -> tuple[str, str] | None:
+    current_command = ""
+    target_pattern = re.compile(
+        rf"\[ALPM\] installed {re.escape(package_base(target))} \(")
+    for line in text.splitlines():
+        if "[PACMAN] Running " in line:
+            current_command = line.split("[PACMAN] Running ", 1)[1].strip("'")
+        if target_pattern.search(line):
+            date = line[1:line.find("]")] if line.startswith("[") else ""
+            command = current_command or f"installed {package_base(target)}"
+            return date, command
+    return None
+
+
+@lru_cache(maxsize=64)
+def pacman_history_event(target: str) -> tuple[str, str] | None:
+    try:
+        paths = list(Path("/var/log").glob("pacman.log*"))
+    except OSError:
+        return None
+    events = [
+        event for event in (
+            parse_pacman_history(read_history_file(path), target)
+            for path in paths
+        )
+        if event
+    ]
+    return min(events, key=lambda item: item[0]) if events else None
+
+
+def parse_zypper_history(
+        text: str, target: str,
+) -> tuple[str, str] | None:
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split("|")
+        if (len(fields) >= 7 and fields[1].casefold() == "install"
+                and package_base(fields[2]) == package_base(target)):
+            repository = fields[6].strip()
+            detail = (
+                f"installed from {repository}"
+                if repository else f"installed {package_base(target)}"
+            )
+            return fields[0].strip(), detail
+    return None
+
+
+@lru_cache(maxsize=64)
+def zypper_history_event(target: str) -> tuple[str, str] | None:
+    try:
+        paths = list(Path("/var/log/zypp").glob("history*"))
+    except OSError:
+        return None
+    events = [
+        event for event in (
+            parse_zypper_history(read_history_file(path), target)
+            for path in paths
+        )
+        if event
+    ]
+    return min(events, key=lambda item: item[0]) if events else None
+
+
+def parse_legacy_rpm_history_info(
+        text: str, target: str,
+) -> str:
+    command = ""
+    package_seen = False
+    target_pattern = re.compile(
+        rf"(?<![A-Za-z0-9+.-]){re.escape(package_base(target))}"
+        r"(?:[.-][A-Za-z0-9_+~:-]+)*")
+    for line in text.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip().casefold() in {
+                "command line", "commandline"}:
+            command = value.strip()
+        if re.search(r"(?i)\binstall(?:ed)?\b", line) \
+                and target_pattern.search(line):
+            package_seen = True
+    return command if package_seen else ""
+
+
+@lru_cache(maxsize=128)
+def legacy_rpm_history_event(
+        manager: str, target: str,
+) -> tuple[str, str] | None:
+    output = capture([manager, "-q", "history", "list", target])
+    transaction_ids: set[int] = set()
+    for line in output.splitlines():
+        first = line.split("|", 1)[0].strip().lstrip("*")
+        if first.isdigit():
+            transaction_ids.add(int(first))
+    for transaction_id in sorted(transaction_ids):
+        command = parse_legacy_rpm_history_info(
+            capture([
+                manager, "-q", "history", "info", str(transaction_id),
+            ]),
+            target,
+        )
+        if command:
+            return str(transaction_id), command
+    return None
+
+
+@lru_cache(maxsize=64)
+def flatpak_history_entries(scope: str) -> tuple[dict[str, object], ...]:
+    try:
+        history = json.loads(capture([
+            "flatpak", "history", f"--{scope}", "--json",
+        ]))
+    except (json.JSONDecodeError, TypeError):
+        history = []
+    return tuple(
+        entry for entry in history
+        if isinstance(entry, dict)
+    ) if isinstance(history, list) else ()
+
+
+@lru_cache(maxsize=64)
+def flatpak_install_evidence(
+        ident: str, scope: str,
+) -> tuple[str, str]:
+    origin = capture([
+        "flatpak", "info", f"--{scope}", "--show-origin", ident,
+    ]).strip()
+    event: dict[str, object] | None = None
+    for entry in flatpak_history_entries(scope):
+        if entry.get("application") != ident:
+            continue
+        change = str(entry.get("change", "")).casefold()
+        if change == "uninstall":
+            event = None
+        elif change == "deploy install":
+            event = entry
+    if event:
+        remote = str(event.get("remote") or origin)
+        time = str(event.get("time") or "")
+        detail = f"Flatpak history{f' {time}' if time else ''}: install {ident}"
+        return remote, detail
+    return origin, ""
+
+
+@lru_cache(maxsize=64)
+def snap_install_evidence(ident: str) -> tuple[str, str, str]:
+    info = capture(["snap", "info", ident])
+    tracking = ""
+    publisher = ""
+    for line in info.splitlines():
+        key, separator, value = line.partition(":")
+        if not separator:
+            continue
+        if key.strip().casefold() == "tracking":
+            tracking = value.strip()
+        elif key.strip().casefold() == "publisher":
+            publisher = value.strip()
+    change = ""
+    for line in capture(["snap", "changes"]).splitlines()[1:]:
+        fields = line.split(maxsplit=4)
+        if len(fields) == 5 and ident.casefold() in fields[4].casefold():
+            if re.search(r"\binstall\b", fields[4], flags=re.IGNORECASE):
+                change = f"snap change {fields[0]}: {fields[4]}"
+                break
+    return tracking, publisher, change
+
+
+@lru_cache(maxsize=64)
+def homebrew_install_evidence(
+        kind: str, ident: str,
+) -> tuple[str, bool | None]:
+    try:
+        payload = json.loads(capture(["brew", "info", "--json=v2", ident]))
+    except (json.JSONDecodeError, TypeError):
+        return "", None
+    key = "casks" if kind == "Homebrew Cask" else "formulae"
+    entries = payload.get(key, []) if isinstance(payload, dict) else []
+    if not isinstance(entries, list) or not entries:
+        return "", None
+    details = entries[0] if isinstance(entries[0], dict) else {}
+    tap = str(details.get("tap") or "")
+    installed = details.get("installed", [])
+    requested: bool | None = None
+    if isinstance(installed, list) and installed:
+        latest = installed[-1] if isinstance(installed[-1], dict) else {}
+        raw_requested = latest.get("installed_on_request")
+        if isinstance(raw_requested, bool):
+            requested = raw_requested
+    return tap, requested
+
+
+@lru_cache(maxsize=1)
+def nix_profile_metadata() -> dict[str, dict[str, object]]:
+    try:
+        payload = json.loads(capture(["nix", "profile", "list", "--json"]))
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    elements = payload.get("elements", payload) if isinstance(payload, dict) else {}
+    return {
+        ident: metadata for ident, metadata in elements.items()
+        if isinstance(ident, str) and isinstance(metadata, dict)
+    } if isinstance(elements, dict) else {}
+
+
+@lru_cache(maxsize=64)
+def cargo_install_source(ident: str) -> str:
+    cargo_root = Path(
+        os.environ.get("CARGO_INSTALL_ROOT")
+        or os.environ.get("CARGO_HOME")
+        or Path.home() / ".cargo"
+    ).expanduser()
+    try:
+        payload = json.loads((cargo_root / ".crates2.json").read_text(
+            encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return ""
+    installs = payload.get("installs", {}) if isinstance(payload, dict) else {}
+    if not isinstance(installs, dict):
+        return ""
+    pattern = re.compile(
+        rf"^{re.escape(ident)}\s+\S+\s+\((.+)\)$")
+    for key in installs:
+        match = pattern.match(str(key))
+        if match:
+            return match.group(1)
     return ""
+
+
+@lru_cache(maxsize=64)
+def pipx_install_source(ident: str, scope: str) -> str:
+    extra = ["--global"] if scope == "system" else []
+    try:
+        payload = json.loads(capture(["pipx", "list", "--json"] + extra))
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    venvs = payload.get("venvs", {}) if isinstance(payload, dict) else {}
+    metadata = venvs.get(ident, {}) if isinstance(venvs, dict) else {}
+    details = metadata.get("metadata", metadata) if isinstance(metadata, dict) else {}
+    main = details.get("main_package", {}) if isinstance(details, dict) else {}
+    if not isinstance(main, dict):
+        return ""
+    return str(
+        main.get("package_or_url")
+        or main.get("package")
+        or ""
+    )
+
+
+@lru_cache(maxsize=64)
+def npm_install_source(ident: str) -> str:
+    root = capture(["npm", "root", "--global"]).strip()
+    if not root:
+        return ""
+    lock_path = Path(root) / ".package-lock.json"
+    try:
+        payload = json.loads(lock_path.read_text(
+            encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return ""
+    packages = payload.get("packages", {}) if isinstance(payload, dict) else {}
+    key = f"node_modules/{ident}"
+    details = packages.get(key, {}) if isinstance(packages, dict) else {}
+    return str(details.get("resolved") or "") if isinstance(details, dict) else ""
+
+
+def friendly_cargo_source(source: str) -> str:
+    crates_io = "registry+https://github.com/rust-lang/crates.io-index"
+    if source == crates_io:
+        return f"crates.io (recorded source {source})"
+    return source
+
+
+@lru_cache(maxsize=64)
+def rpm_install_metadata(ident: str) -> tuple[str, str]:
+    output = capture([
+        "rpm", "-q", "--qf",
+        "%{INSTALLTIME:date}\\t%{VENDOR}\\n", "--", ident,
+    ]).strip().splitlines()
+    if not output:
+        return "", ""
+    date, separator, vendor = output[0].partition("\t")
+    return date.strip(), vendor.strip() if separator else ""
+
+
+def explicit_install_reason(item: Match) -> str:
+    target = package_base(item.ident)
+    if item.kind == "DNF":
+        record = dnf_install_record(target)
+        if record:
+            if record.reason.casefold() not in {
+                    "user", "external user", "external"}:
+                return (
+                    "currently marked explicitly installed by DNF; "
+                    f"originally installed in DNF transaction "
+                    f"{record.transaction_id}: "
+                    f"{compact_history_command(record.command)} "
+                    f"(recorded reason: {record.reason})"
+                )
+            source = (
+                f" from {record.repository}"
+                if record.repository and not record.repository.startswith("@")
+                else ""
+            )
+            return (
+                f"explicitly installed{source}; "
+                f"DNF transaction {record.transaction_id}: "
+                f"{compact_history_command(record.command)}"
+            )
+        if not shutil.which("dnf5") and shutil.which("dnf"):
+            event = legacy_rpm_history_event("dnf", target)
+            if event:
+                return (
+                    f"marked explicitly installed by DNF; "
+                    f"DNF transaction {event[0]}: "
+                    f"{compact_history_command(event[1])}"
+                )
+        return (
+            "marked explicitly installed by DNF; "
+            "original installation command unavailable"
+        )
+    if item.kind == "APT":
+        return recorded_event(
+            "marked manually installed by APT",
+            apt_history_event(target),
+        ).replace("recorded", "APT history", 1)
+    if item.kind == "Pacman":
+        return recorded_event(
+            "Pacman marks it explicitly installed",
+            pacman_history_event(target),
+        ).replace("recorded", "pacman log", 1)
+    if item.kind == "Zypper":
+        return recorded_event(
+            "marked explicitly installed by Zypper",
+            zypper_history_event(target),
+        ).replace("recorded", "Zypper history", 1)
+    if item.kind == "YUM":
+        event = legacy_rpm_history_event("yum", target)
+        if event:
+            return (
+                f"marked explicitly installed by YUM; "
+                f"YUM transaction {event[0]}: "
+                f"{compact_history_command(event[1])}"
+            )
+        return (
+            "marked explicitly installed by YUM; "
+            "original installation command unavailable"
+        )
+    if item.kind == "RPM":
+        date, vendor = rpm_install_metadata(item.ident)
+        when = f" on {date}" if date else ""
+        source = f"; package vendor {vendor}" if vendor else ""
+        return (
+            f"installed directly in the RPM database{when}{source}; "
+            "original command and reason were not recorded"
+        )
+    if item.kind == "RPM-OSTree":
+        return (
+            "explicitly layered in the current rpm-ostree deployment; "
+            "original command unavailable"
+        )
+    if item.kind == "Flatpak":
+        remote, event = flatpak_install_evidence(item.ident, item.scope)
+        source = f" from {remote}" if remote else ""
+        base = (
+            f"explicitly installed{source} as a {item.scope} Flatpak"
+        )
+        return f"{base}; {event}" if event else (
+            f"{base}; original install event unavailable")
+    if item.kind == "Snap":
+        tracking, publisher, change = snap_install_evidence(item.ident)
+        details = ["installed from the Snap Store"]
+        if tracking:
+            details.append(f"{tracking} channel")
+        if publisher:
+            details.append(f"published by {publisher}")
+        base = ", ".join(details)
+        return f"{base}; {change}" if change else (
+            f"{base}; original install change unavailable")
+    if item.kind in {"Homebrew", "Homebrew Cask"}:
+        tap, requested = homebrew_install_evidence(item.kind, item.ident)
+        label = "Homebrew Cask" if item.kind == "Homebrew Cask" else "Homebrew"
+        source = f" from {tap}" if tap else ""
+        state = (
+            "records it as installed on request"
+            if requested is True else
+            "does not retain a reliable original-request record"
+        )
+        return f"installed with {label}{source}; Homebrew {state}"
+    if item.kind == "Nix":
+        metadata = nix_profile_metadata().get(item.ident, {})
+        original = str(
+            metadata.get("originalUrl")
+            or metadata.get("original_url")
+            or "")
+        attribute = str(
+            metadata.get("attrPath")
+            or metadata.get("attr_path")
+            or "")
+        source = original + (f"#{attribute}" if attribute else "")
+        return (
+            f"explicit Nix profile entry from {source}; current Nix profile"
+            if source else
+            "explicit entry in the current Nix profile; original source unavailable"
+        )
+    if item.kind == "Cargo":
+        source = cargo_install_source(item.ident)
+        return (
+            "explicitly installed with Cargo from "
+            f"{friendly_cargo_source(source)}; crate {item.ident}"
+            if source else
+            f"explicitly installed with Cargo; crate {item.ident}; "
+            "recorded source unavailable"
+        )
+    if item.kind == "Pipx":
+        source = pipx_install_source(item.ident, item.scope)
+        if source:
+            origin = (
+                f"PyPI package {source}"
+                if re.fullmatch(r"[A-Za-z0-9_.-]+", source)
+                else source
+            )
+            return (
+                f"explicitly installed with pipx from {origin}; "
+                f"environment {item.ident}"
+            )
+        return (
+            f"top-level pipx environment {item.ident}; "
+            "original package source unavailable"
+        )
+    if item.kind == "NPM":
+        source = npm_install_source(item.ident)
+        return (
+            f"top-level global npm package resolved from {source}; "
+            "original install command unavailable"
+            if source else
+            "present as a top-level global npm package; "
+            "original install command and registry unavailable"
+        )
+    if item.kind == "Gear Lever":
+        source = f"; update source {item.origin}" if item.origin else ""
+        unavailable = "" if item.origin else "; original download source unavailable"
+        return (
+            f"managed by Gear Lever at {item.path or item.ident}"
+            f"{source}{unavailable}"
+        )
+    if item.kind == "AppImage":
+        return (
+            f"standalone AppImage at {item.path or item.ident}; "
+            "no package manager or installation history found"
+        )
+    if item.kind == "Standalone":
+        return (
+            f"unmanaged executable at {item.path or item.ident}; "
+            "no supported installer owns it and its original source is unknown"
+        )
+    return (
+        f"top-level {item.kind} installation; "
+        "original installation source unavailable"
+    )
+
+
+def dependency_install_reason(item: Match) -> str:
+    report = dependency_report(item)
+    cause = compact_dependency_cause(report)
+    if not cause:
+        cause = (
+            "no installed package currently requires it"
+            if report.complete else
+            "installed automatically as an optional dependency"
+            if item.role == "weak dependency" else
+            "installed automatically as a dependency"
+        )
+    if item.kind == "DNF" and report.history_reason:
+        return f"{cause}; {report.history_reason}"
+    if item.kind == "DNF" and not shutil.which("dnf5") \
+            and shutil.which("dnf"):
+        event = legacy_rpm_history_event(
+            "dnf", package_base(item.ident))
+        if event:
+            return (
+                f"{cause}; DNF transaction {event[0]}: "
+                f"{compact_history_command(event[1])}"
+            )
+    if item.kind == "YUM":
+        event = legacy_rpm_history_event(
+            "yum", package_base(item.ident))
+        if event:
+            return (
+                f"{cause}; YUM transaction {event[0]}: "
+                f"{compact_history_command(event[1])}"
+            )
+    if item.kind == "APT":
+        event = apt_history_event(package_base(item.ident))
+        detail = (
+            f"; APT history{f' {event[0]}' if event and event[0] else ''}: "
+            f"{compact_history_command(event[1])}" if event else
+            "; APT marks it automatically installed; "
+            "original install event unavailable"
+        )
+        return cause + detail
+    if item.kind == "Pacman":
+        event = pacman_history_event(package_base(item.ident))
+        detail = (
+            f"; pacman log{f' {event[0]}' if event and event[0] else ''}: "
+            f"{compact_history_command(event[1])}" if event else
+            "; Pacman records it as a dependency; "
+            "original install event unavailable"
+        )
+        return cause + detail
+    if item.kind == "Zypper":
+        event = zypper_history_event(package_base(item.ident))
+        detail = (
+            f"; Zypper history{f' {event[0]}' if event and event[0] else ''}: "
+            f"{compact_history_command(event[1])}" if event else
+            "; Zypper records it as a dependency; "
+            "original install event unavailable"
+        )
+        return cause + detail
+    if item.kind == "Homebrew":
+        tap, _requested = homebrew_install_evidence(
+            item.kind, item.ident)
+        source = f" from {tap}" if tap else ""
+        return (
+            f"{cause}; installed with Homebrew{source} as a dependency; "
+            "original command unavailable"
+        )
+    return (
+        f"{cause}; {item.kind} records it as a dependency; "
+        "original install event unavailable"
+    )
+
+
+def archive_evidence(item: Match, reason: str) -> str:
+    if not item.archive:
+        return reason
+    archive = display(item.archive)
+    if archive in reason or item.archive.name in reason:
+        return reason
+    return (
+        f"{reason}; supplied archive {archive} matches this installed package "
+        "but is not proven to be its original source"
+    )
 
 
 def install_reason(item: Match) -> str:
     if item.role == "explicit":
-        return "explicitly requested"
+        return archive_evidence(item, explicit_install_reason(item))
     if item.role == "external":
-        return "installed outside the native package manager"
+        if item.kind == "DNF":
+            record = dnf_install_record(package_base(item.ident))
+            if record:
+                original = (
+                    "installed from a local or external RPM"
+                    if record.reason.casefold() in {
+                        "external", "external user"}
+                    else
+                    "currently marked as externally installed by DNF; "
+                    f"original recorded reason: {record.reason}"
+                )
+                return archive_evidence(
+                    item,
+                    f"{original}; "
+                    f"DNF transaction {record.transaction_id}: "
+                    f"{compact_history_command(record.command)}",
+                )
+            date, vendor = rpm_install_metadata(item.ident)
+            metadata = (
+                f"; RPM database install time {date}" if date else "")
+            metadata += f"; package vendor {vendor}" if vendor else ""
+            return archive_evidence(
+                item,
+                "DNF records it as installed by an external tool"
+                f"{metadata}; original tool and source unavailable",
+            )
+        return archive_evidence(
+            item,
+            f"installed outside {item.kind}; original source unavailable",
+        )
     if item.role == "group":
-        return (
+        return archive_evidence(item, (
             dnf_group_install_reason(package_base(item.ident))
             if item.kind == "DNF"
             else "installed as part of a package group"
-        )
+        ))
     if item.role not in {"dependency", "weak dependency"}:
-        return "the package manager did not record a reason"
-
-    report = dependency_report(item)
-    parts: list[str] = []
-    cause = compact_dependency_cause(report)
-    if cause:
-        parts.append(cause)
-    else:
-        parts.append(
-            "installed automatically as "
-            + ("an optional dependency"
-               if item.role == "weak dependency" else "a dependency")
+        if item.kind == "RPM":
+            date, vendor = rpm_install_metadata(item.ident)
+            metadata = (
+                f"RPM database install time {date}" if date else
+                "present in the RPM database"
+            )
+            metadata += f"; package vendor {vendor}" if vendor else ""
+            return archive_evidence(
+                item,
+                f"{metadata}; RPM does not record whether it was explicitly "
+                "requested; original command and source unavailable",
+            )
+        return archive_evidence(
+            item,
+            f"{item.kind} did not record an installation reason; "
+            "original source unavailable",
         )
-    if report.history_reason:
-        parts.append(report.history_reason)
-    return "; ".join(parts)
+    return archive_evidence(item, dependency_install_reason(item))
 
 
 def add_install_reasons(matches: list[Match]) -> list[Match]:

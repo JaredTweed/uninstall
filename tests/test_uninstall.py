@@ -26,10 +26,26 @@ class UninstallTests(unittest.TestCase):
         MODULE.rpm_ostree_layered_packages.cache_clear()
         MODULE.zypper_userinstalled.cache_clear()
         MODULE.dnf_install_reasons.cache_clear()
+        MODULE.dnf_history_transaction.cache_clear()
         MODULE.dnf_install_record.cache_clear()
         MODULE.dnf_history_reason.cache_clear()
+        MODULE.dnf_installed_group_inventory.cache_clear()
         MODULE.dnf_group_memberships.cache_clear()
+        MODULE.dnf_installed_environment_inventory.cache_clear()
         MODULE.dnf_environment_details.cache_clear()
+        MODULE.apt_history_event.cache_clear()
+        MODULE.pacman_history_event.cache_clear()
+        MODULE.zypper_history_event.cache_clear()
+        MODULE.legacy_rpm_history_event.cache_clear()
+        MODULE.flatpak_history_entries.cache_clear()
+        MODULE.flatpak_install_evidence.cache_clear()
+        MODULE.snap_install_evidence.cache_clear()
+        MODULE.homebrew_install_evidence.cache_clear()
+        MODULE.nix_profile_metadata.cache_clear()
+        MODULE.cargo_install_source.cache_clear()
+        MODULE.pipx_install_source.cache_clear()
+        MODULE.npm_install_source.cache_clear()
+        MODULE.rpm_install_metadata.cache_clear()
         MODULE.rpm_dependency_graph.cache_clear()
         MODULE.rpm_reverse_graph.cache_clear()
         MODULE.apt_reverse_graph.cache_clear()
@@ -754,6 +770,33 @@ class UninstallTests(unittest.TestCase):
             "(recorded reason: Weak Dependency)",
         )
 
+    @patch.object(MODULE, "capture")
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/dnf5")
+    def test_dnf_history_does_not_confuse_package_name_prefixes(
+            self, _which, capture):
+        capture.side_effect = [
+            MODULE.json.dumps([{"id": 7, "command_line": "dnf install foo"}]),
+            MODULE.json.dumps([{
+                "id": 7,
+                "description": "dnf install foo",
+                "packages": [
+                    {
+                        "nevra": "foo-bar-0:2.0-1.x86_64",
+                        "action": "Install",
+                        "reason": "Dependency",
+                    },
+                    {
+                        "nevra": "foo-0:1.0-1.x86_64",
+                        "action": "Install",
+                        "reason": "User",
+                    },
+                ],
+            }]),
+        ]
+        record = MODULE.dnf_install_record("foo")
+        self.assertIsNotNone(record)
+        self.assertEqual(record.reason, "User")
+
     @patch.object(
         MODULE, "dnf_environment_details",
         return_value=(
@@ -796,6 +839,8 @@ class UninstallTests(unittest.TestCase):
             "Id : cosmic-desktop-apps\n"
             "Name : COSMIC Desktop Supplementary Applications\n"
             "Installed : yes\n"
+            "Default packages : okular\n"
+            "                 : other-app\n"
         )
         self.assertEqual(
             MODULE.dnf_group_memberships("okular"),
@@ -806,8 +851,26 @@ class UninstallTests(unittest.TestCase):
         )
         capture.assert_called_once_with([
             "dnf5", "-q", "-C", "group", "info",
-            "--installed", "--hidden", "--contains-pkgs=okular",
+            "--installed", "--hidden",
         ])
+
+    def test_long_history_command_keeps_decisive_group_target(self):
+        command = (
+            "dnf5 --config /etc/dnf/dnf.conf --installroot / "
+            "install @core @workstation-product-environment "
+            + " ".join(f"package-{number}" for number in range(30))
+        )
+        self.assertEqual(
+            MODULE.compact_history_command(command),
+            "dnf5 install @workstation-product-environment "
+            "(original command abbreviated)",
+        )
+
+    def test_short_history_command_is_not_changed(self):
+        self.assertEqual(
+            MODULE.compact_history_command("dnf install wine"),
+            "dnf install wine",
+        )
 
     @patch.object(
         MODULE, "dnf_group_memberships",
@@ -828,6 +891,238 @@ class UninstallTests(unittest.TestCase):
             "installed as part of a package group; "
             "DNF transaction 9: dnf group install desktop",
         )
+
+    @patch.object(MODULE, "dnf_install_record")
+    def test_explicit_dnf_reason_includes_repository_and_transaction(
+            self, install_record):
+        install_record.return_value = MODULE.DnfInstallRecord(
+            114, "dnf install yazi", "User",
+            repository="copr:owner:yazi",
+        )
+        item = MODULE.Match("DNF", "yazi", "yazi", role="explicit")
+        self.assertEqual(
+            MODULE.install_reason(item),
+            "explicitly installed from copr:owner:yazi; "
+            "DNF transaction 114: dnf install yazi",
+        )
+
+    @patch.object(
+        MODULE, "rpm_install_metadata",
+        return_value=("Tue Jul 14 17:40:05 2026", "Example Vendor"),
+    )
+    def test_plain_rpm_reason_discloses_database_limitations(self, _metadata):
+        item = MODULE.Match("RPM", "example", "example", role="unknown")
+        self.assertEqual(
+            MODULE.install_reason(item),
+            "RPM database install time Tue Jul 14 17:40:05 2026; "
+            "package vendor Example Vendor; RPM does not record whether it "
+            "was explicitly requested; original command and source unavailable",
+        )
+
+    def test_apt_history_parser_finds_the_original_command(self):
+        text = (
+            "Start-Date: 2026-07-01  10:20:00\n"
+            "Commandline: apt install freecad\n"
+            "Install: freecad:amd64 (1.0, automatic), "
+            "libfoo:amd64 (2.0, automatic)\n"
+            "End-Date: 2026-07-01  10:20:05\n"
+        )
+        self.assertEqual(
+            MODULE.parse_apt_history(text, "freecad"),
+            [("2026-07-01  10:20:00", "apt install freecad")],
+        )
+
+    @patch.object(
+        MODULE, "apt_history_event",
+        return_value=("2026-07-01 10:20:00", "apt install freecad"),
+    )
+    def test_explicit_apt_reason_distinguishes_state_from_history(
+            self, _history):
+        item = MODULE.Match("APT", "freecad", "freecad", role="explicit")
+        self.assertEqual(
+            MODULE.install_reason(item),
+            "marked manually installed by APT; "
+            "APT history on 2026-07-01 10:20:00: apt install freecad",
+        )
+
+    def test_pacman_history_parser_connects_command_to_install(self):
+        text = (
+            "[2026-07-01T10:00:00+0000] [PACMAN] "
+            "Running 'pacman -S okular'\n"
+            "[2026-07-01T10:00:01+0000] [ALPM] "
+            "installed okular (1.0-1)\n"
+        )
+        self.assertEqual(
+            MODULE.parse_pacman_history(text, "okular"),
+            ("2026-07-01T10:00:01+0000", "pacman -S okular"),
+        )
+
+    def test_zypper_history_parser_reports_recorded_repository(self):
+        text = (
+            "2026-07-01 10:00:00|install|okular|1.0|x86_64|"
+            "root@host|repo-oss|checksum|\n"
+        )
+        self.assertEqual(
+            MODULE.parse_zypper_history(text, "okular"),
+            ("2026-07-01 10:00:00", "installed from repo-oss"),
+        )
+
+    def test_legacy_dnf_history_parser_recovers_original_command(self):
+        text = (
+            "Transaction ID : 42\n"
+            "Command Line : dnf install okular\n"
+            "Packages Altered:\n"
+            "    Install okular-1.0-1.x86_64 @updates\n"
+        )
+        self.assertEqual(
+            MODULE.parse_legacy_rpm_history_info(text, "okular"),
+            "dnf install okular",
+        )
+
+    @patch.object(MODULE, "capture")
+    def test_flatpak_evidence_includes_remote_and_install_event(self, capture):
+        capture.side_effect = [
+            "flathub\n",
+            MODULE.json.dumps([
+                {
+                    "time": "Jul 1 10:00:00",
+                    "change": "deploy install",
+                    "application": "org.freecad.FreeCAD",
+                    "installation": "system",
+                    "remote": "flathub",
+                },
+            ]),
+        ]
+        self.assertEqual(
+            MODULE.flatpak_install_evidence(
+                "org.freecad.FreeCAD", "system"),
+            (
+                "flathub",
+                "Flatpak history Jul 1 10:00:00: "
+                "install org.freecad.FreeCAD",
+            ),
+        )
+
+    @patch.object(MODULE, "capture")
+    def test_snap_evidence_includes_channel_publisher_and_change(
+            self, capture):
+        capture.side_effect = [
+            "tracking: latest/stable\npublisher: KDE\u2713\n",
+            "ID Status Spawn Ready Summary\n"
+            "84 Done now now Install \"okular\" snap\n",
+        ]
+        self.assertEqual(
+            MODULE.snap_install_evidence("okular"),
+            ("latest/stable", "KDE\u2713", 'snap change 84: Install "okular" snap'),
+        )
+
+    @patch.object(MODULE, "capture")
+    def test_homebrew_evidence_uses_tap_and_requested_state(self, capture):
+        capture.return_value = MODULE.json.dumps({
+            "formulae": [{
+                "tap": "homebrew/core",
+                "installed": [{"installed_on_request": True}],
+            }],
+        })
+        self.assertEqual(
+            MODULE.homebrew_install_evidence("Homebrew", "ripgrep"),
+            ("homebrew/core", True),
+        )
+
+    @patch.object(MODULE, "nix_profile_metadata")
+    def test_nix_reason_uses_original_flake_reference(self, metadata):
+        metadata.return_value = {
+            "ripgrep": {
+                "originalUrl": "github:NixOS/nixpkgs",
+                "attrPath": "legacyPackages.x86_64-linux.ripgrep",
+            },
+        }
+        item = MODULE.Match("Nix", "ripgrep", "ripgrep", role="explicit")
+        rendered = MODULE.install_reason(item)
+        self.assertIn("github:NixOS/nixpkgs#legacyPackages", rendered)
+        self.assertIn("current Nix profile", rendered)
+
+    @patch.object(
+        MODULE, "cargo_install_source",
+        return_value=(
+            "registry+https://github.com/rust-lang/crates.io-index"),
+    )
+    def test_cargo_reason_names_recorded_registry_source(self, _source):
+        item = MODULE.Match(
+            "Cargo", "ripgrep", "ripgrep", role="explicit")
+        self.assertIn(
+            "crates.io (recorded source registry+https://",
+            MODULE.install_reason(item),
+        )
+
+    @patch.object(MODULE, "pipx_install_source", return_value="httpie")
+    def test_pipx_reason_names_package_and_environment(self, _source):
+        item = MODULE.Match(
+            "Pipx", "httpie", "httpie", scope="user", role="explicit")
+        self.assertEqual(
+            MODULE.install_reason(item),
+            "explicitly installed with pipx from PyPI package httpie; "
+            "environment httpie",
+        )
+
+    @patch.object(
+        MODULE, "npm_install_source",
+        return_value="https://registry.npmjs.org/tool/-/tool-2.0.0.tgz",
+    )
+    def test_npm_reason_uses_resolved_package_source(self, _source):
+        item = MODULE.Match("NPM", "tool", "tool", role="explicit")
+        self.assertIn(
+            "top-level global npm package resolved from "
+            "https://registry.npmjs.org",
+            MODULE.install_reason(item),
+        )
+
+    def test_file_based_installers_are_explicit_about_missing_history(self):
+        appimage = MODULE.Match(
+            "AppImage", "/apps/Tool.AppImage", "Tool",
+            path=Path("/apps/Tool.AppImage"), role="explicit")
+        standalone = MODULE.Match(
+            "Standalone", "/usr/local/bin/tool", "tool",
+            path=Path("/usr/local/bin/tool"), role="explicit")
+        gearlever = MODULE.Match(
+            "Gear Lever", "/apps/Tool.AppImage", "Tool",
+            path=Path("/apps/Tool.AppImage"), role="explicit",
+            origin="https://example.com/releases",
+        )
+        self.assertIn("no package manager", MODULE.install_reason(appimage))
+        self.assertIn("original source is unknown",
+                      MODULE.install_reason(standalone))
+        self.assertIn("update source https://example.com/releases",
+                      MODULE.install_reason(gearlever))
+
+    @patch.object(
+        MODULE, "explicit_install_reason",
+        return_value="marked manually installed by APT; history unavailable",
+    )
+    def test_matching_archive_is_not_claimed_as_original_source(
+            self, _reason):
+        item = MODULE.Match(
+            "APT", "example", "example", role="explicit",
+            archive=Path("/tmp/example.deb"),
+        )
+        self.assertIn(
+            "matches this installed package but is not proven",
+            MODULE.install_reason(item),
+        )
+
+    def test_multiple_dependency_roots_are_summarized_on_one_line(self):
+        item = MODULE.Match("APT", "libfoo", "libfoo", role="dependency")
+        report = MODULE.DependencyReport(
+            item, [], [
+                ["texlive", "tex-engine", "libfoo"],
+                ["wine", "wine-core", "libfoo"],
+                ["third-app", "helper", "libfoo"],
+            ],
+        )
+        rendered = MODULE.compact_dependency_cause(report)
+        self.assertIn("texlive -> tex-engine -> libfoo", rendered)
+        self.assertIn("wine -> wine-core -> libfoo", rendered)
+        self.assertIn("(+1 other roots)", rendered)
 
     @patch.object(MODULE, "capture")
     def test_apt_graph_understands_alternative_dependencies(self, capture):
