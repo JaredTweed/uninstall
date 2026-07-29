@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 
 @dataclass(frozen=True)
@@ -379,6 +379,8 @@ def main() -> int:
     if not args.app:
         parser.print_help()
         return 2
+    if norm(args.app) == "uninstall":
+        return self_uninstall()
     return run_uninstall(args.app)
 
 

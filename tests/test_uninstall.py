@@ -70,6 +70,18 @@ class UninstallTests(unittest.TestCase):
         with patch("builtins.input", return_value="2"):
             self.assertEqual(MODULE.choose(matches), [])
 
+    @patch.object(MODULE, "self_uninstall", return_value=0)
+    @patch.object(MODULE.sys, "argv", ["uninstall", "uninstall"])
+    def test_uninstall_uninstall_is_self_uninstall(self, self_uninstall):
+        self.assertEqual(MODULE.main(), 0)
+        self_uninstall.assert_called_once_with()
+
+    @patch.object(MODULE, "run_uninstall", return_value=0)
+    @patch.object(MODULE.sys, "argv", ["uninstall", "uninstall-helper"])
+    def test_longer_name_remains_a_normal_search(self, run_uninstall):
+        self.assertEqual(MODULE.main(), 0)
+        run_uninstall.assert_called_once_with("uninstall-helper")
+
 
 if __name__ == "__main__":
     unittest.main()

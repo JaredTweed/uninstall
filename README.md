@@ -47,6 +47,7 @@ Make sure `$HOME/.local/bin` is on your `PATH`.
 uninstall FreeCAD
 uninstall org.freecad.FreeCAD
 uninstall --help
+uninstall uninstall
 uninstall --self-uninstall
 ```
 
