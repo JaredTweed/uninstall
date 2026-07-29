@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""A friendly, cross-package-manager Linux uninstaller."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Iterable
+
+VERSION = "0.1.0"
+
+
+@dataclass(frozen=True)
+class Match:
+    kind: str
+    ident: str
+    name: str
+    version: str = ""
+    scope: str = ""
+    path: Path | None = None
+
+
+def norm(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def relevant(query: str, *values: str) -> bool:
+    needle = norm(query)
+    return bool(needle) and any(needle in norm(value) for value in values)
+
+
+def capture(command: list[str]) -> str:
+    try:
+        result = subprocess.run(
+            command, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=20, check=False,
+        )
+        return result.stdout if result.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def detect_flatpak(query: str) -> list[Match]:
+    if not shutil.which("flatpak"):
+        return []
+    found: list[Match] = []
+    for scope in ("user", "system"):
+        text = capture(["flatpak", "list", "--app", f"--{scope}",
+                        "--columns=application,name,version"])
+        for line in text.splitlines():
+            fields = line.split("\t")
+            if len(fields) >= 2 and relevant(query, fields[0], fields[1]):
+                found.append(Match("Flatpak", fields[0], fields[1],
+                                   fields[2] if len(fields) > 2 else "", scope))
+    return found
+
+
+def detect_snap(query: str) -> list[Match]:
+    if not shutil.which("snap"):
+        return []
+    found: list[Match] = []
+    for line in capture(["snap", "list"]).splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 2 and relevant(query, fields[0]):
+            found.append(Match("Snap", fields[0], fields[0], fields[1], "system"))
+    return found
+
+
+def detect_dpkg(query: str) -> list[Match]:
+    if not shutil.which("dpkg-query"):
+        return []
+    fmt = "${binary:Package}\\t${Version}\\t${binary:Summary}\\n"
+    found: list[Match] = []
+    for line in capture(["dpkg-query", "-W", "-f=" + fmt]).splitlines():
+        fields = line.split("\t", 2)
+        if len(fields) >= 2 and relevant(query, fields[0], fields[2] if len(fields) > 2 else ""):
+            found.append(Match("APT", fields[0], fields[0], fields[1], "system"))
+    return found
+
+
+def detect_rpm(query: str) -> list[Match]:
+    if not shutil.which("rpm"):
+        return []
+    if shutil.which("dnf5") or shutil.which("dnf"):
+        kind = "DNF"
+    elif shutil.which("yum"):
+        kind = "YUM"
+    elif shutil.which("zypper"):
+        kind = "Zypper"
+    else:
+        return []
+    fmt = "%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{SUMMARY}\\n"
+    found: list[Match] = []
+    for line in capture(["rpm", "-qa", "--qf", fmt]).splitlines():
+        fields = line.split("\t", 2)
+        if len(fields) >= 2 and relevant(query, fields[0], fields[2] if len(fields) > 2 else ""):
+            found.append(Match(kind, fields[0], fields[0], fields[1], "system"))
+    return found
+
+
+def detect_pacman(query: str) -> list[Match]:
+    if not shutil.which("pacman"):
+        return []
+    found: list[Match] = []
+    for line in capture(["pacman", "-Q"]).splitlines():
+        fields = line.rsplit(maxsplit=1)
+        if fields and relevant(query, fields[0]):
+            found.append(Match("Pacman", fields[0], fields[0],
+                               fields[1] if len(fields) > 1 else "", "system"))
+    return found
+
+
+def detect_appimages(query: str) -> list[Match]:
+    roots = [
+        Path.home() / "Applications", Path.home() / ".local/bin",
+        Path.home() / "Downloads", Path.home() / "Desktop",
+        Path("/opt"), Path("/usr/local/bin"),
+    ]
+    found: list[Match] = []
+    seen: set[Path] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            for current, dirs, files in os.walk(root):
+                relative_depth = len(Path(current).relative_to(root).parts)
+                if relative_depth >= 2:
+                    dirs[:] = []
+                for filename in files:
+                    path = Path(current) / filename
+                    if (filename.casefold().endswith(".appimage")
+                            and relevant(query, filename)
+                            and path not in seen):
+                        seen.add(path)
+                        found.append(Match("AppImage", str(path), path.stem, "",
+                                           "user" if path.is_relative_to(Path.home()) else "system", path))
+        except OSError:
+            continue
+    return found
+
+
+DETECTORS: tuple[Callable[[str], list[Match]], ...] = (
+    detect_flatpak, detect_snap, detect_dpkg, detect_rpm, detect_pacman,
+    detect_appimages,
+)
+
+
+def score(match: Match, query: str) -> tuple[int, str, str]:
+    needle = norm(query)
+    values = (norm(match.ident), norm(match.name))
+    rank = 0 if needle in values else 1 if any(v.startswith(needle) for v in values) else 2
+    return rank, match.kind, match.name.casefold()
+
+
+def find_matches(query: str) -> list[Match]:
+    matches: list[Match] = []
+    for detector in DETECTORS:
+        matches.extend(detector(query))
+    unique = {(m.kind, m.ident, m.scope): m for m in matches}
+    return sorted(unique.values(), key=lambda item: score(item, query))
+
+
+def choose(matches: list[Match]) -> list[Match]:
+    print(f"\nFound {len(matches)} likely installed option{'s' if len(matches) != 1 else ''}:\n")
+    for index, item in enumerate(matches, 1):
+        details = " · ".join(value for value in (item.version, item.scope) if value)
+        print(f"  {index:>2}. {item.name}  [{item.kind}]{'  ' + details if details else ''}")
+        if item.ident != item.name:
+            print(f"      {item.ident}")
+    print("\nChoose numbers separated by commas, “a” for all, or Enter to cancel.")
+    raw = input("> ").strip().casefold()
+    if not raw:
+        return []
+    if raw in {"a", "all"}:
+        return matches
+    try:
+        indexes = {int(part.strip()) for part in raw.split(",")}
+    except ValueError:
+        print("That selection was not understood.", file=sys.stderr)
+        return []
+    if not indexes or min(indexes) < 1 or max(indexes) > len(matches):
+        print("Selection is out of range.", file=sys.stderr)
+        return []
+    return [item for index, item in enumerate(matches, 1) if index in indexes]
+
+
+def data_keys(selected: Iterable[Match]) -> set[str]:
+    keys: set[str] = set()
+    for item in selected:
+        values = (item.name, item.ident, Path(item.ident).stem)
+        for value in values:
+            simple = norm(value)
+            if len(simple) >= 3:
+                keys.add(simple)
+            tail = norm(value.rsplit(".", 1)[-1])
+            if len(tail) >= 3:
+                keys.add(tail)
+    return keys
+
+
+def find_user_data(selected: list[Match]) -> list[Path]:
+    keys = data_keys(selected)
+    roots = [
+        Path.home() / ".config", Path.home() / ".cache",
+        Path.home() / ".local/share", Path.home() / ".local/state",
+    ]
+    paths: set[Path] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            for child in root.iterdir():
+                child_key = norm(child.name)
+                if child_key in keys and (child.is_dir() or child.is_symlink()):
+                    paths.add(child)
+        except OSError:
+            pass
+    for item in selected:
+        if item.kind == "Snap":
+            candidate = Path.home() / "snap" / item.ident
+            if candidate.exists():
+                paths.add(candidate)
+    return sorted(paths)
+
+
+def privileged(command: list[str]) -> list[str]:
+    if os.geteuid() == 0:
+        return command
+    sudo = shutil.which("sudo")
+    return ([sudo] if sudo else ["sudo"]) + command
+
+
+def uninstall_command(item: Match, remove_data: bool) -> list[str]:
+    if item.kind == "Flatpak":
+        command = ["flatpak", "uninstall", "-y", f"--{item.scope}"]
+        if remove_data:
+            command.append("--delete-data")
+        return command + [item.ident]
+    if item.kind == "Snap":
+        command = ["snap", "remove"]
+        if remove_data:
+            command.append("--purge")
+        return privileged(command + [item.ident])
+    if item.kind == "APT":
+        action = "purge" if remove_data else "remove"
+        return privileged(["apt-get", action, item.ident])
+    if item.kind == "DNF":
+        manager = "dnf5" if shutil.which("dnf5") else "dnf"
+        return privileged([manager, "remove", item.ident])
+    if item.kind == "Zypper":
+        return privileged(["zypper", "remove", item.ident])
+    if item.kind == "YUM":
+        return privileged(["yum", "remove", item.ident])
+    if item.kind == "Pacman":
+        return privileged(["pacman", "-R", item.ident])
+    if item.kind == "AppImage" and item.path:
+        command = ["rm", "--", str(item.path)]
+        return command if os.access(item.path.parent, os.W_OK) else privileged(command)
+    raise ValueError(f"Unsupported package kind: {item.kind}")
+
+
+def yes(prompt: str) -> bool:
+    try:
+        return input(prompt).strip().casefold() in {"y", "yes"}
+    except EOFError:
+        return False
+
+
+def remove_paths(paths: list[Path]) -> bool:
+    ok = True
+    home = Path.home().resolve()
+    for path in paths:
+        try:
+            resolved_parent = path.parent.resolve()
+            if resolved_parent != home and home not in resolved_parent.parents:
+                raise ValueError("path is outside your home directory")
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path)
+            print(f"  Removed {path}")
+        except (OSError, ValueError) as error:
+            ok = False
+            print(f"  Could not remove {path}: {error}", file=sys.stderr)
+    return ok
+
+
+def run_uninstall(query: str) -> int:
+    print(f"Searching installed apps for “{query}”…")
+    matches = find_matches(query)
+    if not matches:
+        print("No likely installed apps found.")
+        return 1
+    try:
+        selected = choose(matches)
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled.")
+        return 130
+    if not selected:
+        print("Nothing selected.")
+        return 0
+
+    paths = find_user_data(selected)
+    remove_data = False
+    if paths or any(item.kind in {"Flatpak", "Snap", "APT"} for item in selected):
+        print("\nAlso remove app data and saved configuration?")
+        if paths:
+            for path in paths:
+                print(f"  {path}")
+        print("This cannot be undone.")
+        remove_data = yes("Remove app data? [y/N] ")
+
+    commands = [uninstall_command(item, remove_data) for item in selected]
+    print("\nReady to run:")
+    for command in commands:
+        print("  " + shlex.join(command))
+    if remove_data and paths:
+        print(f"  and remove {len(paths)} user-data path{'s' if len(paths) != 1 else ''}")
+    if not yes("\nContinue? [y/N] "):
+        print("Cancelled.")
+        return 0
+
+    failed = False
+    for item, command in zip(selected, commands):
+        print(f"\nRemoving {item.name} ({item.kind})…")
+        try:
+            result = subprocess.run(command, check=False)
+        except OSError as error:
+            print(f"Could not run {command[0]}: {error}", file=sys.stderr)
+            failed = True
+            continue
+        if result.returncode:
+            print(f"Removal failed with exit code {result.returncode}.", file=sys.stderr)
+            failed = True
+    if remove_data and paths:
+        if failed:
+            print("\nApp data was kept because an uninstall command failed.")
+        elif not remove_paths(paths):
+            failed = True
+    print("\nFinished." if not failed else "\nFinished with errors.")
+    return 1 if failed else 0
+
+
+def self_uninstall() -> int:
+    located = shutil.which(sys.argv[0])
+    target = Path(located if located else sys.argv[0]).absolute()
+    if not target.is_file():
+        print("Cannot locate the installed executable.", file=sys.stderr)
+        return 1
+    print(f"This will remove uninstall itself:\n  {target}")
+    if not yes("Continue? [y/N] "):
+        print("Cancelled.")
+        return 0
+    command = ["rm", "--", str(target)]
+    if not os.access(target.parent, os.W_OK):
+        command = privileged(command)
+    return subprocess.run(command, check=False).returncode
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="uninstall",
+        description="Find and safely uninstall Linux apps, however they were installed.",
+    )
+    parser.add_argument("app", nargs="?", help="app name to find")
+    parser.add_argument("--self-uninstall", action="store_true",
+                        help="remove this command from the system")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    args = parser.parse_args()
+    if args.self_uninstall:
+        return self_uninstall()
+    if not args.app:
+        parser.print_help()
+        return 2
+    return run_uninstall(args.app)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
