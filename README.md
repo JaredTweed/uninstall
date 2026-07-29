@@ -22,6 +22,8 @@ common AppImage locations. You choose the exact result, decide separately
 whether its data should go too, see the command that will run, and confirm once
 more. If a command has a different package name—such as `aafire` from
 `aalib`—it asks the system package database which package owns the executable.
+If no package owns it, `uninstall` offers to remove the exact standalone
+executable from your `PATH` instead of suggesting loosely related packages.
 
 ## Install
 

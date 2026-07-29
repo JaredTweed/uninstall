@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 
 @dataclass(frozen=True)
@@ -124,7 +124,7 @@ def detect_pacman(query: str) -> list[Match]:
 
 
 def detect_executable_owner(query: str) -> list[Match]:
-    """Find a differently named package that owns a command on PATH."""
+    """Find the package owning a command, or identify a standalone command."""
     if not query or Path(query).name != query:
         return []
     executable = shutil.which(query)
@@ -164,6 +164,11 @@ def detect_executable_owner(query: str) -> list[Match]:
                 found.append(Match("Pacman", fields[0], fields[0],
                                    fields[1] if len(fields) > 1 else "",
                                    "system", provides=path))
+    if not found:
+        visible_path = Path(executable).absolute()
+        scope = "user" if visible_path.is_relative_to(Path.home()) else "system"
+        found.append(Match("Standalone", str(visible_path), query, "",
+                           scope, path=visible_path))
     return found
 
 
@@ -205,8 +210,20 @@ DETECTORS: tuple[Callable[[str], list[Match]], ...] = (
 def score(match: Match, query: str) -> tuple[int, str, str]:
     needle = norm(query)
     values = (norm(match.ident), norm(match.name))
-    rank = 0 if needle in values else 1 if any(v.startswith(needle) for v in values) else 2
+    rank = (-1 if match.provides or match.kind == "Standalone"
+            else 0 if needle in values
+            else 1 if any(v.startswith(needle) for v in values) else 2)
     return rank, match.kind, match.name.casefold()
+
+
+def exact_app_match(match: Match, query: str) -> bool:
+    needle = norm(query)
+    return needle in {
+        norm(match.name),
+        norm(match.ident),
+        norm(match.ident.rsplit(".", 1)[-1]),
+        norm(Path(match.ident).stem),
+    }
 
 
 def find_matches(query: str) -> list[Match]:
@@ -214,7 +231,17 @@ def find_matches(query: str) -> list[Match]:
     for detector in DETECTORS:
         matches.extend(detector(query))
     unique = {(m.kind, m.ident, m.scope): m for m in matches}
-    return sorted(unique.values(), key=lambda item: score(item, query))
+    results = list(unique.values())
+    commands = [
+        item for item in results
+        if item.provides or item.kind == "Standalone"
+    ]
+    if commands:
+        results = commands + [
+            item for item in results
+            if item not in commands and exact_app_match(item, query)
+        ]
+    return sorted(results, key=lambda item: score(item, query))
 
 
 def choose(matches: list[Match]) -> list[Match]:
@@ -313,6 +340,9 @@ def uninstall_command(item: Match, remove_data: bool) -> list[str]:
     if item.kind == "Pacman":
         return privileged(["pacman", "-R", item.ident])
     if item.kind == "AppImage" and item.path:
+        command = ["rm", "--", str(item.path)]
+        return command if os.access(item.path.parent, os.W_OK) else privileged(command)
+    if item.kind == "Standalone" and item.path:
         command = ["rm", "--", str(item.path)]
         return command if os.access(item.path.parent, os.W_OK) else privileged(command)
     raise ValueError(f"Unsupported package kind: {item.kind}")

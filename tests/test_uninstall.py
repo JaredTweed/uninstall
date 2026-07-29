@@ -68,6 +68,45 @@ class UninstallTests(unittest.TestCase):
     def test_missing_command_has_no_owner(self, _which):
         self.assertEqual(MODULE.detect_executable_owner("not-a-command"), [])
 
+    @patch.object(MODULE.Path, "home", return_value=Path("/home/test"))
+    @patch.object(MODULE.os, "access", return_value=True)
+    @patch.object(MODULE.shutil, "which")
+    @patch.object(MODULE, "capture", return_value="")
+    def test_unowned_command_is_standalone(
+            self, _capture, which, _access, _home):
+        locations = {
+            "edit": "/home/test/.local/bin/edit",
+            "rpm": "/usr/bin/rpm",
+            "dnf5": "/usr/bin/dnf5",
+        }
+        which.side_effect = locations.get
+        result = MODULE.detect_executable_owner("edit")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].kind, "Standalone")
+        self.assertEqual(result[0].path, Path("/home/test/.local/bin/edit"))
+        self.assertEqual(
+            MODULE.uninstall_command(result[0], False),
+            ["rm", "--", "/home/test/.local/bin/edit"],
+        )
+
+    @patch.object(MODULE, "DETECTORS")
+    def test_exact_command_suppresses_loose_package_matches(self, detectors):
+        detectors.__iter__.return_value = iter([
+            lambda _query: [
+                MODULE.Match("Standalone", "/home/test/.local/bin/edit",
+                             "edit", scope="user",
+                             path=Path("/home/test/.local/bin/edit")),
+                MODULE.Match("DNF", "libedit", "libedit", scope="system"),
+                MODULE.Match("Flatpak", "com.example.edit", "Edit",
+                             scope="user"),
+            ],
+        ])
+        result = MODULE.find_matches("edit")
+        self.assertEqual(
+            [(item.kind, item.name) for item in result],
+            [("Standalone", "edit"), ("Flatpak", "Edit")],
+        )
+
     def test_commands_are_exact_and_do_not_use_a_shell(self):
         item = MODULE.Match("Flatpak", "org.freecad.FreeCAD", "FreeCAD",
                             "1.0", "user")
