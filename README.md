@@ -4,17 +4,22 @@
 this app or command, and how do I remove it?”
 
 ```console
-$ uninstall FreeCAD
-Searching installed software for “FreeCAD”…
+$ uninstall DOSbox
 
-Found 2 likely installed options:
+Found 1 likely installed option:
 
-   1. FreeCAD  [Flatpak]  0.21.2 · user
-      org.freecad.FreeCAD
-   2. freecad  [APT]  0.20.2 · system
+   1. dosbox-staging  [DNF]  0.82.2-5.fc44 | system | weak dependency
+      provides command: /usr/bin/dosbox
+      Why installed: wine recommends it; DNF transaction 193: dnf install wine (recorded reason: Weak Dependency)
 
-Choose numbers separated by commas, “a” for all, or Enter to cancel.
-> 1
+Automatically selected the only result.
+
+Also expected to remove 8 now-unused dependencies: SDL2_net, fluid-soundfont-common, fluid-soundfont-gm, fluidsynth-libs, iir1, mt32emu, opusfile, speexdsp
+
+Ready to run:
+  sudo dnf5 remove dosbox-staging
+
+Continue? [y/N]
 ```
 
 It searches:
@@ -101,8 +106,6 @@ Make sure `$HOME/.local/bin` is on your `PATH`.
 uninstall FreeCAD
 uninstall org.freecad.FreeCAD
 uninstall ~/Downloads/example.rpm
-uninstall --why aalib-libs
-uninstall --plan wine
 uninstall --show-dependencies lib
 uninstall --help
 uninstall uninstall
@@ -118,46 +121,26 @@ matches exist, but a dependency-only result is still shown. Exact matches and
 command owners are never hidden. Use `--show-dependencies` to expand every
 mixed result.
 
-Before any cleanup question or removal, `uninstall` builds a read-only
-dependency and transaction plan. For APT, DNF/RPM, Pacman, and Homebrew it
-reports direct dependents and traces best-effort paths back to explicitly
-installed root applications:
+Each result has one concise `Why installed` line. For APT, DNF/RPM, Pacman,
+and Homebrew, `uninstall` traces dependencies back to an explicitly installed
+application when the package database has enough information. On DNF it also
+distinguishes user, group, hard-dependency, and weak-dependency reasons and
+includes the original DNF5 transaction for automatically installed packages
+when history is available:
 
 ```text
-libfoo [DNF]
-  Installed as: dependency (installed automatically)
-  Required dependency paths:
-    wine --requires--> wine-core --requires--> libfoo
+Why installed: wine recommends it; DNF transaction 193: dnf install wine (recorded reason: Weak Dependency)
 ```
 
-On DNF systems, `--why` distinguishes user, group, hard-dependency, and
-weak-dependency installation reasons. It reports current RPM `Recommends`,
-`Suggests`, `Supplements`, and `Enhances` relationships separately from hard
-requirements, and uses DNF5 history to show the original command and recorded
-transaction reason when available:
+Before asking for confirmation, native simulations determine what the package
+manager expects to remove. Routine internal details stay out of the way.
+`uninstall` prints the information that can change the decision: installed
+dependents, newly unused dependencies, protected or critical packages, or an
+unavailable preview. High- and unknown-impact operations require typing the
+exact confirmation phrase instead of answering `y`.
 
-```text
-dosbox-staging [DNF]
-  Installed as: weak dependency (installed automatically; optional)
-  Original install: DNF transaction 193: dnf install wine
-  Optional dependency paths:
-    wine --recommends--> dosbox-staging
-```
-
-Direct relationship lines are suppressed when the same evidence already
-appears in a root path, so simple cases are not repeated. Running `uninstall`
-without an app prompts for one. Combining `--why --plan` produces the full plan
-because `--plan` is the more detailed, still read-only operation.
-
-Native simulations determine the packages actually scheduled for removal.
-The preview separates the requested targets, packages that depend on them, and
-dependencies the manager now considers unused. Risk is labelled `LOW`,
-`CAUTION`, `HIGH`, or `UNKNOWN`; `LOW` is used instead of making an absolute
-claim that an uninstall is “safe.” High- and
-unknown-impact operations require typing the exact confirmation phrase rather
-than answering `y`. Essential, held, protected, and core packages receive an
-additional warning. `--why` explains dependency paths without creating a
-transaction; `--plan` includes the native transaction preview and then exits.
+Running `uninstall` without an app prompts for one. The normal command always
+explains the installation and checks removal impact.
 
 When a backend supports multiple targets, selected results from that backend
 are sent as one transaction—the same grouping used for its preview. Backends

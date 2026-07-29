@@ -20,7 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,7 @@ class Match:
     role: str = "unknown"
     archive: Path | None = None
     archive_version: str = ""
+    reason: str = ""
 
 
 @dataclass
@@ -169,6 +170,31 @@ def capture_any(command: list[str], timeout: int = 60) -> tuple[int, str]:
         return 124, output
     except OSError as error:
         return 127, str(error)
+
+
+def find_executable(query: str) -> str | None:
+    """Resolve a command, tolerating case mistakes when unambiguous."""
+    executable = shutil.which(query)
+    if executable or not query or Path(query).name != query:
+        return executable
+    if query == query.casefold():
+        return None
+    for raw_directory in os.environ.get("PATH", "").split(os.pathsep):
+        directory = Path(raw_directory or ".")
+        try:
+            candidates = [
+                entry.path for entry in os.scandir(directory)
+                if entry.name.casefold() == query.casefold()
+                and entry.is_file(follow_symlinks=True)
+                and os.access(entry.path, os.X_OK)
+            ]
+        except OSError:
+            continue
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            return None
+    return None
 
 
 def rpm_manager() -> str:
@@ -538,7 +564,7 @@ def parse_nix_profile_json(text: str) -> list[tuple[str, list[str]]]:
 def detect_nix(query: str) -> list[Match]:
     if not shutil.which("nix"):
         return []
-    executable = shutil.which(query) if Path(query).name == query else None
+    executable = find_executable(query) if Path(query).name == query else None
     resolved = str(Path(executable).resolve()) if executable else ""
     found: list[Match] = []
     text = capture(["nix", "profile", "list", "--json"])
@@ -606,7 +632,7 @@ def detect_executable_owner(query: str) -> list[Match]:
     """Find the package owning a command, or identify a standalone command."""
     if not query or Path(query).name != query:
         return []
-    executable = shutil.which(query)
+    executable = find_executable(query)
     if not executable:
         return []
     visible = Path(executable).absolute()
@@ -729,7 +755,7 @@ def detect_executable_owner(query: str) -> list[Match]:
 def unidentified_system_command(query: str) -> str:
     if not query or Path(query).name != query:
         return ""
-    executable = shutil.which(query)
+    executable = find_executable(query)
     if not executable:
         return ""
     visible = Path(executable).absolute()
@@ -1576,6 +1602,67 @@ def dependency_report(item: Match) -> DependencyReport:
     )
 
 
+def compact_dependency_cause(report: DependencyReport) -> str:
+    if report.relationship_paths:
+        nodes, relations = report.relationship_paths[0]
+        if len(nodes) == 2 and relations:
+            parent = display(nodes[0])
+            relation = relations[0]
+            if relation in {"requires", "recommends", "suggests"}:
+                return f"{parent} {relation} it"
+            if relation == "is supplemented by":
+                return f"it supplements {parent}"
+            if relation == "is enhanced by":
+                return f"it enhances {parent}"
+        return "dependency path " + render_relationship_path(nodes, relations)
+    if report.root_paths:
+        path = report.root_paths[0]
+        if len(path) == 2:
+            return f"{display(path[0])} requires it"
+        return "required through " + " -> ".join(
+            display(node) for node in path)
+    if report.direct_dependents:
+        names = ", ".join(display(name) for name in report.direct_dependents[:3])
+        return f"required directly by {names}"
+    if report.weak_relations:
+        dependent, relation = report.weak_relations[0]
+        return f"{display(dependent)} {display(relation)} it"
+    return ""
+
+
+def install_reason(item: Match) -> str:
+    if item.role == "explicit":
+        return "explicitly requested"
+    if item.role == "external":
+        return "installed outside the native package manager"
+    if item.role == "group":
+        return "installed as part of a package group"
+    if item.role not in {"dependency", "weak dependency"}:
+        return "the package manager did not record a reason"
+
+    report = dependency_report(item)
+    parts: list[str] = []
+    cause = compact_dependency_cause(report)
+    if cause:
+        parts.append(cause)
+    else:
+        parts.append(
+            "installed automatically as "
+            + ("an optional dependency"
+               if item.role == "weak dependency" else "a dependency")
+        )
+    if report.history_reason:
+        parts.append(report.history_reason)
+    return "; ".join(parts)
+
+
+def add_install_reasons(matches: list[Match]) -> list[Match]:
+    return [
+        replace(item, reason=install_reason(item))
+        for item in matches
+    ]
+
+
 def parse_dnf_preview(output: str) -> tuple[list[str], list[str]]:
     removals: list[str] = []
     orphans: list[str] = []
@@ -1987,12 +2074,40 @@ def show_removal_plan(plan: RemovalPlan) -> None:
         print(f"  Note: {display(note)}")
 
 
+def show_compact_impact(plan: RemovalPlan) -> None:
+    dependents = [
+        name for name in plan.additional_removals
+        if name not in plan.orphan_removals
+    ]
+    if dependents:
+        print(
+            "\nWarning: removal also affects installed dependents: "
+            + ", ".join(display(name) for name in dependents)
+        )
+    if plan.orphan_removals:
+        print(
+            "\nAlso expected to remove "
+            f"{len(plan.orphan_removals)} now-unused "
+            f"dependenc{'y' if len(plan.orphan_removals) == 1 else 'ies'}: "
+            + ", ".join(display(name) for name in plan.orphan_removals)
+        )
+    if plan.protected_items:
+        print(
+            "\nWarning: protected or critical packages are involved: "
+            + ", ".join(display(name) for name in plan.protected_items)
+        )
+    if plan.level == "UNKNOWN":
+        print(
+            "\nWarning: a reliable preview was unavailable; "
+            "review the package manager's final transaction carefully."
+        )
+
+
 def choose(matches: list[Match], auto_select: bool = False) -> list[Match]:
     print(f"\nFound {len(matches)} likely installed option{'s' if len(matches) != 1 else ''}:\n")
     for index, item in enumerate(matches, 1):
         role = (
-            "" if item.role == "explicit"
-            else "role unknown" if item.role == "unknown"
+            "" if item.role in {"explicit", "unknown"}
             else item.role
         )
         details = " | ".join(
@@ -2003,6 +2118,8 @@ def choose(matches: list[Match], auto_select: bool = False) -> list[Match]:
             print(f"      {display(item.ident)}")
         if item.provides:
             print(f"      provides command: {display(item.provides)}")
+        if item.reason:
+            print(f"      Why installed: {display(item.reason)}")
         if item.archive:
             print(f"      matched package archive: {display(item.archive)}")
             if (item.archive_version and item.version
@@ -2390,12 +2507,10 @@ def remove_paths(paths: list[Path]) -> bool:
 
 def run_uninstall(
         query: str, show_dependencies: bool = False,
-        plan_only: bool = False, why_only: bool = False,
 ) -> int:
-    print(f'Searching installed software for "{display(query)}"...')
     matches = annotate_roles(find_matches(query))
     matches, hidden_dependencies = filter_dependency_matches(
-        matches, query, show_dependencies or why_only or plan_only)
+        matches, query, show_dependencies)
     if hidden_dependencies:
         print(
             f"Hidden {hidden_dependencies} fuzzy dependency match"
@@ -2438,6 +2553,7 @@ def run_uninstall(
         else:
             print("No likely installed apps found.")
         return 1
+    matches = add_install_reasons(matches)
     try:
         selected = choose(
             matches, auto_select=len(matches) == 1)
@@ -2448,14 +2564,6 @@ def run_uninstall(
         print("Nothing selected.")
         return 0
 
-    if why_only and not plan_only:
-        print("\nTracing installation reasons and current dependencies...")
-        show_dependency_reports(
-            [dependency_report(item) for item in selected],
-            heading="Why this software is installed",
-        )
-        return 0
-
     for item in selected:
         error = preflight_file(item)
         if error:
@@ -2463,12 +2571,8 @@ def run_uninstall(
                   file=sys.stderr)
             return 1
 
-    print("\nBuilding a read-only removal preview...")
     plan = build_removal_plan(selected)
-    show_removal_plan(plan)
-    if plan_only:
-        print("\nPlan only; nothing was changed.")
-        return 0
+    show_compact_impact(plan)
 
     paths = find_user_data(selected)
     cleanup_kinds, paths_to_remove = ask_cleanup(selected, paths)
@@ -2550,17 +2654,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         prog="uninstall",
         description=(
-            "Find, explain, preview, and safely remove installed Linux software."
+            "Find, explain, and safely remove installed Linux software."
         ),
         epilog=(
             "Examples:\n"
             "  uninstall FreeCAD          find and remove it\n"
-            "  uninstall DOSbox --why     explain why it is installed\n"
-            "  uninstall wine --plan      preview every package removal\n"
+            "  uninstall DOSbox           explain and remove it\n"
             "  uninstall ./example.rpm    resolve a local archive\n"
-            "\n"
-            "--why answers 'Why is this installed?'; "
-            "--plan answers 'What would removal do?'"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -2571,10 +2671,6 @@ def main() -> int:
                         help="remove the uninstall command itself")
     parser.add_argument("--show-dependencies", action="store_true",
                         help="include fuzzy library/dependency search matches")
-    parser.add_argument("--why", action="store_true",
-                        help="explain why software is installed; make no changes")
-    parser.add_argument("--plan", action="store_true",
-                        help="preview the removal transaction; make no changes")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     args = parser.parse_args()
     if os.geteuid() == 0 and os.environ.get("SUDO_USER") not in {None, "", "root"}:
@@ -2582,7 +2678,7 @@ def main() -> int:
               file=sys.stderr)
         return 2
     if args.self_uninstall:
-        if args.app or args.show_dependencies or args.why or args.plan:
+        if args.app or args.show_dependencies:
             parser.error("--self-uninstall cannot be combined with an app or another mode")
         return self_uninstall()
     if not args.app:
@@ -2594,12 +2690,10 @@ def main() -> int:
             print("Nothing entered.")
             return 0
     if norm(args.app) == "uninstall" and not (
-            args.show_dependencies or args.why or args.plan):
+            args.show_dependencies):
         return self_uninstall()
     return run_uninstall(
-        args.app, show_dependencies=args.show_dependencies,
-        plan_only=args.plan, why_only=args.why,
-    )
+        args.app, show_dependencies=args.show_dependencies)
 
 
 if __name__ == "__main__":

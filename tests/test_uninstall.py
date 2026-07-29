@@ -99,6 +99,15 @@ class UninstallTests(unittest.TestCase):
         self.assertFalse(MODULE.relevant("rg", "org.mozilla.firefox"))
         self.assertTrue(MODULE.relevant("rg", "rg"))
 
+    def test_command_lookup_tolerates_unambiguous_case_mistakes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            command = Path(directory) / "dosbox"
+            command.write_text("#!/bin/sh\n", encoding="utf-8")
+            command.chmod(0o755)
+            with patch.dict(os.environ, {"PATH": directory}):
+                self.assertEqual(
+                    MODULE.find_executable("DOSbox"), str(command))
+
     def test_terminal_control_characters_are_neutralized(self):
         self.assertEqual(MODULE.display("safe\x1b[31m\nname"), "safe?[31m?name")
 
@@ -112,7 +121,9 @@ class UninstallTests(unittest.TestCase):
             env=environment,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(b"--why", result.stdout)
+        self.assertIn(b"--show-dependencies", result.stdout)
+        self.assertNotIn(b"--why", result.stdout)
+        self.assertNotIn(b"--plan", result.stdout)
 
     @patch.object(MODULE.shutil, "which", return_value="/usr/bin/flatpak")
     @patch.object(MODULE, "capture")
@@ -622,6 +633,47 @@ class UninstallTests(unittest.TestCase):
             rendered.count("wine --recommends--> dosbox-staging"), 1)
         self.assertNotIn("Other optional relationships", rendered)
 
+    @patch.object(MODULE, "dependency_report")
+    def test_compact_reason_combines_current_cause_and_install_history(
+            self, dependency_report):
+        item = MODULE.Match(
+            "DNF", "dosbox-staging", "dosbox-staging",
+            role="weak dependency",
+        )
+        dependency_report.return_value = MODULE.DependencyReport(
+            item, [], [], True,
+            weak_relations=[("wine", "recommends")],
+            relationship_paths=[
+                (["wine", "dosbox-staging"], ["recommends"]),
+            ],
+            history_reason=(
+                "DNF transaction 193: dnf install wine "
+                "(recorded reason: Weak Dependency)"
+            ),
+        )
+        self.assertEqual(
+            MODULE.install_reason(item),
+            "wine recommends it; DNF transaction 193: dnf install wine "
+            "(recorded reason: Weak Dependency)",
+        )
+
+    def test_compact_impact_reports_extra_removals_without_verbose_plan(self):
+        item = MODULE.Match("DNF", "dosbox-staging", "dosbox-staging")
+        plan = MODULE.RemovalPlan(
+            [item], [], ["dosbox-staging", "helper"],
+            ["helper"], ["helper"], "CAUTION", True, [], [],
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            MODULE.show_compact_impact(plan)
+        rendered = output.getvalue()
+        self.assertIn(
+            "Also expected to remove 1 now-unused dependency: helper",
+            rendered,
+        )
+        self.assertNotIn("Removal preview", rendered)
+        self.assertNotIn("Risk:", rendered)
+
     @patch.object(MODULE, "capture")
     @patch.object(MODULE.shutil, "which", return_value="/usr/bin/dnf5")
     def test_dnf_history_reports_original_install_command(
@@ -760,25 +812,15 @@ class UninstallTests(unittest.TestCase):
             self.assertEqual(MODULE.run_uninstall("tool"), 0)
         run.assert_not_called()
 
-    @patch.object(MODULE.subprocess, "run")
-    @patch.object(MODULE, "build_removal_plan")
-    @patch.object(MODULE, "filter_dependency_matches")
-    @patch.object(MODULE, "annotate_roles")
-    @patch.object(MODULE, "find_matches")
-    def test_plan_mode_never_executes_removal(
-            self, find_matches, annotate, filter_matches, build_plan, run):
-        item = MODULE.Match("Cargo", "tool", "tool", role="explicit")
-        find_matches.return_value = [item]
-        annotate.return_value = [item]
-        filter_matches.return_value = ([item], 0)
-        build_plan.return_value = MODULE.RemovalPlan(
-            [item], [MODULE.DependencyReport(item, [], [])],
-            ["tool"], [], [], "LOW", True, [], [])
-        with patch("builtins.input", side_effect=AssertionError(
-                "a unique read-only result must not prompt")):
-            self.assertEqual(
-                MODULE.run_uninstall("tool", plan_only=True), 0)
-        run.assert_not_called()
+    def test_removed_read_only_flags_are_rejected(self):
+        for flag in ("--why", "--plan"):
+            with self.subTest(flag=flag):
+                result = subprocess.run(
+                    [str(SCRIPT), flag, "tool"],
+                    check=False, capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("unrecognized arguments", result.stderr)
 
     @patch.object(MODULE.shutil, "which")
     @patch.object(MODULE, "capture")
@@ -1140,7 +1182,7 @@ class UninstallTests(unittest.TestCase):
         with patch("builtins.input", side_effect=["2", ""]):
             self.assertEqual(MODULE.choose(matches), [])
 
-    def test_read_only_mode_auto_selects_one_result(self):
+    def test_single_result_is_auto_selected(self):
         item = MODULE.Match("DNF", "dosbox-staging", "dosbox-staging")
         with patch("builtins.input", side_effect=AssertionError(
                 "read-only unique result must not prompt")):
@@ -1155,36 +1197,21 @@ class UninstallTests(unittest.TestCase):
         self.assertEqual(MODULE.main(), 0)
         self_uninstall.assert_called_once_with()
 
-    @patch.object(MODULE, "self_uninstall", return_value=0)
-    @patch.object(MODULE, "run_uninstall", return_value=0)
-    @patch.object(
-        MODULE.sys, "argv", ["uninstall", "uninstall", "--why"])
-    def test_uninstall_why_does_not_trigger_self_removal(
-            self, run_uninstall, self_uninstall):
-        self.assertEqual(MODULE.main(), 0)
-        self_uninstall.assert_not_called()
-        run_uninstall.assert_called_once_with(
-            "uninstall", show_dependencies=False,
-            plan_only=False, why_only=True,
-        )
-
     @patch.object(MODULE, "run_uninstall", return_value=0)
     @patch.object(MODULE.sys, "argv", ["uninstall", "uninstall-helper"])
     def test_longer_name_remains_a_normal_search(self, run_uninstall):
         self.assertEqual(MODULE.main(), 0)
         run_uninstall.assert_called_once_with(
             "uninstall-helper", show_dependencies=False,
-            plan_only=False, why_only=False,
         )
 
     @patch.object(MODULE, "run_uninstall", return_value=0)
-    @patch.object(MODULE.sys, "argv", ["uninstall", "--why"])
+    @patch.object(MODULE.sys, "argv", ["uninstall"])
     def test_no_argument_prompts_for_an_app(self, run_uninstall):
         with patch("builtins.input", return_value="DOSbox"):
             self.assertEqual(MODULE.main(), 0)
         run_uninstall.assert_called_once_with(
             "DOSbox", show_dependencies=False,
-            plan_only=False, why_only=True,
         )
 
     @patch.object(MODULE.os, "geteuid", return_value=0)
