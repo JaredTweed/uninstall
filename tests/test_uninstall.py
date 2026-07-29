@@ -34,6 +34,8 @@ class UninstallTests(unittest.TestCase):
         MODULE.explicit_names_for_kind.cache_clear()
         MODULE.apt_held_packages.cache_clear()
         MODULE.dnf_protected_patterns.cache_clear()
+        MODULE.path_disk_size.cache_clear()
+        MODULE.package_installed_size.cache_clear()
 
     def test_installer_creates_a_completely_new_custom_prefix(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -98,6 +100,56 @@ class UninstallTests(unittest.TestCase):
         self.assertTrue(MODULE.relevant("éditeur", "Éditeur"))
         self.assertFalse(MODULE.relevant("rg", "org.mozilla.firefox"))
         self.assertTrue(MODULE.relevant("rg", "rg"))
+
+    def test_sizes_use_compact_binary_units(self):
+        self.assertEqual(MODULE.format_size(0), "0 B")
+        self.assertEqual(MODULE.format_size(28 * 1024), "28 KiB")
+        self.assertEqual(
+            MODULE.format_size(1533637632),
+            "1.4 GiB",
+        )
+
+    @patch.object(MODULE, "capture", return_value="1533637632\n")
+    def test_flatpak_installed_size_is_machine_readable(self, capture):
+        self.assertEqual(
+            MODULE.package_installed_size(
+                "Flatpak", "org.freecad.FreeCAD", "system"),
+            1533637632,
+        )
+        capture.assert_called_once_with([
+            "flatpak", "info", "--system", "--show-size",
+            "org.freecad.FreeCAD",
+        ])
+
+    @patch.object(MODULE, "capture", return_value="1000\n2000\n")
+    def test_rpm_size_sums_multiple_installed_architectures(self, capture):
+        self.assertEqual(
+            MODULE.package_installed_size(
+                "DNF", "example", "system"),
+            3000,
+        )
+        capture.assert_called_once_with([
+            "rpm", "-q", "--qf", "%{SIZE}\\n", "--", "example",
+        ])
+
+    @patch.object(MODULE, "capture", return_value="2048")
+    def test_apt_installed_size_converts_kibibytes(self, _capture):
+        self.assertEqual(
+            MODULE.package_installed_size(
+                "APT", "example", "system"),
+            2 * 1024 * 1024,
+        )
+
+    @patch.object(
+        MODULE, "capture",
+        return_value="Name : example\nInstalled Size : 2.3 MiB\n",
+    )
+    def test_pacman_installed_size_is_parsed(self, _capture):
+        self.assertEqual(
+            MODULE.package_installed_size(
+                "Pacman", "example", "system"),
+            int(2.3 * 1024 * 1024),
+        )
 
     def test_command_lookup_tolerates_unambiguous_case_mistakes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1142,7 +1194,16 @@ class UninstallTests(unittest.TestCase):
             Path("/home/test/.config/FreeCAD"),
         ]
         output = io.StringIO()
-        with redirect_stdout(output), \
+        with patch.object(
+                MODULE, "manager_cleanup_size",
+                return_value=512 * 1024 * 1024), \
+                patch.object(
+                    MODULE, "path_disk_size",
+                    side_effect=[
+                        184 * 1024 * 1024,
+                        int(2.3 * 1024 * 1024),
+                    ]), \
+                redirect_stdout(output), \
                 patch("builtins.input", return_value="1,3"):
             cleanup_kinds, selected_paths = MODULE.ask_cleanup(selected, paths)
         self.assertEqual(cleanup_kinds, {"Flatpak"})
@@ -1151,6 +1212,9 @@ class UninstallTests(unittest.TestCase):
         self.assertIn("Remove associated data too? (optional)", rendered)
         self.assertIn("[Flatpak] Sandbox data and permissions", rendered)
         self.assertIn("[Detected] /home/test/.cache/FreeCAD", rendered)
+        self.assertIn("512 MiB", rendered)
+        self.assertIn("184 MiB", rendered)
+        self.assertIn("2.3 MiB", rendered)
         self.assertIn("Flatpak data is manager-owned.", rendered)
         self.assertIn("not guaranteed to belong to this app", rendered)
 
@@ -1163,6 +1227,38 @@ class UninstallTests(unittest.TestCase):
                 MODULE.cleanup_display_command(path),
                 ["rm", "-r", "--", str(path)],
             )
+
+    @patch.object(MODULE, "path_disk_size", return_value=128 * 1024 * 1024)
+    @patch.object(
+        MODULE, "package_installed_size",
+        return_value=256 * 1024 * 1024,
+    )
+    def test_space_estimate_includes_app_dependencies_and_selected_data(
+            self, _package_size, _path_size):
+        item = MODULE.Match(
+            "DNF", "app", "app", size_bytes=1024 * 1024 * 1024)
+        plan = MODULE.RemovalPlan(
+            [item], [], ["app", "helper"], ["helper"], ["helper"],
+            "CAUTION", True, [], [],
+        )
+        total, complete = MODULE.removal_space_estimate(
+            plan, set(), [Path("/home/test/.config/app")])
+        self.assertTrue(complete)
+        self.assertEqual(total, 1408 * 1024 * 1024)
+        self.assertEqual(
+            MODULE.ready_heading(total, complete),
+            "Ready to run (freeing about 1.4 GiB):",
+        )
+
+    def test_unknown_sizes_are_disclosed_in_ready_heading(self):
+        self.assertEqual(
+            MODULE.ready_heading(1024 * 1024, False),
+            "Ready to run (freeing at least 1 MiB; some sizes unknown):",
+        )
+        self.assertEqual(
+            MODULE.ready_heading(0, False),
+            "Ready to run (space estimate unavailable):",
+        )
 
     def test_manager_cleanup_choices_are_independent(self):
         selected = [

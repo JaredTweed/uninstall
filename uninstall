@@ -20,7 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable
 
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 
 
 @dataclass(frozen=True)
@@ -36,6 +36,7 @@ class Match:
     archive: Path | None = None
     archive_version: str = ""
     reason: str = ""
+    size_bytes: int | None = None
 
 
 @dataclass
@@ -79,6 +80,144 @@ def display(value: object) -> str:
         char if char.isprintable() and char not in "\x1b\x7f" else "?"
         for char in text
     )
+
+
+def format_size(size_bytes: int) -> str:
+    value = float(max(size_bytes, 0))
+    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+    unit = units[0]
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            break
+        value /= 1024
+    if unit == "B":
+        return f"{int(value)} B"
+    if value >= 10:
+        return f"{value:.0f} {unit}"
+    rendered = f"{value:.1f}".rstrip("0").rstrip(".")
+    return f"{rendered} {unit}"
+
+
+def parse_size(value: str) -> int | None:
+    match = re.search(
+        r"(?i)(\d+(?:[.,]\d+)?)\s*"
+        r"(bytes?|[kmgtpe]?i?b)\b",
+        value.replace("\N{NO-BREAK SPACE}", " "),
+    )
+    if not match:
+        stripped = value.strip()
+        return int(stripped) if stripped.isdigit() else None
+    number = float(match.group(1).replace(",", "."))
+    unit = match.group(2).casefold()
+    powers = {
+        "b": 0, "byte": 0, "bytes": 0,
+        "kb": 1, "kib": 1,
+        "mb": 2, "mib": 2,
+        "gb": 3, "gib": 3,
+        "tb": 4, "tib": 4,
+        "pb": 5, "pib": 5,
+        "eb": 6, "eib": 6,
+    }
+    power = powers.get(unit)
+    return None if power is None else int(number * (1024 ** power))
+
+
+@lru_cache(maxsize=256)
+def path_disk_size(path_text: str) -> int | None:
+    path = Path(path_text)
+    if not path.exists() and not path.is_symlink():
+        return 0
+    code, output = capture_any(
+        ["du", "-sk", "--", str(path)], timeout=15)
+    if code != 0:
+        return None
+    first_line = output.splitlines()[0] if output.splitlines() else ""
+    fields = first_line.split(maxsplit=1)
+    return int(fields[0]) * 1024 if fields and fields[0].isdigit() else None
+
+
+def file_disk_size(path: Path) -> int | None:
+    try:
+        details = path.lstat() if path.is_symlink() else path.stat()
+    except OSError:
+        return None
+    blocks = getattr(details, "st_blocks", 0)
+    return blocks * 512 if blocks else details.st_size
+
+
+@lru_cache(maxsize=256)
+def package_installed_size(
+        kind: str, ident: str, scope: str, path_text: str = "",
+) -> int | None:
+    if kind == "Flatpak":
+        output = capture([
+            "flatpak", "info", f"--{scope}", "--show-size", ident,
+        ]).strip()
+        return int(output) if output.isdigit() else parse_size(output)
+    if kind == "APT":
+        output = capture([
+            "dpkg-query", "-W", "-f=${Installed-Size}", ident,
+        ]).strip()
+        return int(output) * 1024 if output.isdigit() else None
+    if kind in {"DNF", "YUM", "Zypper", "RPM", "RPM-OSTree"}:
+        output = capture([
+            "rpm", "-q", "--qf", "%{SIZE}\\n", "--", ident,
+        ]).strip()
+        sizes = [
+            int(line) for line in output.splitlines()
+            if line.strip().isdigit()
+        ]
+        return sum(sizes) if sizes else None
+    if kind == "Pacman":
+        output = capture(["pacman", "-Qi", ident])
+        for line in output.splitlines():
+            if line.casefold().startswith("installed size") and ":" in line:
+                return parse_size(line.split(":", 1)[1])
+        return None
+    if kind == "Snap":
+        total = 0
+        found = False
+        try:
+            images = list(Path("/var/lib/snapd/snaps").glob(f"{ident}_*.snap"))
+        except OSError:
+            images = []
+        for image in images:
+            size = file_disk_size(image)
+            if size is not None:
+                total += size
+                found = True
+        return total if found else None
+    if kind in {"AppImage", "Gear Lever", "Standalone"} and path_text:
+        return file_disk_size(Path(path_text))
+    if kind == "NPM":
+        root = capture(["npm", "root", "--global"]).strip()
+        return path_disk_size(str(Path(root) / ident)) if root else None
+    if kind == "Pipx":
+        candidates = (
+            Path.home() / ".local/share/pipx/venvs" / ident,
+            Path("/opt/pipx/venvs") / ident,
+        )
+        for candidate in candidates:
+            if candidate.exists():
+                return path_disk_size(str(candidate))
+        return None
+    if kind == "Homebrew":
+        prefix = capture(["brew", "--prefix", ident]).strip()
+        return path_disk_size(prefix) if prefix else None
+    return None
+
+
+def add_installed_sizes(matches: list[Match]) -> list[Match]:
+    return [
+        replace(
+            item,
+            size_bytes=package_installed_size(
+                item.kind, item.ident, item.scope,
+                str(item.path or item.provides or ""),
+            ),
+        )
+        for item in matches
+    ]
 
 
 def configure_output() -> None:
@@ -2111,7 +2250,16 @@ def choose(matches: list[Match], auto_select: bool = False) -> list[Match]:
             else item.role
         )
         details = " | ".join(
-            display(value) for value in (item.version, item.scope, role) if value)
+            display(value)
+            for value in (
+                item.version,
+                item.scope,
+                role,
+                format_size(item.size_bytes)
+                if item.size_bytes is not None else "",
+            )
+            if value
+        )
         print(f"  {index:>2}. {display(item.name)}  [{display(item.kind)}]"
               f"{'  ' + details if details else ''}")
         if item.ident != item.name:
@@ -2369,6 +2517,34 @@ def build_uninstall_batches(
     return batches
 
 
+def manager_cleanup_paths(
+        kind: str, selected: list[Match],
+) -> list[Path] | None:
+    targets = [item for item in selected if item.kind == kind]
+    if kind == "Flatpak":
+        return [
+            Path.home() / ".var/app" / item.ident
+            for item in targets
+        ]
+    if kind == "Snap":
+        paths: list[Path] = []
+        for item in targets:
+            paths.extend((
+                Path.home() / "snap" / item.ident,
+                Path("/var/snap") / item.ident,
+            ))
+        return paths
+    return None
+
+
+def manager_cleanup_size(kind: str, selected: list[Match]) -> int | None:
+    paths = manager_cleanup_paths(kind, selected)
+    if paths is None:
+        return None
+    sizes = [path_disk_size(str(path)) for path in paths]
+    return None if any(size is None for size in sizes) else sum(sizes)
+
+
 def ask_cleanup(
         selected: list[Match], paths: list[Path],
 ) -> tuple[set[str], list[Path]]:
@@ -2391,13 +2567,20 @@ def ask_cleanup(
         return set(), []
 
     print("\nRemove associated data too? (optional)\n")
-    entries: list[tuple[str, Path | None]] = []
+    entries: list[tuple[str, Path | None, int | None]] = []
+    labels: list[str] = []
     for kind, description in managed:
-        entries.append((kind, None))
-        print(f"  {len(entries):>2}. [{kind}] {description}")
+        entries.append((kind, None, manager_cleanup_size(kind, selected)))
+        labels.append(f"[{kind}] {description}")
     for path in paths:
-        entries.append(("", path))
-        print(f"  {len(entries):>2}. [Detected] {display(path)}")
+        entries.append(("", path, path_disk_size(str(path))))
+        labels.append(f"[Detected] {display(path)}")
+    label_width = max(len(label) for label in labels)
+    for index, (label, (_kind, _path, size)) in enumerate(
+            zip(labels, entries), 1):
+        size_text = (
+            format_size(size) if size is not None else "size unknown")
+        print(f"  {index:>2}. {label:<{label_width}}  {size_text}")
 
     if managed:
         manager_note = (
@@ -2450,7 +2633,7 @@ def ask_cleanup(
         }
         selected_paths = [
             path
-            for index, (_kind, path) in enumerate(entries, 1)
+            for index, (_kind, path, _size) in enumerate(entries, 1)
             if index in indexes and path is not None
         ]
         return cleanup_kinds, selected_paths
@@ -2460,6 +2643,76 @@ def cleanup_display_command(path: Path) -> list[str]:
     if path.is_dir() and not path.is_symlink():
         return ["rm", "-r", "--", str(path)]
     return ["rm", "--", str(path)]
+
+
+def distinct_paths(paths: Iterable[Path]) -> list[Path]:
+    distinct: list[Path] = []
+    for path in sorted(
+            {item.absolute() for item in paths},
+            key=lambda item: (len(item.parts), str(item))):
+        if any(path == parent or path_is_within(path, parent)
+               for parent in distinct):
+            continue
+        distinct.append(path)
+    return distinct
+
+
+def removal_space_estimate(
+        plan: RemovalPlan, cleanup_kinds: set[str],
+        cleanup_paths: list[Path],
+) -> tuple[int, bool]:
+    total = 0
+    complete = plan.level != "UNKNOWN"
+    for item in plan.selected:
+        if item.size_bytes is None:
+            complete = False
+        else:
+            total += item.size_bytes
+
+    selected_kinds = {item.kind for item in plan.selected}
+    selected_scopes = {item.scope for item in plan.selected}
+    if plan.additional_removals:
+        if len(selected_kinds) == 1:
+            kind = next(iter(selected_kinds))
+            scope = (
+                next(iter(selected_scopes))
+                if len(selected_scopes) == 1 else "system"
+            )
+            for ident in plan.additional_removals:
+                size = package_installed_size(kind, ident, scope)
+                if size is None:
+                    complete = False
+                else:
+                    total += size
+        else:
+            complete = False
+
+    measured_paths = list(cleanup_paths)
+    for kind in cleanup_kinds:
+        paths = manager_cleanup_paths(kind, plan.selected)
+        if paths is None:
+            complete = False
+        else:
+            measured_paths.extend(paths)
+    for path in distinct_paths(measured_paths):
+        size = path_disk_size(str(path))
+        if size is None:
+            complete = False
+        else:
+            total += size
+    return total, complete
+
+
+def ready_heading(size_bytes: int, complete: bool) -> str:
+    if complete:
+        return f"Ready to run (freeing about {format_size(size_bytes)}):"
+    if size_bytes:
+        return (
+            "Ready to run "
+            f"(freeing at least {format_size(size_bytes)}; "
+            "some sizes unknown):"
+        )
+    return "Ready to run (space estimate unavailable):"
 
 
 def yes(prompt: str) -> bool:
@@ -2560,7 +2813,7 @@ def run_uninstall(
         else:
             print("No likely installed apps found.")
         return 1
-    matches = add_install_reasons(matches)
+    matches = add_installed_sizes(add_install_reasons(matches))
     try:
         selected = choose(
             matches, auto_select=len(matches) == 1)
@@ -2589,7 +2842,9 @@ def run_uninstall(
     except RuntimeError as error:
         print(display(error) + ".", file=sys.stderr)
         return 1
-    print("\nReady to run:")
+    size_bytes, size_complete = removal_space_estimate(
+        plan, cleanup_kinds, paths_to_remove)
+    print("\n" + ready_heading(size_bytes, size_complete))
     for _items, command in batches:
         print("  " + display(shlex.join(command)))
     for path in paths_to_remove:

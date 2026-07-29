@@ -1,12 +1,12 @@
 #!/bin/sh
 set -eu
 
-RELEASE_VERSION=0.11.0
+RELEASE_VERSION=0.12.0
 SOURCE_URL=${UNINSTALL_SOURCE_URL:-https://raw.githubusercontent.com/JaredTweed/uninstall/v${RELEASE_VERSION}/uninstall}
 PREFIX=${PREFIX:-/usr/local}
 DESTINATION="$PREFIX/bin/uninstall"
 
-for required_command in chmod curl dirname install mkdir mktemp python3 rm sed; do
+for required_command in chmod curl dirname du install mkdir mktemp python3 rm sed; do
     if ! command -v "$required_command" >/dev/null 2>&1; then
         printf '%s\n' "$required_command is required but was not found." >&2
         exit 1

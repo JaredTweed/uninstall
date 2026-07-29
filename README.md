@@ -8,7 +8,7 @@ $ uninstall DOSbox
 
 Found 1 likely installed option:
 
-   1. dosbox-staging  [DNF]  0.82.2-5.fc44 | system | weak dependency
+   1. dosbox-staging  [DNF]  0.82.2-5.fc44 | system | weak dependency | 16 MiB
       provides command: /usr/bin/dosbox
       Why installed: wine recommends it; DNF transaction 193: dnf install wine (recorded reason: Weak Dependency)
 
@@ -16,7 +16,7 @@ Automatically selected the only result.
 
 Also expected to remove 8 now-unused dependencies: SDL2_net, fluid-soundfont-common, fluid-soundfont-gm, fluidsynth-libs, iir1, mt32emu, opusfile, speexdsp
 
-Ready to run:
+Ready to run (freeing about 159 MiB):
   sudo dnf5 remove dosbox-staging
 
 Continue? [y/N]
@@ -139,6 +139,11 @@ dependents, newly unused dependencies, protected or critical packages, or an
 unavailable preview. High- and unknown-impact operations require typing the
 exact confirmation phrase instead of answering `y`.
 
+When reliable metadata is available, the result line also shows the installed
+application size. The final estimate includes selected application files,
+additional packages in the native removal preview, package-manager cleanup,
+and selected detected paths.
+
 Running `uninstall` without an app prompts for one. The normal command always
 explains the installation and checks removal impact.
 
@@ -163,9 +168,9 @@ prompt:
 ```text
 Remove associated data too? (optional)
 
-   1. [Flatpak] Sandbox data and permissions
-   2. [Detected] /home/jared/.cache/FreeCAD
-   3. [Detected] /home/jared/.config/FreeCAD
+   1. [Flatpak] Sandbox data and permissions       2.6 MiB
+   2. [Detected] /home/jared/.cache/FreeCAD        0 B
+   3. [Detected] /home/jared/.config/FreeCAD       28 KiB
 
 Flatpak data is manager-owned. Detected paths are name matches, are not
 guaranteed to belong to this app, and will be deleted permanently.
@@ -189,6 +194,12 @@ exact name or executable-path matches, not asserted ownership. They are
 labelled `[Detected]` and selected individually. Every selected cleanup action
 is shown under `Ready to run`, and detected paths are kept if any uninstall
 command fails.
+
+Sizes use binary units and represent the best available estimate of disk space
+affected. Shared package objects, hard links, retained package caches, and
+unreadable locations can make the final reclaimed space differ. The prompt
+says `about`, `at least`, or `space estimate unavailable` as appropriate; an
+unknown component is never silently treated as zero.
 
 Do not run the whole program with `sudo`; `uninstall` invokes `sudo` or `doas`
 itself only for selected system-wide operations. Shell built-ins and shell
