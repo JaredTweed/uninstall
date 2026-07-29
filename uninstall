@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 
 
 @dataclass(frozen=True)
@@ -25,6 +25,7 @@ class Match:
     version: str = ""
     scope: str = ""
     path: Path | None = None
+    provides: str = ""
 
 
 def norm(value: str) -> str:
@@ -45,6 +46,16 @@ def capture(command: list[str]) -> str:
         return result.stdout if result.returncode == 0 else ""
     except (OSError, subprocess.TimeoutExpired):
         return ""
+
+
+def rpm_manager() -> str:
+    if shutil.which("dnf5") or shutil.which("dnf"):
+        return "DNF"
+    if shutil.which("yum"):
+        return "YUM"
+    if shutil.which("zypper"):
+        return "Zypper"
+    return ""
 
 
 def detect_flatpak(query: str) -> list[Match]:
@@ -88,13 +99,8 @@ def detect_dpkg(query: str) -> list[Match]:
 def detect_rpm(query: str) -> list[Match]:
     if not shutil.which("rpm"):
         return []
-    if shutil.which("dnf5") or shutil.which("dnf"):
-        kind = "DNF"
-    elif shutil.which("yum"):
-        kind = "YUM"
-    elif shutil.which("zypper"):
-        kind = "Zypper"
-    else:
+    kind = rpm_manager()
+    if not kind:
         return []
     fmt = "%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{SUMMARY}\\n"
     found: list[Match] = []
@@ -114,6 +120,50 @@ def detect_pacman(query: str) -> list[Match]:
         if fields and relevant(query, fields[0]):
             found.append(Match("Pacman", fields[0], fields[0],
                                fields[1] if len(fields) > 1 else "", "system"))
+    return found
+
+
+def detect_executable_owner(query: str) -> list[Match]:
+    """Find a differently named package that owns a command on PATH."""
+    if not query or Path(query).name != query:
+        return []
+    executable = shutil.which(query)
+    if not executable:
+        return []
+    path = str(Path(executable).resolve())
+    found: list[Match] = []
+
+    kind = rpm_manager()
+    if kind and shutil.which("rpm"):
+        fmt = "%{NAME}\\t%{VERSION}-%{RELEASE}\\n"
+        for line in capture(["rpm", "-qf", "--qf", fmt, path]).splitlines():
+            fields = line.split("\t", 1)
+            if fields and fields[0]:
+                found.append(Match(kind, fields[0], fields[0],
+                                   fields[1] if len(fields) > 1 else "",
+                                   "system", provides=path))
+
+    if shutil.which("dpkg-query"):
+        owners = capture(["dpkg-query", "-S", path])
+        fmt = "${binary:Package}\\t${Version}\\n"
+        for owner_line in owners.splitlines():
+            owner = owner_line.split(":", 1)[0].strip()
+            if not owner:
+                continue
+            details = capture(["dpkg-query", "-W", "-f=" + fmt, owner]).strip()
+            fields = details.split("\t", 1)
+            if fields and fields[0]:
+                found.append(Match("APT", fields[0], fields[0],
+                                   fields[1] if len(fields) > 1 else "",
+                                   "system", provides=path))
+
+    if shutil.which("pacman"):
+        for owner in capture(["pacman", "-Qoq", path]).splitlines():
+            fields = capture(["pacman", "-Q", owner.strip()]).strip().rsplit(maxsplit=1)
+            if fields:
+                found.append(Match("Pacman", fields[0], fields[0],
+                                   fields[1] if len(fields) > 1 else "",
+                                   "system", provides=path))
     return found
 
 
@@ -148,7 +198,7 @@ def detect_appimages(query: str) -> list[Match]:
 
 DETECTORS: tuple[Callable[[str], list[Match]], ...] = (
     detect_flatpak, detect_snap, detect_dpkg, detect_rpm, detect_pacman,
-    detect_appimages,
+    detect_appimages, detect_executable_owner,
 )
 
 
@@ -174,6 +224,8 @@ def choose(matches: list[Match]) -> list[Match]:
         print(f"  {index:>2}. {item.name}  [{item.kind}]{'  ' + details if details else ''}")
         if item.ident != item.name:
             print(f"      {item.ident}")
+        if item.provides:
+            print(f"      provides command: {item.provides}")
     print("\nChoose numbers separated by commas, “a” for all, or Enter to cancel.")
     raw = input("> ").strip().casefold()
     if not raw:

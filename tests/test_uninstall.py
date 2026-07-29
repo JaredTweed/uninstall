@@ -43,6 +43,31 @@ class UninstallTests(unittest.TestCase):
         result = MODULE.detect_dpkg("cax")
         self.assertEqual([item.ident for item in result], ["freecad"])
 
+    @patch.object(MODULE.shutil, "which")
+    @patch.object(MODULE, "capture")
+    def test_rpm_finds_package_owning_differently_named_command(
+            self, capture, which):
+        locations = {
+            "aafire": "/usr/bin/aafire",
+            "rpm": "/usr/bin/rpm",
+            "dnf5": "/usr/bin/dnf5",
+        }
+        which.side_effect = locations.get
+        capture.return_value = "aalib\t1.4.0-0.58.rc5.fc44\n"
+        result = MODULE.detect_executable_owner("aafire")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].kind, "DNF")
+        self.assertEqual(result[0].ident, "aalib")
+        self.assertEqual(result[0].provides, "/usr/bin/aafire")
+        capture.assert_called_once_with([
+            "rpm", "-qf", "--qf", "%{NAME}\\t%{VERSION}-%{RELEASE}\\n",
+            "/usr/bin/aafire",
+        ])
+
+    @patch.object(MODULE.shutil, "which", return_value=None)
+    def test_missing_command_has_no_owner(self, _which):
+        self.assertEqual(MODULE.detect_executable_owner("not-a-command"), [])
+
     def test_commands_are_exact_and_do_not_use_a_shell(self):
         item = MODULE.Match("Flatpak", "org.freecad.FreeCAD", "FreeCAD",
                             "1.0", "user")

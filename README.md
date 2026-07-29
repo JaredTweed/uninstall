@@ -1,7 +1,7 @@
 # uninstall
 
 `uninstall` answers a surprisingly awkward Linux question: “How did I install
-this app, and how do I remove it?”
+this app or command, and how do I remove it?”
 
 ```console
 $ uninstall FreeCAD
@@ -20,7 +20,8 @@ Choose numbers separated by commas, “a” for all, or Enter to cancel.
 It searches Flatpak, Snap, APT/dpkg, DNF/YUM/RPM, Zypper/RPM, Pacman, and
 common AppImage locations. You choose the exact result, decide separately
 whether its data should go too, see the command that will run, and confirm once
-more.
+more. If a command has a different package name—such as `aafire` from
+`aalib`—it asks the system package database which package owns the executable.
 
 ## Install
 
