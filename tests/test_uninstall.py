@@ -31,6 +31,29 @@ class UninstallTests(unittest.TestCase):
         MODULE.apt_inventory_by_name.cache_clear()
         MODULE.pacman_inventory.cache_clear()
         MODULE.pacman_inventory_by_name.cache_clear()
+        MODULE.apk_inventory.cache_clear()
+        MODULE.apk_inventory_by_name.cache_clear()
+        MODULE.apk_world.cache_clear()
+        MODULE.apk_provider_map.cache_clear()
+        MODULE.apk_explicit_causes.cache_clear()
+        MODULE.apk_reverse_graph.cache_clear()
+        MODULE.opkg_inventory.cache_clear()
+        MODULE.opkg_inventory_by_name.cache_clear()
+        MODULE.opkg_provider_map.cache_clear()
+        MODULE.opkg_reverse_graph.cache_clear()
+        MODULE.xbps_inventory.cache_clear()
+        MODULE.xbps_inventory_by_name.cache_clear()
+        MODULE.xbps_manual_packages.cache_clear()
+        MODULE.xbps_reverse_dependencies.cache_clear()
+        MODULE.portage_inventory.cache_clear()
+        MODULE.portage_inventory_by_name.cache_clear()
+        MODULE.portage_world.cache_clear()
+        MODULE.slackware_inventory.cache_clear()
+        MODULE.slackware_inventory_by_name.cache_clear()
+        MODULE.eopkg_inventory.cache_clear()
+        MODULE.eopkg_automatic_packages.cache_clear()
+        MODULE.swupd_inventory.cache_clear()
+        MODULE.swupd_reverse_dependencies.cache_clear()
         MODULE.flatpak_inventory.cache_clear()
         MODULE.snap_inventory.cache_clear()
         MODULE.pipx_inventory.cache_clear()
@@ -39,6 +62,8 @@ class UninstallTests(unittest.TestCase):
         MODULE.npm_inventory.cache_clear()
         MODULE.homebrew_installed_metadata.cache_clear()
         MODULE.cargo_install_records.cache_clear()
+        MODULE.nix_env_inventory.cache_clear()
+        MODULE.guix_inventory.cache_clear()
         MODULE.rpm_ostree_layered_packages.cache_clear()
         MODULE.zypper_userinstalled.cache_clear()
         MODULE.dnf_install_reasons.cache_clear()
@@ -75,6 +100,7 @@ class UninstallTests(unittest.TestCase):
         MODULE.dnf_protected_patterns.cache_clear()
         MODULE.path_disk_size.cache_clear()
         MODULE.package_installed_size.cache_clear()
+        MODULE.transactional_zypper_system.cache_clear()
         MODULE._DNF_HISTORY_DETAILS.clear()
         MODULE._DNF_INSTALL_RECORDS.clear()
 
@@ -268,6 +294,343 @@ class UninstallTests(unittest.TestCase):
         self.assertEqual(reverse["libfoo"], {"app"})
         self.assertEqual(size, 4096)
         capture.assert_called_once()
+
+    @patch.object(MODULE.shutil, "which", return_value="/sbin/apk")
+    def test_apk_inventory_world_roles_and_dependency_roots(self, _which):
+        records = MODULE.parse_apk_installed(
+            "P:nano\nV:8.0-r0\nT:Small editor\nI:4096\nD:musl\n"
+            "p:cmd:nano\no:nano\n\n"
+            "P:musl\nV:1.2.5-r1\nT:C library\nI:2048\n"
+            "p:so:libc.musl-x86_64.so.1\n"
+        )
+        with patch.object(MODULE, "apk_inventory", return_value=records), \
+                patch.object(MODULE, "apk_world", return_value=("nano",)):
+            [app] = MODULE.annotate_roles(MODULE.detect_apk("Small editor"))
+            [library] = MODULE.annotate_roles(MODULE.detect_apk("musl"))
+            report = MODULE.dependency_report(library)
+            reason = MODULE.install_reason(app)
+
+        self.assertEqual((app.role, app.size_bytes), ("explicit", 4096))
+        self.assertEqual(library.role, "dependency")
+        self.assertEqual(report.direct_dependents, ["nano"])
+        self.assertEqual(report.root_paths, [["nano", "musl"]])
+        self.assertEqual(
+            reason,
+            "listed explicitly in /etc/apk/world; "
+            "original APK command unavailable",
+        )
+
+    @patch.object(MODULE, "capture_any")
+    def test_apk_preview_includes_automatically_removed_dependencies(
+            self, capture_any):
+        capture_any.return_value = (
+            0,
+            "(1/2) Purging nano (8.0-r0)\n"
+            "(2/2) Purging oniguruma (6.9-r0)\n",
+        )
+        selected = [MODULE.Match("APK", "nano", "nano", scope="system")]
+        planned, orphans, available, _notes = (
+            MODULE.native_removal_preview(selected))
+        self.assertEqual(planned, ["nano", "oniguruma"])
+        self.assertEqual(orphans, ["oniguruma"])
+        self.assertTrue(available)
+        capture_any.assert_called_once_with([
+            "apk", "del", "--simulate", "nano",
+        ])
+
+    def test_apk_world_repository_tag_still_marks_provider_explicit(self):
+        records = (MODULE.PackageRecord("nano", provides=("editor",)),)
+        with patch.object(MODULE, "apk_inventory", return_value=records), \
+                patch.object(MODULE, "apk_world", return_value=("editor@edge>=8",)):
+            self.assertEqual(
+                MODULE.apk_explicit_causes(), {"nano": "editor@edge>=8"})
+
+    @patch.object(MODULE.shutil, "which", return_value="/bin/opkg")
+    def test_opkg_status_roles_sizes_and_dependency_roots(self, _which):
+        records = MODULE.parse_opkg_status(
+            "Package: nano\nVersion: 8.0-1\n"
+            "Status: install user installed\nInstalled-Size: 4096\n"
+            "Depends: libfoo\nDescription: Small editor\n\n"
+            "Package: libfoo\nVersion: 2.0-1\n"
+            "Status: install ok installed\nAuto-Installed: yes\n"
+            "Installed-Size: 2048\nDescription: Runtime library\n"
+        )
+        with patch.object(MODULE, "opkg_inventory", return_value=records):
+            [app] = MODULE.annotate_roles(MODULE.detect_opkg("Small editor"))
+            [library] = MODULE.annotate_roles(MODULE.detect_opkg("libfoo"))
+            report = MODULE.dependency_report(library)
+
+        self.assertEqual((app.role, app.size_bytes), ("explicit", 4096))
+        self.assertEqual(library.role, "dependency")
+        self.assertEqual(report.direct_dependents, ["nano"])
+        self.assertEqual(report.root_paths, [["nano", "libfoo"]])
+
+    @patch.object(MODULE, "capture_any", return_value=(
+        0, "Removing package nano from root...\n"))
+    def test_opkg_uses_a_no_action_removal_preview(self, capture_any):
+        selected = [MODULE.Match("OPKG", "nano", "nano", scope="system")]
+        planned, _orphans, available, _notes = (
+            MODULE.native_removal_preview(selected))
+        self.assertEqual(planned, ["nano"])
+        self.assertTrue(available)
+        capture_any.assert_called_once_with([
+            "opkg", "--noaction", "remove", "nano",
+        ])
+
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/xbps-query")
+    @patch.object(MODULE, "xbps_reverse_dependencies")
+    @patch.object(MODULE, "xbps_manual_packages")
+    @patch.object(MODULE, "xbps_inventory")
+    def test_xbps_manual_roles_and_reverse_dependency_roots(
+            self, inventory, manual, reverse, _which):
+        inventory.return_value = (
+            MODULE.PackageRecord("app", "1.0_1", "Application"),
+            MODULE.PackageRecord("libfoo", "2.0_1", "Library"),
+        )
+        manual.return_value = (True, {"app"})
+        reverse.side_effect = lambda target: (
+            (True, {"app"}) if target == "libfoo" else (True, set()))
+
+        [app] = MODULE.annotate_roles(MODULE.detect_xbps("Application"))
+        [library] = MODULE.annotate_roles(MODULE.detect_xbps("libfoo"))
+        report = MODULE.dependency_report(library)
+
+        self.assertEqual(app.role, "explicit")
+        self.assertEqual(library.role, "dependency")
+        self.assertEqual(report.direct_dependents, ["app"])
+        self.assertEqual(report.root_paths, [["app", "libfoo"]])
+
+    @patch.object(MODULE, "capture_any", return_value=(
+        0,
+        "nano-8.0_1 remove x86_64 repo 4096 0\n"
+        "oniguruma-6.9_1 remove x86_64 repo 2048 0\n",
+    ))
+    def test_xbps_recursive_dry_run_is_parsed(self, capture_any):
+        selected = [MODULE.Match("XBPS", "nano", "nano", scope="system")]
+        planned, orphans, available, _notes = (
+            MODULE.native_removal_preview(selected))
+        self.assertEqual(planned, ["nano", "oniguruma"])
+        self.assertEqual(orphans, ["oniguruma"])
+        self.assertTrue(available)
+        capture_any.assert_called_once_with([
+            "xbps-remove", "--dry-run", "--recursive", "nano",
+        ])
+
+    def test_portage_vdb_world_and_exact_depclean_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "app-editors" / "nano-8.0"
+            package.mkdir(parents=True)
+            (package / "PN").write_text("nano\n", encoding="utf-8")
+            (package / "PVR").write_text("8.0\n", encoding="utf-8")
+            (package / "DESCRIPTION").write_text(
+                "Small editor\n", encoding="utf-8")
+            (package / "SIZE").write_text("4096\n", encoding="utf-8")
+            (package / "repository").write_text(
+                "gentoo\n", encoding="utf-8")
+            (package / "CONTENTS").write_text(
+                "obj /usr/bin/nano hash 1\n", encoding="utf-8")
+            records = MODULE.parse_portage_vdb(Path(directory))
+
+        self.assertEqual(
+            (records[0].ident, records[0].version, records[0].size_bytes),
+            ("app-editors/nano", "8.0", 4096),
+        )
+        with patch.object(MODULE, "portage_inventory", return_value=records), \
+                patch.object(
+                    MODULE, "portage_world",
+                    return_value={"app-editors/nano"}), \
+                patch.object(MODULE.shutil, "which", return_value="/usr/bin/emerge"):
+            [item] = MODULE.annotate_roles(MODULE.detect_portage("nano"))
+        self.assertEqual(item.role, "explicit")
+        self.assertIn("Portage @world", MODULE.install_reason(item))
+        with patch.object(MODULE.os, "geteuid", return_value=0):
+            self.assertEqual(
+                MODULE.uninstall_command(item, False),
+                [
+                    "emerge", "--ask=n", "--verbose", "--depclean",
+                    "=app-editors/nano-8.0",
+                ],
+            )
+
+    def test_slackware_log_preserves_name_size_description_and_files(self):
+        record = MODULE.parse_slackware_package_log(
+            "PACKAGE NAME: nano-8.0-x86_64-1\n"
+            "UNCOMPRESSED PACKAGE SIZE: 4M\n"
+            "PACKAGE DESCRIPTION:\n"
+            "nano: Small editor\n"
+            "FILE LIST:\n"
+            "./\nusr/bin/nano\nusr/share/nano/\n",
+            "fallback",
+        )
+        self.assertEqual((record.ident, record.version), ("nano", "8.0"))
+        self.assertEqual(record.summary, "Small editor")
+        self.assertEqual(record.size_bytes, 4 * 1024 * 1024)
+        self.assertEqual(record.files, ("/usr/bin/nano",))
+
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/eopkg")
+    @patch.object(MODULE, "capture", return_value=(
+        "nano - Small editor\nlibfoo - Runtime library\n"))
+    def test_eopkg_installed_inventory_is_searchable(
+            self, capture, _which):
+        [item] = MODULE.detect_eopkg("Small editor")
+        self.assertEqual((item.kind, item.ident), ("Eopkg", "nano"))
+        capture.assert_called_once_with([
+            "eopkg", "--no-color", "list-installed",
+        ])
+
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/eopkg")
+    @patch.object(MODULE, "capture_any", return_value=(
+        0, "libfoo - nano\norphan - Orphaned package\n"))
+    def test_eopkg_uses_retained_automatic_parent_for_role_and_reason(
+            self, capture_any, _which):
+        item = MODULE.Match("Eopkg", "libfoo", "libfoo")
+        [annotated] = MODULE.annotate_roles([item])
+        self.assertEqual(annotated.role, "dependency")
+        self.assertEqual(
+            MODULE.install_reason(annotated),
+            "installed automatically for nano; original Eopkg command unavailable",
+        )
+        capture_any.assert_called_once_with([
+            "eopkg", "--no-color", "list-installed", "--automatic",
+        ], timeout=30)
+
+    def test_new_system_backends_use_native_non_force_removal_commands(self):
+        cases = (
+            (MODULE.Match("APK", "nano", "nano", scope="system"),
+             ["apk", "del", "nano"]),
+            (MODULE.Match("OPKG", "nano", "nano", scope="system"),
+             ["opkg", "remove", "nano"]),
+            (MODULE.Match("XBPS", "nano", "nano", scope="system"),
+             ["xbps-remove", "--recursive", "--yes", "nano"]),
+            (MODULE.Match(
+                "Portage", "app-editors/nano", "nano", "8.0", "system"),
+             ["emerge", "--ask=n", "--verbose", "--depclean",
+              "=app-editors/nano-8.0"]),
+            (MODULE.Match("Slackware", "nano", "nano", scope="system"),
+             ["removepkg", "nano"]),
+            (MODULE.Match("Eopkg", "nano", "nano", scope="system"),
+             ["eopkg", "remove", "--yes-all", "nano"]),
+        )
+        with patch.object(MODULE.os, "geteuid", return_value=0):
+            for item, expected in cases:
+                with self.subTest(kind=item.kind):
+                    self.assertEqual(
+                        MODULE.uninstall_command(item, False), expected)
+
+    def test_owner_output_matches_apk_xbps_and_eopkg_packages_exactly(self):
+        record = MODULE.PackageRecord("nano", "8.0-r0", size_bytes=4096)
+        visible = Path("/usr/bin/nano")
+        for kind, output in (
+                ("APK", "/usr/bin/nano is owned by nano-8.0-r0"),
+                ("XBPS", "nano-8.0-r0: /usr/bin/nano (regular file)"),
+                ("Eopkg", "nano package contains /usr/bin/nano")):
+            with self.subTest(kind=kind):
+                [item] = MODULE.package_owner_from_output(
+                    output, (record,), kind, visible)
+                self.assertEqual((item.ident, item.provides),
+                                 ("nano", "/usr/bin/nano"))
+
+    @patch.object(MODULE, "capture_any", return_value=(0, "safe preview"))
+    def test_portage_and_slackware_unparsed_previews_remain_unknown(
+            self, capture_any):
+        portage = MODULE.Match(
+            "Portage", "app-editors/nano", "nano", "8.0", "system")
+        slackware = MODULE.Match(
+            "Slackware", "nano", "nano", "8.0", "system")
+        for item in (portage, slackware):
+            with self.subTest(kind=item.kind):
+                planned, _orphans, available, notes = (
+                    MODULE.native_removal_preview([item]))
+                self.assertEqual(planned, [item.ident])
+                self.assertFalse(available)
+                self.assertTrue(notes)
+        self.assertEqual(
+            capture_any.call_args_list[0].args[0],
+            [
+                "emerge", "--pretend", "--verbose", "--depclean",
+                "=app-editors/nano-8.0",
+            ],
+        )
+        self.assertEqual(
+            capture_any.call_args_list[1].args[0],
+            ["removepkg", "-warn", "nano"],
+        )
+
+    @patch.object(MODULE, "capture_any", return_value=(0, "dry run"))
+    def test_eopkg_uses_dry_run_and_can_purge_changed_configuration(
+            self, capture_any):
+        item = MODULE.Match("Eopkg", "nano", "nano", scope="system")
+        planned, _orphans, available, notes = (
+            MODULE.native_removal_preview([item]))
+        self.assertEqual(planned, ["nano"])
+        self.assertFalse(available)
+        self.assertIn("completed a dry-run", notes[0])
+        capture_any.assert_called_once_with([
+            "eopkg", "--no-color", "remove", "--dry-run", "nano",
+        ])
+        with patch.object(MODULE.os, "geteuid", return_value=0):
+            self.assertEqual(
+                MODULE.uninstall_command(item, True),
+                ["eopkg", "remove", "--yes-all", "--purge", "nano"],
+            )
+
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/swupd")
+    @patch.object(MODULE, "capture_any", return_value=(
+        0,
+        "os-core: installed\n"
+        "desktop: explicitly installed\n"
+        "graphics: installed, experimental\n",
+    ))
+    def test_swupd_inventory_preserves_explicit_bundle_tracking(
+            self, capture_any, _which):
+        items = MODULE.detect_swupd("desktop")
+        [item] = MODULE.annotate_roles(items)
+        self.assertEqual((item.kind, item.ident, item.role),
+                         ("Swupd", "desktop", "explicit"))
+        capture_any.assert_called_once_with([
+            "swupd", "bundle-list", "--status", "--quiet",
+        ], timeout=30)
+
+    @patch.object(MODULE, "swupd_inventory", return_value=(
+        MODULE.PackageRecord("desktop", origin="explicit"),
+        MODULE.PackageRecord("graphics", origin="dependency"),
+    ))
+    @patch.object(MODULE, "swupd_reverse_dependencies")
+    def test_swupd_dependency_report_reaches_explicit_bundle_root(
+            self, reverse, _inventory):
+        reverse.side_effect = lambda target: (
+            (True, {"desktop"}) if target == "graphics" else (True, set()))
+        item = MODULE.Match(
+            "Swupd", "graphics", "graphics", role="dependency")
+        report = MODULE.swupd_dependency_report(item)
+        self.assertEqual(report.direct_dependents, ["desktop"])
+        self.assertEqual(report.root_paths, [["desktop", "graphics"]])
+        self.assertTrue(report.complete)
+
+    @patch.object(MODULE.os, "geteuid", return_value=0)
+    def test_swupd_uses_non_force_bundle_removal(self, _euid):
+        item = MODULE.Match("Swupd", "desktop", "desktop", scope="system")
+        self.assertEqual(
+            MODULE.uninstall_command(item, False),
+            ["swupd", "bundle-remove", "desktop"],
+        )
+        planned, _orphans, available, notes = (
+            MODULE.native_removal_preview([item]))
+        self.assertEqual(planned, ["desktop"])
+        self.assertFalse(available)
+        self.assertIn("does not expose a read-only", notes[0])
+
+    @patch.object(MODULE, "portage_world", return_value={"app-editors/nano"})
+    @patch.object(MODULE, "pacman_inventory_by_name", return_value={})
+    @patch.object(MODULE, "command_lines", return_value=(True, {"nano"}))
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/tool")
+    def test_pacman_fallback_and_portage_roles_coexist(
+            self, _which, command_lines, _inventory, _world):
+        pacman = MODULE.Match("Pacman", "nano", "nano")
+        portage = MODULE.Match("Portage", "app-editors/nano", "nano")
+        annotated = MODULE.annotate_roles([pacman, portage])
+        self.assertEqual([item.role for item in annotated], ["explicit", "explicit"])
+        command_lines.assert_called_once_with(["pacman", "-Qqe"])
 
     @patch.object(MODULE, "package_installed_size")
     def test_inventory_sizes_avoid_per_package_size_queries(self, package_size):
@@ -1851,6 +2214,77 @@ class UninstallTests(unittest.TestCase):
             [("hello", ["/nix/store/abc-hello"])],
         )
 
+    @patch.object(MODULE.Path, "home", return_value=Path("/home/test"))
+    @patch.object(MODULE.shutil, "which")
+    @patch.object(MODULE, "capture")
+    def test_guix_profile_entries_are_discovered_and_removed_transactionally(
+            self, capture, which, _home):
+        which.side_effect = {
+            "guix": "/gnu/store/current/bin/guix",
+        }.get
+        capture.return_value = (
+            "emacs\t29.4\tout\t/gnu/store/hash-emacs-29.4\n")
+
+        [item] = MODULE.detect_guix("emacs")
+
+        self.assertEqual(
+            (item.kind, item.ident, item.version, item.origin),
+            ("Guix", "emacs", "29.4", "/home/test/.guix-profile"),
+        )
+        self.assertEqual(
+            MODULE.uninstall_command(item, False),
+            [
+                "guix", "package", "--profile=/home/test/.guix-profile",
+                "--remove=emacs",
+            ],
+        )
+        capture.assert_called_once_with([
+            "guix", "package", "--profile=/home/test/.guix-profile",
+            "--list-installed",
+        ])
+
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/nix-env")
+    @patch.object(MODULE, "capture", return_value=(
+        "hello-2.12.1 /nix/store/hash-hello-2.12.1\n"))
+    def test_legacy_nix_environment_is_supported(self, capture, _which):
+        [record] = MODULE.nix_env_inventory()
+        item = MODULE.Match(
+            "Nix Legacy", record.ident, record.ident, record.version,
+            "user", origin=record.origin, role="explicit",
+        )
+        self.assertEqual((record.ident, record.version), ("hello", "2.12.1"))
+        self.assertIn("legacy Nix user profile", MODULE.install_reason(item))
+        self.assertEqual(
+            MODULE.uninstall_command(item, False),
+            ["nix-env", "--uninstall", "hello"],
+        )
+        capture.assert_called_once_with([
+            "nix-env", "--query", "--installed", "--out-path",
+        ])
+
+    @patch.object(MODULE.shutil, "which", side_effect=(
+        lambda command: "/usr/bin/nix-env" if command == "nix-env" else None))
+    @patch.object(MODULE, "nix_env_inventory", return_value=(
+        MODULE.PackageRecord(
+            "hello", "2.12.1", origin="/nix/store/hash-hello-2.12.1"),))
+    def test_legacy_nix_detection_does_not_require_modern_nix_command(
+            self, _inventory, _which):
+        [item] = MODULE.detect_nix("hello")
+        self.assertEqual((item.kind, item.ident), ("Nix Legacy", "hello"))
+
+    @patch.object(MODULE.os, "geteuid", return_value=0)
+    @patch.object(MODULE, "transactional_zypper_system", return_value=True)
+    def test_read_only_suse_removal_uses_transactional_update(
+            self, _transactional, _euid):
+        item = MODULE.Match("Zypper", "nano", "nano", scope="system")
+        self.assertEqual(
+            MODULE.uninstall_command(item, False),
+            [
+                "transactional-update", "--non-interactive", "pkg", "remove",
+                "nano",
+            ],
+        )
+
     def test_commands_are_exact_and_do_not_use_a_shell(self):
         item = MODULE.Match("Flatpak", "org.freecad.FreeCAD", "FreeCAD",
                             "1.0", "user")
@@ -2114,9 +2548,18 @@ class UninstallTests(unittest.TestCase):
         )
 
     @patch.object(MODULE.os, "geteuid", return_value=1000)
+    @patch.object(MODULE.shutil, "which")
+    def test_pkexec_is_the_final_privilege_fallback(self, which, _euid):
+        which.side_effect = {"pkexec": "/usr/bin/pkexec"}.get
+        self.assertEqual(
+            MODULE.privileged(["apk", "del", "thing"]),
+            ["pkexec", "apk", "del", "thing"],
+        )
+
+    @patch.object(MODULE.os, "geteuid", return_value=1000)
     @patch.object(MODULE.shutil, "which", return_value=None)
     def test_missing_privilege_helper_fails_before_removal(self, _which, _euid):
-        with self.assertRaisesRegex(RuntimeError, "neither sudo nor doas"):
+        with self.assertRaisesRegex(RuntimeError, "sudo, doas, and pkexec"):
             MODULE.privileged(["dnf", "remove", "thing"])
 
     def test_selection_rejects_out_of_range_input(self):

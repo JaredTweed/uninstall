@@ -26,9 +26,13 @@ It searches:
 
 - Flatpak, Snap, AppImage, and AppImages managed by Gear Lever
 - APT/dpkg, DNF/YUM/RPM, layered rpm-ostree packages, Zypper/RPM, and Pacman
+- Alpine/OpenWrt APK, legacy OpenWrt OPKG, Void XBPS, Gentoo Portage
+  (including Gentoo Prefix), Slackware pkgtools, Solus Eopkg, and Clear Linux
+  Swupd bundles
 - local `.rpm`, `.deb`, and Arch `.pkg.tar.*` archives that correspond to
   installed packages
-- Homebrew, Nix profiles, Cargo, pipx, and global npm packages
+- Homebrew, modern and legacy Nix profiles, Guix profiles, Cargo, pipx, and
+  global npm packages
 - standalone executables on `PATH`
 
 You choose the exact result, decide separately whether its data should go too,
@@ -89,7 +93,8 @@ version, and only then installs it.
 curl -fsSL https://raw.githubusercontent.com/JaredTweed/uninstall/main/install.sh | sh
 ```
 
-The installer uses `sudo` or `doas` only when `/usr/local/bin` is not writable.
+The installer uses `sudo`, `doas`, or `pkexec` only when `/usr/local/bin` is not
+writable.
 For a user-only installation:
 
 ```sh
@@ -161,6 +166,12 @@ every supported backend:
   specification, and npm's retained resolved package URL
 - Gear Lever update metadata and exact managed path, or an explicit statement
   that an AppImage or standalone executable has no known installation history
+- APK's world constraints and dependency graph; OPKG's user/automatic status;
+  XBPS manual-package and reverse-dependency metadata; and Portage's `@world`
+  set and installed VDB
+- Guix profile generations, legacy Nix environments, Slackware's installed
+  package logs, Eopkg's retained package and reverse-dependency metadata, and
+  Swupd's explicit bundle tracking and dependency metadata
 
 Current state and historical evidence are worded separately. For example,
 `marked manually installed by APT` describes current state, while an APT
@@ -206,6 +217,18 @@ installed. When metadata or a dry-run is unavailable the result says `UNKNOWN`;
 it never silently claims the operation is safe. The package manager's final
 transaction is always authoritative.
 
+APK, OPKG, XBPS, Portage, and Eopkg use their native no-action, dry-run, or
+pretend operations. Portage removal uses dependency-aware `--depclean`, never
+unsafe blind `--unmerge`; XBPS removal never forces reverse dependencies.
+Slackware does not track dependency relationships. Eopkg can simulate removal
+but does not provide stable machine-readable transaction output. Those cases
+remain explicitly unknown-impact and require typed confirmation.
+Swupd safely refuses to remove bundles needed by installed dependents, but has
+no read-only removal transaction, so it also remains unknown-impact.
+
+On read-only SUSE variants such as MicroOS, the final Zypper removal is routed
+through `transactional-update` and takes effect in a new snapshot after reboot.
+
 Nothing is removed during search or planning, invalid selections can be
 retried, and pressing Enter at a prompt cancels.
 
@@ -230,6 +253,7 @@ The available package-manager choice depends on the selected software:
 - Flatpak `--delete-data` removes sandbox data and permission-store entries.
 - Snap `--purge` skips the automatic recovery snapshot; it does not delete
   snapshots that already exist.
+- Eopkg `--purge` removes package-managed changed configuration files.
 - Homebrew Cask `--zap` removes declared associated files and may include files
   shared by other apps.
 
@@ -248,10 +272,10 @@ unreadable locations can make the final reclaimed space differ. The prompt
 says `about`, `at least`, or `space estimate unavailable` as appropriate; an
 unknown component is never silently treated as zero.
 
-Do not run the whole program with `sudo`; `uninstall` invokes `sudo` or `doas`
-itself only for selected system-wide operations. Shell built-ins and shell
-functions are not installed executables and therefore cannot be removed by
-this tool.
+Do not run the whole program with `sudo`; `uninstall` invokes `sudo`, `doas`,
+or `pkexec` itself only for selected system-wide operations. Shell built-ins
+and shell functions are not installed executables and therefore cannot be
+removed by this tool.
 
 ## Install from a fork
 
@@ -271,7 +295,9 @@ python3 -m unittest discover -s tests -v
 The test suite replaces package managers with harmless fixtures and never
 uninstalls real packages. Machine-readable inventory is preferred where
 available (including Gear Lever, pipx, Nix, rpm-ostree, and Zypper), with
-version-compatible fallbacks where necessary.
+version-compatible fallbacks where necessary. Fixtures cover APK, OPKG, XBPS,
+Portage, Slackware, Eopkg, Swupd, Guix, and legacy Nix without requiring those
+package managers on the development machine.
 
 ## License
 

@@ -24,7 +24,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Callable, Iterable
 
-VERSION = "0.16.0"
+VERSION = "0.17.0"
 
 
 def synchronized_lru_cache(maxsize: int):
@@ -122,6 +122,18 @@ class AptPackageRecord:
     depends: str = ""
     pre_depends: str = ""
     provides: str = ""
+
+
+@dataclass(frozen=True)
+class PackageRecord:
+    ident: str
+    version: str = ""
+    summary: str = ""
+    size_bytes: int | None = None
+    depends: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
+    origin: str = ""
+    files: tuple[str, ...] = ()
 
 
 @lru_cache(maxsize=16384)
@@ -250,6 +262,25 @@ def package_installed_size(
             if line.casefold().startswith("installed size") and ":" in line:
                 return parse_size(line.split(":", 1)[1])
         return None
+    if kind == "APK":
+        record = apk_inventory_by_name().get(ident)
+        if record and record.size_bytes is not None:
+            return record.size_bytes
+        return parse_size(capture(["apk", "info", "--size", ident]))
+    if kind == "OPKG":
+        record = opkg_inventory_by_name().get(ident)
+        return record.size_bytes if record else None
+    if kind == "XBPS":
+        output = capture([
+            "xbps-query", "--property", "installed_size", ident,
+        ]).strip()
+        return int(output) if output.isdigit() else parse_size(output)
+    if kind == "Portage":
+        record = portage_inventory_by_name().get(ident)
+        return record.size_bytes if record else None
+    if kind == "Slackware":
+        record = slackware_inventory_by_name().get(ident)
+        return record.size_bytes if record else None
     if kind == "Snap":
         total = 0
         found = False
@@ -428,6 +459,23 @@ def rpm_manager() -> str:
     if shutil.which("zypper"):
         return "Zypper"
     return "RPM" if shutil.which("rpm") else ""
+
+
+@lru_cache(maxsize=1)
+def transactional_zypper_system() -> bool:
+    """Identify read-only SUSE variants that must modify a new snapshot."""
+    if not shutil.which("transactional-update"):
+        return False
+    try:
+        mounts = Path("/proc/self/mounts").read_text(
+            encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    for line in mounts:
+        fields = line.split()
+        if len(fields) >= 4 and fields[1] == "/":
+            return "ro" in fields[3].split(",")
+    return False
 
 
 @synchronized_lru_cache(maxsize=1)
@@ -697,6 +745,545 @@ def detect_pacman(query: str) -> list[Match]:
                 size_bytes=parse_size(record.get("Installed Size", "")),
             ))
     return found
+
+
+def dependency_name(value: str) -> str:
+    """Strip a package-manager version constraint from a dependency token."""
+    return re.split(r"[<>=~]", value.lstrip("!"), maxsplit=1)[0].strip()
+
+
+def apk_constraint_name(value: str) -> str:
+    """Return the provided name from an APK world constraint, excluding its tag."""
+    return dependency_name(value).split("@", 1)[0]
+
+
+def parse_apk_installed(text: str) -> tuple[PackageRecord, ...]:
+    records: list[PackageRecord] = []
+    for block in re.split(r"\n\s*\n", text):
+        fields: dict[str, str] = {}
+        for line in block.splitlines():
+            if len(line) >= 2 and line[1] == ":":
+                fields[line[0]] = line[2:].strip()
+        name = fields.get("P", "")
+        if not name:
+            continue
+        records.append(PackageRecord(
+            ident=name,
+            version=fields.get("V", ""),
+            summary=fields.get("T", ""),
+            size_bytes=(int(fields["I"])
+                        if fields.get("I", "").isdigit() else None),
+            depends=tuple(fields.get("D", "").split()),
+            provides=tuple(fields.get("p", "").split()),
+            origin=fields.get("o", ""),
+        ))
+    return tuple(records)
+
+
+@synchronized_lru_cache(maxsize=1)
+def apk_inventory() -> tuple[PackageRecord, ...]:
+    if not shutil.which("apk"):
+        return ()
+    try:
+        text = Path("/lib/apk/db/installed").read_text(
+            encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    parsed = parse_apk_installed(text)
+    if parsed:
+        return parsed
+    records: list[PackageRecord] = []
+    for line in capture(["apk", "info", "--verbose"]).splitlines():
+        match = re.match(r"^(.+)-([0-9][^\s]*-r\d+)$", line.strip())
+        if match:
+            records.append(PackageRecord(match.group(1), match.group(2)))
+    return tuple(records)
+
+
+@synchronized_lru_cache(maxsize=1)
+def apk_inventory_by_name() -> dict[str, PackageRecord]:
+    return {record.ident: record for record in apk_inventory()}
+
+
+@lru_cache(maxsize=1)
+def apk_world() -> tuple[str, ...]:
+    try:
+        lines = Path("/etc/apk/world").read_text(
+            encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ()
+    return tuple(
+        line.strip() for line in lines
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+
+
+@lru_cache(maxsize=1)
+def apk_provider_map() -> dict[str, set[str]]:
+    providers: dict[str, set[str]] = defaultdict(set)
+    for record in apk_inventory():
+        providers[record.ident].add(record.ident)
+        for capability in record.provides:
+            name = dependency_name(capability)
+            if name:
+                providers[name].add(record.ident)
+    return dict(providers)
+
+
+@lru_cache(maxsize=1)
+def apk_explicit_causes() -> dict[str, str]:
+    providers = apk_provider_map()
+    causes: dict[str, str] = {}
+    for constraint in apk_world():
+        capability = apk_constraint_name(constraint)
+        for package in providers.get(capability, set()):
+            causes.setdefault(package, constraint)
+    return causes
+
+
+def detect_apk(query: str) -> list[Match]:
+    return [
+        Match(
+            "APK", record.ident, record.ident, record.version, "system",
+            size_bytes=record.size_bytes, origin=record.origin,
+        )
+        for record in apk_inventory()
+        if relevant(query, record.ident, record.summary)
+    ]
+
+
+def parse_control_records(text: str) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    for block in re.split(r"\n\s*\n", text):
+        fields: dict[str, str] = {}
+        current = ""
+        for line in block.splitlines():
+            if ":" in line and not line[:1].isspace():
+                current, value = line.split(":", 1)
+                fields[current] = value.strip()
+            elif current and line[:1].isspace():
+                fields[current] += " " + line.strip()
+        if fields:
+            records.append(fields)
+    return records
+
+
+def parse_opkg_status(text: str) -> tuple[PackageRecord, ...]:
+    records: list[PackageRecord] = []
+    for fields in parse_control_records(text):
+        status = fields.get("Status", "")
+        name = fields.get("Package", "")
+        if not name or " installed" not in status:
+            continue
+        role = (
+            "explicit" if " user " in f" {status} " else
+            "dependency" if fields.get(
+                "Auto-Installed", "").casefold() == "yes" else
+            "base"
+        )
+        records.append(PackageRecord(
+            ident=name,
+            version=fields.get("Version", ""),
+            summary=fields.get("Description", ""),
+            size_bytes=(int(fields["Installed-Size"])
+                        if fields.get("Installed-Size", "").isdigit()
+                        else None),
+            depends=tuple(
+                value.strip() for value in fields.get("Depends", "").split(",")
+                if value.strip()),
+            provides=tuple(
+                value.strip() for value in fields.get("Provides", "").split(",")
+                if value.strip()),
+            origin=role,
+        ))
+    return tuple(records)
+
+
+@synchronized_lru_cache(maxsize=1)
+def opkg_inventory() -> tuple[PackageRecord, ...]:
+    if not shutil.which("opkg"):
+        return ()
+    status_path = next((
+        path for path in (
+            Path("/usr/lib/opkg/status"), Path("/var/lib/opkg/status"))
+        if path.is_file()
+    ), None)
+    text = read_first(status_path) if status_path else ""
+    parsed = parse_opkg_status(text)
+    if parsed:
+        return parsed
+    records: list[PackageRecord] = []
+    for line in capture(["opkg", "list-installed"]).splitlines():
+        fields = line.split(" - ", 2)
+        if len(fields) >= 2 and fields[0]:
+            records.append(PackageRecord(
+                fields[0], fields[1],
+                fields[2] if len(fields) > 2 else "",
+                origin="unknown",
+            ))
+    return tuple(records)
+
+
+@synchronized_lru_cache(maxsize=1)
+def opkg_inventory_by_name() -> dict[str, PackageRecord]:
+    return {record.ident: record for record in opkg_inventory()}
+
+
+@lru_cache(maxsize=1)
+def opkg_provider_map() -> dict[str, set[str]]:
+    providers: dict[str, set[str]] = defaultdict(set)
+    for record in opkg_inventory():
+        providers[record.ident].add(record.ident)
+        for capability in record.provides:
+            name = dependency_name(capability)
+            if name:
+                providers[name].add(record.ident)
+    return dict(providers)
+
+
+@lru_cache(maxsize=1)
+def opkg_reverse_graph() -> tuple[dict[str, set[str]], bool]:
+    inventory = opkg_inventory()
+    if not inventory:
+        return {}, False
+    providers = opkg_provider_map()
+    reverse: dict[str, set[str]] = defaultdict(set)
+    for record in inventory:
+        for raw_dependency in record.depends:
+            for alternative in raw_dependency.split("|"):
+                capability = dependency_name(alternative.strip())
+                for provider in providers.get(capability, set()):
+                    if provider != record.ident:
+                        reverse[provider].add(record.ident)
+    return dict(reverse), True
+
+
+def detect_opkg(query: str) -> list[Match]:
+    return [
+        Match(
+            "OPKG", record.ident, record.ident, record.version, "system",
+            size_bytes=record.size_bytes, origin=record.origin,
+        )
+        for record in opkg_inventory()
+        if relevant(query, record.ident, record.summary)
+    ]
+
+
+def split_xbps_pkgver(value: str) -> tuple[str, str]:
+    match = re.match(r"^(.+)-([0-9][^\s]*_\d+)$", value.strip())
+    return (match.group(1), match.group(2)) if match else (value.strip(), "")
+
+
+@synchronized_lru_cache(maxsize=1)
+def xbps_inventory() -> tuple[PackageRecord, ...]:
+    if not shutil.which("xbps-query"):
+        return ()
+    records: list[PackageRecord] = []
+    for line in capture(["xbps-query", "--list-pkgs"]).splitlines():
+        fields = line.split(maxsplit=2)
+        if len(fields) < 2 or fields[0] != "ii":
+            continue
+        name, version = split_xbps_pkgver(fields[1])
+        records.append(PackageRecord(
+            name, version, fields[2] if len(fields) > 2 else ""))
+    return tuple(records)
+
+
+@synchronized_lru_cache(maxsize=1)
+def xbps_inventory_by_name() -> dict[str, PackageRecord]:
+    return {record.ident: record for record in xbps_inventory()}
+
+
+@lru_cache(maxsize=1)
+def xbps_manual_packages() -> tuple[bool, set[str]]:
+    if not shutil.which("xbps-query"):
+        return False, set()
+    code, output = capture_any(["xbps-query", "--list-manual-pkgs"])
+    if code != 0:
+        return False, set()
+    return True, {
+        split_xbps_pkgver(line.split()[0])[0]
+        for line in output.splitlines() if line.split()
+    }
+
+
+def detect_xbps(query: str) -> list[Match]:
+    return [
+        Match("XBPS", record.ident, record.ident, record.version, "system")
+        for record in xbps_inventory()
+        if relevant(query, record.ident, record.summary)
+    ]
+
+
+def read_first(path: Path) -> str:
+    try:
+        return path.read_text(
+            encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def portage_prefix() -> Path:
+    return Path(os.environ.get("EPREFIX") or "/")
+
+
+def portage_scope() -> str:
+    prefix = portage_prefix().expanduser().absolute()
+    return "user" if path_is_within(prefix, Path.home()) else "system"
+
+
+def parse_portage_vdb(root: Path) -> tuple[PackageRecord, ...]:
+    records: list[PackageRecord] = []
+    try:
+        categories = tuple(root.iterdir())
+    except OSError:
+        return ()
+    for category in categories:
+        if not category.is_dir():
+            continue
+        try:
+            packages = tuple(category.iterdir())
+        except OSError:
+            continue
+        for package in packages:
+            if not package.is_dir():
+                continue
+            package_full = read_first(package / "PF") or package.name
+            name = read_first(package / "PN")
+            version = read_first(package / "PVR")
+            if not name:
+                match = re.match(r"^(.+)-([0-9].*)$", package_full)
+                if match:
+                    name, inferred_version = match.groups()
+                    version = version or inferred_version
+            elif not version and package_full.startswith(name + "-"):
+                version = package_full[len(name) + 1:]
+            if not name:
+                continue
+            raw_size = read_first(package / "SIZE")
+            records.append(PackageRecord(
+                ident=f"{category.name}/{name}",
+                version=version,
+                summary=read_first(package / "DESCRIPTION"),
+                size_bytes=int(raw_size) if raw_size.isdigit() else None,
+                origin=read_first(package / "repository"),
+                files=(str(package / "CONTENTS"),),
+            ))
+    return tuple(records)
+
+
+@synchronized_lru_cache(maxsize=1)
+def portage_inventory() -> tuple[PackageRecord, ...]:
+    if not shutil.which("emerge"):
+        return ()
+    return parse_portage_vdb(portage_prefix() / "var/db/pkg")
+
+
+@synchronized_lru_cache(maxsize=1)
+def portage_inventory_by_name() -> dict[str, PackageRecord]:
+    return {record.ident: record for record in portage_inventory()}
+
+
+@lru_cache(maxsize=1)
+def portage_world() -> set[str]:
+    try:
+        lines = (portage_prefix() / "var/lib/portage/world").read_text(
+            encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return set()
+    installed = portage_inventory_by_name()
+    explicit: set[str] = set()
+    for raw in lines:
+        atom = raw.strip()
+        if not atom or atom.startswith(("#", "@")):
+            continue
+        atom = atom.lstrip("<>=~!")
+        atom = atom.split("[", 1)[0].split(":", 1)[0]
+        if atom in installed:
+            explicit.add(atom)
+            continue
+        candidates = [ident for ident in installed if atom.startswith(ident + "-")]
+        if candidates:
+            explicit.add(max(candidates, key=len))
+    return explicit
+
+
+def detect_portage(query: str) -> list[Match]:
+    return [
+        Match(
+            "Portage", record.ident, record.ident.rsplit("/", 1)[-1],
+            record.version, portage_scope(), size_bytes=record.size_bytes,
+            origin=record.origin,
+        )
+        for record in portage_inventory()
+        if relevant(
+            query, record.ident, record.ident.rsplit("/", 1)[-1],
+            record.summary)
+    ]
+
+
+def parse_slackware_size(value: str) -> int | None:
+    parsed = parse_size(value)
+    if parsed is not None:
+        return parsed
+    match = re.search(r"(?i)(\d+(?:\.\d+)?)\s*([KMGT])\b", value)
+    if not match:
+        return None
+    return int(float(match.group(1)) * (1024 ** ("KMGT".index(
+        match.group(2).upper()) + 1)))
+
+
+def split_slackware_pkgname(value: str) -> tuple[str, str]:
+    fields = value.rsplit("-", 3)
+    return (fields[0], fields[1]) if len(fields) == 4 else (value, "")
+
+
+def parse_slackware_package_log(
+        text: str, fallback_name: str,
+) -> PackageRecord:
+    package_line = next((
+        line.partition(":")[2].strip()
+        for line in text.splitlines()
+        if line.startswith("PACKAGE NAME:")
+    ), fallback_name)
+    name, version = split_slackware_pkgname(package_line)
+    size_line = next((
+        line.partition(":")[2].strip()
+        for line in text.splitlines()
+        if line.startswith("UNCOMPRESSED PACKAGE SIZE:")
+    ), "")
+    description = ""
+    file_lines: list[str] = []
+    in_description = False
+    in_files = False
+    for line in text.splitlines():
+        if line == "PACKAGE DESCRIPTION:":
+            in_description, in_files = True, False
+            continue
+        if line == "FILE LIST:":
+            in_description, in_files = False, True
+            continue
+        if in_description and not description and ":" in line:
+            description = line.split(":", 1)[1].strip()
+        elif in_files and line and not line.endswith("/"):
+            file_lines.append("/" + line.lstrip("./"))
+    return PackageRecord(
+        name, version, description, parse_slackware_size(size_line),
+        files=tuple(file_lines),
+    )
+
+
+@synchronized_lru_cache(maxsize=1)
+def slackware_inventory() -> tuple[PackageRecord, ...]:
+    if not shutil.which("removepkg"):
+        return ()
+    roots = (Path("/var/lib/pkgtools/packages"), Path("/var/log/packages"))
+    root = next((candidate for candidate in roots if candidate.is_dir()), None)
+    if root is None:
+        return ()
+    try:
+        paths = tuple(root.iterdir())
+    except OSError:
+        return ()
+    records: list[PackageRecord] = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        text = read_first(path)
+        records.append(parse_slackware_package_log(text, path.name))
+    return tuple(records)
+
+
+@synchronized_lru_cache(maxsize=1)
+def slackware_inventory_by_name() -> dict[str, PackageRecord]:
+    return {record.ident: record for record in slackware_inventory()}
+
+
+def detect_slackware(query: str) -> list[Match]:
+    return [
+        Match(
+            "Slackware", record.ident, record.ident, record.version,
+            "system", size_bytes=record.size_bytes,
+        )
+        for record in slackware_inventory()
+        if relevant(query, record.ident, record.summary)
+    ]
+
+
+@synchronized_lru_cache(maxsize=1)
+def eopkg_inventory() -> tuple[PackageRecord, ...]:
+    if not shutil.which("eopkg"):
+        return ()
+    records: list[PackageRecord] = []
+    for line in capture([
+            "eopkg", "--no-color", "list-installed",
+    ]).splitlines():
+        match = re.match(r"^([A-Za-z0-9+_.-]+)\s+-\s+(.+)$", line.strip())
+        if match:
+            records.append(PackageRecord(
+                match.group(1), summary=match.group(2)))
+    return tuple(records)
+
+
+def detect_eopkg(query: str) -> list[Match]:
+    return [
+        Match("Eopkg", record.ident, record.ident, record.version, "system")
+        for record in eopkg_inventory()
+        if relevant(query, record.ident, record.summary)
+    ]
+
+
+@synchronized_lru_cache(maxsize=1)
+def eopkg_automatic_packages() -> tuple[bool, dict[str, str]]:
+    if not shutil.which("eopkg"):
+        return False, {}
+    code, output = capture_any([
+        "eopkg", "--no-color", "list-installed", "--automatic",
+    ], timeout=30)
+    if code != 0:
+        return False, {}
+    automatic: dict[str, str] = {}
+    for line in output.splitlines():
+        name, separator, parent = line.partition(" - ")
+        if separator and name.strip():
+            automatic[name.strip()] = parent.strip()
+    return True, automatic
+
+
+@synchronized_lru_cache(maxsize=1)
+def swupd_inventory() -> tuple[PackageRecord, ...]:
+    if not shutil.which("swupd"):
+        return ()
+    code, output = capture_any([
+        "swupd", "bundle-list", "--status", "--quiet",
+    ], timeout=30)
+    if code != 0:
+        return ()
+    records: list[PackageRecord] = []
+    for line in output.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        name, separator, status = raw.partition(":")
+        if not name.strip():
+            continue
+        retained_status = status.casefold() if separator else "installed"
+        if "installed" not in retained_status:
+            continue
+        role = (
+            "explicit" if "explicitly installed" in retained_status
+            else "dependency"
+        )
+        records.append(PackageRecord(name.strip(), origin=role))
+    return tuple(records)
+
+
+def detect_swupd(query: str) -> list[Match]:
+    return [
+        Match("Swupd", record.ident, record.ident, scope="system")
+        for record in swupd_inventory()
+        if relevant(query, record.ident)
+    ]
 
 
 @synchronized_lru_cache(maxsize=1)
@@ -1073,12 +1660,13 @@ def parse_nix_profile_json(text: str) -> list[tuple[str, list[str]]]:
 
 
 def detect_nix(query: str) -> list[Match]:
-    if not shutil.which("nix"):
+    has_nix = bool(shutil.which("nix"))
+    if not has_nix and not shutil.which("nix-env"):
         return []
     executable = find_executable(query) if Path(query).name == query else None
     resolved = str(Path(executable).resolve()) if executable else ""
     found: list[Match] = []
-    metadata = nix_profile_metadata()
+    metadata = nix_profile_metadata() if has_nix else {}
     entries: list[tuple[str, list[str]]] = []
     for ident, details in metadata.items():
         raw_paths = details.get(
@@ -1088,7 +1676,7 @@ def detect_nix(query: str) -> list[Match]:
         ] if isinstance(raw_paths, list) else []
         if stores:
             entries.append((ident, stores))
-    if not entries:
+    if not entries and has_nix:
         entries = parse_nix_profile(capture(["nix", "profile", "list"]))
     for ident, stores in entries:
         owns_command = bool(resolved) and any(
@@ -1099,6 +1687,88 @@ def detect_nix(query: str) -> list[Match]:
             found.append(Match("Nix", ident, ident, "", "user",
                                provides=str(Path(executable).absolute())
                                if owns_command and executable else ""))
+    if found or entries or not shutil.which("nix-env"):
+        return found
+    for record in nix_env_inventory():
+        owns_command = bool(resolved and record.origin) and (
+            resolved == record.origin
+            or resolved.startswith(record.origin.rstrip("/") + "/")
+        )
+        if relevant(query, record.ident) or owns_command:
+            found.append(Match(
+                "Nix Legacy", record.ident, record.ident, record.version,
+                "user", provides=(str(Path(executable).absolute())
+                                  if owns_command and executable else ""),
+                origin=record.origin,
+            ))
+    return found
+
+
+@synchronized_lru_cache(maxsize=1)
+def nix_env_inventory() -> tuple[PackageRecord, ...]:
+    if not shutil.which("nix-env"):
+        return ()
+    records: list[PackageRecord] = []
+    for line in capture([
+            "nix-env", "--query", "--installed", "--out-path",
+    ]).splitlines():
+        fields = line.split(maxsplit=1)
+        if not fields:
+            continue
+        match = re.match(r"^(.+)-([0-9][^\s]*)$", fields[0])
+        name = match.group(1) if match else fields[0]
+        version = match.group(2) if match else ""
+        records.append(PackageRecord(
+            name, version,
+            origin=fields[1] if len(fields) > 1 else "",
+        ))
+    return tuple(records)
+
+
+def guix_profile_path() -> Path:
+    return Path(
+        os.environ.get("GUIX_PROFILE") or Path.home() / ".guix-profile"
+    ).expanduser()
+
+
+@synchronized_lru_cache(maxsize=1)
+def guix_inventory() -> tuple[PackageRecord, ...]:
+    if not shutil.which("guix"):
+        return ()
+    profile = guix_profile_path()
+    records: list[PackageRecord] = []
+    for line in capture([
+            "guix", "package", f"--profile={profile}", "--list-installed",
+    ]).splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        store = next((value for value in fields[2:]
+                      if value.startswith("/gnu/store/")), "")
+        records.append(PackageRecord(
+            fields[0], fields[1], origin=store))
+    return tuple(records)
+
+
+def detect_guix(query: str) -> list[Match]:
+    if not shutil.which("guix"):
+        return []
+    executable = find_executable(query) if Path(query).name == query else None
+    resolved = str(Path(executable).resolve()) if executable else ""
+    profile = str(guix_profile_path())
+    found: list[Match] = []
+    for record in guix_inventory():
+        owns_command = bool(resolved and record.origin) and (
+            resolved == record.origin
+            or resolved.startswith(record.origin.rstrip("/") + "/")
+        )
+        if relevant(query, record.ident) or owns_command:
+            found.append(Match(
+                "Guix", record.ident, record.ident, record.version, "user",
+                provides=(str(Path(executable).absolute())
+                          if owns_command and executable else ""),
+                origin=profile,
+            ))
     return found
 
 
@@ -1137,6 +1807,58 @@ def flatpak_command_owner(visible: Path) -> list[Match]:
             if item.ident == app_id:
                 found.append(replace(item, provides=str(visible)))
     return found
+
+
+def package_owner_from_output(
+        output: str, records: Iterable[PackageRecord], kind: str,
+        visible: Path,
+) -> list[Match]:
+    for record in records:
+        if re.search(
+                rf"(?<![A-Za-z0-9+_.-]){re.escape(record.ident)}"
+                rf"(?:-{re.escape(record.version)})?(?![A-Za-z0-9+_.-])",
+                output):
+            return [Match(
+                kind, record.ident,
+                (record.ident.rsplit("/", 1)[-1]
+                 if kind == "Portage" else record.ident),
+                record.version, "system", provides=str(visible),
+                size_bytes=record.size_bytes, origin=record.origin,
+            )]
+    return []
+
+
+def portage_command_owner(resolved: Path, visible: Path) -> list[Match]:
+    target = str(resolved)
+    for record in portage_inventory():
+        for contents_path in record.files:
+            try:
+                lines = Path(contents_path).read_text(
+                    encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            if any(
+                    line.startswith((f"obj {target} ", f"sym {target} -> "))
+                    for line in lines):
+                return [Match(
+                    "Portage", record.ident,
+                    record.ident.rsplit("/", 1)[-1], record.version,
+                    portage_scope(), provides=str(visible),
+                    size_bytes=record.size_bytes, origin=record.origin,
+                )]
+    return []
+
+
+def slackware_command_owner(resolved: Path, visible: Path) -> list[Match]:
+    target = str(resolved)
+    for record in slackware_inventory():
+        if target in record.files:
+            return [Match(
+                "Slackware", record.ident, record.ident, record.version,
+                "system", provides=str(visible),
+                size_bytes=record.size_bytes,
+            )]
+    return []
 
 
 def detect_executable_owner(query: str) -> list[Match]:
@@ -1206,6 +1928,44 @@ def detect_executable_owner(query: str) -> list[Match]:
         scope = "user" if path_is_within(visible, Path.home()) else "system"
         return [Match("NPM", package, package, "", scope,
                       provides=str(visible))]
+
+    if shutil.which("apk"):
+        owned = package_owner_from_output(
+            capture(["apk", "info", "--who-owns", path]),
+            apk_inventory(), "APK", visible)
+        if owned:
+            return owned
+
+    if shutil.which("opkg"):
+        owned = package_owner_from_output(
+            capture(["opkg", "search", path]),
+            opkg_inventory(), "OPKG", visible)
+        if owned:
+            return owned
+
+    if shutil.which("xbps-query"):
+        owned = package_owner_from_output(
+            capture(["xbps-query", "--ownedby", path]),
+            xbps_inventory(), "XBPS", visible)
+        if owned:
+            return owned
+
+    if shutil.which("emerge"):
+        owned = portage_command_owner(resolved, visible)
+        if owned:
+            return owned
+
+    if shutil.which("removepkg"):
+        owned = slackware_command_owner(resolved, visible)
+        if owned:
+            return owned
+
+    if shutil.which("eopkg"):
+        owned = package_owner_from_output(
+            capture(["eopkg", "search-file", path]),
+            eopkg_inventory(), "Eopkg", visible)
+        if owned:
+            return owned
 
     kind = rpm_manager()
     if kind and shutil.which("rpm"):
@@ -1441,8 +2201,10 @@ def is_package_archive_query(query: str) -> bool:
 
 DETECTORS: tuple[Callable[[str], list[Match]], ...] = (
     detect_flatpak, detect_snap, detect_dpkg, detect_rpm, detect_pacman,
+    detect_apk, detect_opkg, detect_xbps, detect_portage, detect_slackware,
+    detect_eopkg, detect_swupd,
     detect_homebrew, detect_gearlever, detect_pipx, detect_npm, detect_cargo,
-    detect_nix, detect_appimages, detect_executable_owner,
+    detect_nix, detect_guix, detect_appimages, detect_executable_owner,
 )
 
 
@@ -1671,6 +2433,46 @@ def annotate_roles(matches: list[Match]) -> list[Match]:
                         "explicit" if item.ident in explicit else "dependency")
                     roles[(item.kind, item.ident, item.scope)] = role
 
+    if by_kind.get("APK") and shutil.which("apk"):
+        explicit = apk_explicit_causes()
+        for item in by_kind["APK"]:
+            roles[(item.kind, item.ident, item.scope)] = (
+                "explicit" if item.ident in explicit else "dependency")
+
+    if by_kind.get("OPKG") and shutil.which("opkg"):
+        inventory = opkg_inventory_by_name()
+        for item in by_kind["OPKG"]:
+            retained = inventory.get(item.ident)
+            if retained and retained.origin in {"explicit", "dependency"}:
+                roles[(item.kind, item.ident, item.scope)] = retained.origin
+
+    if by_kind.get("XBPS") and shutil.which("xbps-query"):
+        ok, explicit = xbps_manual_packages()
+        if ok:
+            for item in by_kind["XBPS"]:
+                roles[(item.kind, item.ident, item.scope)] = (
+                    "explicit" if item.ident in explicit else "dependency")
+
+    if by_kind.get("Portage") and shutil.which("emerge"):
+        explicit = portage_world()
+        for item in by_kind["Portage"]:
+            roles[(item.kind, item.ident, item.scope)] = (
+                "explicit" if item.ident in explicit else "dependency")
+
+    if by_kind.get("Eopkg") and shutil.which("eopkg"):
+        ok, automatic = eopkg_automatic_packages()
+        if ok:
+            for item in by_kind["Eopkg"]:
+                roles[(item.kind, item.ident, item.scope)] = (
+                    "dependency" if item.ident in automatic else "explicit")
+
+    if by_kind.get("Swupd") and shutil.which("swupd"):
+        retained = {record.ident: record.origin for record in swupd_inventory()}
+        for item in by_kind["Swupd"]:
+            role = retained.get(item.ident, "")
+            if role in {"explicit", "dependency"}:
+                roles[(item.kind, item.ident, item.scope)] = role
+
     if by_kind.get("Homebrew") and shutil.which("brew"):
         metadata = homebrew_installed_metadata()
         unresolved: list[Match] = []
@@ -1695,7 +2497,8 @@ def annotate_roles(matches: list[Match]) -> list[Match]:
 
     inherently_explicit = {
         "Flatpak", "Snap", "Homebrew Cask", "Cargo", "Pipx", "NPM", "Nix",
-        "AppImage", "Gear Lever", "Standalone", "RPM-OSTree",
+        "Nix Legacy", "Guix", "AppImage", "Gear Lever", "Standalone",
+        "RPM-OSTree",
     }
     for item in matches:
         key = (item.kind, item.ident, item.scope)
@@ -1834,6 +2637,24 @@ def apt_reverse_graph() -> tuple[dict[str, set[str]], bool]:
                 provider_base = package_base(provider)
                 if provider_base != package_base(dependent):
                     reverse[provider_base].add(package_base(dependent))
+    return dict(reverse), True
+
+
+@lru_cache(maxsize=1)
+def apk_reverse_graph() -> tuple[dict[str, set[str]], bool]:
+    inventory = apk_inventory()
+    if not inventory:
+        return {}, False
+    providers = apk_provider_map()
+    reverse: dict[str, set[str]] = defaultdict(set)
+    for record in inventory:
+        for raw_dependency in record.depends:
+            if raw_dependency.startswith("!"):
+                continue
+            capability = dependency_name(raw_dependency)
+            for provider in providers.get(capability, set()):
+                if provider != record.ident:
+                    reverse[provider].add(record.ident)
     return dict(reverse), True
 
 
@@ -2214,6 +3035,110 @@ def dnf_group_install_reason(target: str) -> str:
     return f"{cause}; {transaction}" if transaction else cause
 
 
+@lru_cache(maxsize=128)
+def xbps_reverse_dependencies(target: str) -> tuple[bool, set[str]]:
+    code, output = capture_any([
+        "xbps-query", "--revdeps", target,
+    ], timeout=30)
+    if code != 0:
+        return False, set()
+    dependencies = {
+        split_xbps_pkgver(line.split()[0])[0]
+        for line in output.splitlines()
+        if line.split() and not line.lstrip().startswith("[")
+    }
+    return True, dependencies
+
+
+def xbps_dependency_report(item: Match) -> DependencyReport:
+    target = item.ident
+    manual_ok, explicit = xbps_manual_packages()
+    reverse: dict[str, set[str]] = {}
+    queue = deque([target])
+    queried: set[str] = set()
+    complete = manual_ok
+    while queue and len(queried) < 64:
+        package = queue.popleft()
+        if package in queried:
+            continue
+        queried.add(package)
+        ok, dependents = xbps_reverse_dependencies(package)
+        complete = complete and ok
+        reverse[package] = dependents
+        for dependent in dependents:
+            if dependent not in explicit and dependent not in queried:
+                queue.append(dependent)
+    if queue:
+        complete = False
+    paths, paths_complete = root_paths(target, reverse, explicit)
+    return DependencyReport(
+        item, sorted(reverse.get(target, set())), paths,
+        complete and paths_complete,
+        "Paths use current XBPS reverse-dependency and manual-package metadata.",
+    )
+
+
+def eopkg_dependency_report(item: Match) -> DependencyReport:
+    code, output = capture_any([
+        "eopkg", "--no-color", "info", item.ident,
+    ], timeout=30)
+    direct: list[str] = []
+    for line in output.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip().casefold() == "reverse dependencies":
+            direct.extend(re.findall(r"[A-Za-z0-9+_.-]+", value))
+    return DependencyReport(
+        item, sorted(set(direct)), [], False,
+        ("Eopkg reports direct reverse dependencies but does not retain "
+         "a reliable explicit-install root." if code == 0 else
+         "Eopkg package information was unavailable."),
+    )
+
+
+@lru_cache(maxsize=128)
+def swupd_reverse_dependencies(target: str) -> tuple[bool, set[str]]:
+    code, output = capture_any([
+        "swupd", "bundle-list", f"--has-dep={target}", "--quiet",
+    ], timeout=30)
+    if code != 0:
+        return False, set()
+    return True, {
+        line.partition(":")[0].strip()
+        for line in output.splitlines()
+        if line.partition(":")[0].strip()
+    }
+
+
+def swupd_dependency_report(item: Match) -> DependencyReport:
+    explicit = {
+        record.ident for record in swupd_inventory()
+        if record.origin == "explicit"
+    }
+    reverse: dict[str, set[str]] = {}
+    queue = deque([item.ident])
+    queried: set[str] = set()
+    complete = bool(explicit)
+    while queue and len(queried) < 64:
+        bundle = queue.popleft()
+        if bundle in queried:
+            continue
+        queried.add(bundle)
+        ok, dependents = swupd_reverse_dependencies(bundle)
+        complete = complete and ok
+        reverse[bundle] = dependents
+        for dependent in dependents:
+            if dependent not in explicit and dependent not in queried:
+                queue.append(dependent)
+    if queue:
+        complete = False
+    paths, paths_complete = root_paths(item.ident, reverse, explicit)
+    return DependencyReport(
+        item, sorted(reverse.get(item.ident, set())), paths,
+        complete and paths_complete,
+        "Paths use current Swupd bundle dependencies and tracking state.",
+    )
+
+
 @lru_cache(maxsize=None)
 def explicit_names_for_kind(kind: str) -> set[str]:
     if kind == "APT" and shutil.which("apt-mark"):
@@ -2238,6 +3163,29 @@ def explicit_names_for_kind(kind: str) -> set[str]:
     if kind == "Pacman" and shutil.which("pacman"):
         ok, names = command_lines(["pacman", "-Qqe"])
         return names if ok else set()
+    if kind == "APK":
+        return set(apk_explicit_causes())
+    if kind == "OPKG":
+        return {
+            record.ident for record in opkg_inventory()
+            if record.origin == "explicit"
+        }
+    if kind == "XBPS":
+        ok, names = xbps_manual_packages()
+        return names if ok else set()
+    if kind == "Portage":
+        return set(portage_world())
+    if kind == "Eopkg":
+        ok, automatic = eopkg_automatic_packages()
+        return (
+            {record.ident for record in eopkg_inventory()} - set(automatic)
+            if ok else set()
+        )
+    if kind == "Swupd":
+        return {
+            record.ident for record in swupd_inventory()
+            if record.origin == "explicit"
+        }
     if kind == "Homebrew" and shutil.which("brew"):
         ok, names = command_lines([
             "brew", "list", "--formula", "--installed-on-request",
@@ -2277,6 +3225,18 @@ def dependency_report(item: Match) -> DependencyReport:
         note = "Paths use current APT metadata; alternatives can be ambiguous."
     elif item.kind == "Pacman" and shutil.which("pacman"):
         reverse, complete = pacman_reverse_graph()
+    elif item.kind == "APK" and shutil.which("apk"):
+        reverse, complete = apk_reverse_graph()
+        note = "Paths use the current APK installed database and world file."
+    elif item.kind == "OPKG" and shutil.which("opkg"):
+        reverse, complete = opkg_reverse_graph()
+        note = "Paths use the current OPKG status database."
+    elif item.kind == "XBPS" and shutil.which("xbps-query"):
+        return xbps_dependency_report(item)
+    elif item.kind == "Eopkg" and shutil.which("eopkg"):
+        return eopkg_dependency_report(item)
+    elif item.kind == "Swupd" and shutil.which("swupd"):
+        return swupd_dependency_report(item)
     elif item.kind == "Homebrew" and shutil.which("brew"):
         direct_ok, direct = command_lines([
             "brew", "uses", "--installed", item.ident,
@@ -2298,7 +3258,7 @@ def dependency_report(item: Match) -> DependencyReport:
         )
     elif item.kind in {
             "Flatpak", "AppImage", "Standalone", "Cargo", "Pipx", "NPM", "Nix",
-            "Homebrew Cask"}:
+            "Nix Legacy", "Guix", "Homebrew Cask"}:
         return DependencyReport(
             item, [], [], True,
             "This is a top-level or self-contained installation; "
@@ -2326,7 +3286,8 @@ def dependency_report(item: Match) -> DependencyReport:
                     relation_map.get((target, dependent), set()) - {"requires"}):
                 weak_relations.append((dependent, relation))
     if not explicit and item.kind in {
-            "APT", "DNF", "Pacman", "YUM", "Zypper", "RPM", "RPM-OSTree"}:
+            "APT", "DNF", "Pacman", "APK", "OPKG", "XBPS", "Portage", "YUM",
+            "Zypper", "RPM", "RPM-OSTree", "Swupd"}:
         paths_complete = False
         note = (note + " Installation-reason metadata was unavailable.").strip()
     return DependencyReport(
@@ -2860,6 +3821,43 @@ def explicit_install_reason(item: Match) -> str:
             "Pacman marks it explicitly installed",
             pacman_history_event(target),
         ).replace("recorded", "pacman log", 1)
+    if item.kind == "APK":
+        constraint = apk_explicit_causes().get(item.ident, item.ident)
+        if constraint == item.ident:
+            return (
+                "listed explicitly in /etc/apk/world; "
+                "original APK command unavailable"
+            )
+        return (
+            f"installed to satisfy explicit /etc/apk/world constraint "
+            f"{constraint}; original APK command unavailable"
+        )
+    if item.kind == "OPKG":
+        return (
+            "marked as a user-installed package in the OPKG status database; "
+            "original command unavailable"
+        )
+    if item.kind == "XBPS":
+        return (
+            "marked manually installed in the XBPS package database; "
+            "original install command unavailable"
+        )
+    if item.kind == "Portage":
+        source = f" from {item.origin}" if item.origin else ""
+        return (
+            f"selected explicitly in the Portage @world set{source}; "
+            "original emerge command unavailable"
+        )
+    if item.kind == "Eopkg":
+        return (
+            "marked as explicitly installed by Eopkg; "
+            "original command unavailable"
+        )
+    if item.kind == "Swupd":
+        return (
+            "explicitly tracked as an installed Clear Linux bundle; "
+            "original swupd command unavailable"
+        )
     if item.kind == "Zypper":
         return recorded_event(
             "marked explicitly installed by Zypper",
@@ -2934,6 +3932,17 @@ def explicit_install_reason(item: Match) -> str:
             if source else
             "explicit entry in the current Nix profile; original source unavailable"
         )
+    if item.kind == "Nix Legacy":
+        source = f" at {item.origin}" if item.origin else ""
+        return (
+            f"explicit entry in the legacy Nix user profile{source}; "
+            "original nix-env command unavailable"
+        )
+    if item.kind == "Guix":
+        return (
+            f"explicit entry in Guix profile {item.origin}; "
+            "original Guix transaction command unavailable"
+        )
     if item.kind == "Cargo":
         source = cargo_install_source(item.ident)
         return (
@@ -2992,6 +4001,14 @@ def explicit_install_reason(item: Match) -> str:
 
 
 def dependency_install_reason(item: Match) -> str:
+    if item.kind == "Eopkg":
+        ok, automatic = eopkg_automatic_packages()
+        parent = automatic.get(item.ident, "") if ok else ""
+        if parent:
+            return (
+                f"installed automatically for {parent}; "
+                "original Eopkg command unavailable"
+            )
     report = dependency_report(item)
     cause = compact_dependency_cause(report)
     if not cause:
@@ -3039,6 +4056,31 @@ def dependency_install_reason(item: Match) -> str:
             "original install event unavailable"
         )
         return cause + detail
+    if item.kind == "APK":
+        return (
+            f"{cause}; absent from /etc/apk/world and therefore managed "
+            "automatically by APK; original install command unavailable"
+        )
+    if item.kind == "OPKG":
+        return (
+            f"{cause}; OPKG marks it automatically installed; "
+            "original install command unavailable"
+        )
+    if item.kind == "XBPS":
+        return (
+            f"{cause}; XBPS marks it automatically installed; "
+            "original install command unavailable"
+        )
+    if item.kind == "Portage":
+        return (
+            f"{cause}; absent from the Portage @world set; "
+            "original emerge command unavailable"
+        )
+    if item.kind == "Eopkg":
+        return (
+            f"{cause}; Eopkg marks it automatically installed; "
+            "original command unavailable"
+        )
     if item.kind == "Zypper":
         event = zypper_history_event(package_base(item.ident))
         detail = (
@@ -3126,6 +4168,24 @@ def install_reason(item: Match) -> str:
                 item,
                 f"{metadata}; RPM does not record whether it was explicitly "
                 "requested; original command and source unavailable",
+            )
+        if item.kind == "Slackware":
+            return archive_evidence(
+                item,
+                "registered in the Slackware pkgtools database; pkgtools "
+                "does not record explicit/dependency state or the original source",
+            )
+        if item.kind == "Eopkg":
+            return archive_evidence(
+                item,
+                "registered in the Eopkg package database; a reliable "
+                "explicit-install marker and original command are unavailable",
+            )
+        if item.kind == "OPKG":
+            return archive_evidence(
+                item,
+                "present in the OPKG base image or installed database; "
+                "explicit/dependency state and original command are unavailable",
             )
         return archive_evidence(
             item,
@@ -3268,6 +4328,127 @@ def native_removal_preview(
                 notes.append(
                     "Pacman rejected the preview, usually because another package requires the target."
                 )
+        elif kind == "APK":
+            code, output = capture_any(
+                ["apk", "del", "--simulate"] + identifiers)
+            removed = [
+                match.group(1)
+                for line in output.splitlines()
+                for match in [re.search(
+                    r"\b(?:Purging|Removing)\s+([A-Za-z0-9+_.-]+)",
+                    line,
+                )]
+                if match
+            ]
+            if code == 0 and removed:
+                planned.extend(removed)
+                orphans.extend(
+                    name for name in removed if name not in identifiers)
+            elif code == 0:
+                planned.extend(identifiers)
+                available = False
+                notes.append(
+                    "APK completed a simulation, but its additional removals "
+                    "could not be parsed reliably."
+                )
+            else:
+                available = False
+                notes.append("APK rejected the simulated removal.")
+        elif kind == "OPKG":
+            code, output = capture_any(
+                ["opkg", "--noaction", "remove"] + identifiers)
+            removed = [
+                match.group(1)
+                for line in output.splitlines()
+                for match in [re.search(
+                    r"\bRemoving package ([A-Za-z0-9+_.-]+)", line)]
+                if match
+            ]
+            if code == 0 and removed:
+                planned.extend(removed)
+            elif code == 0:
+                planned.extend(identifiers)
+                available = False
+                notes.append(
+                    "OPKG completed a no-action test, but its removal output "
+                    "could not be parsed reliably."
+                )
+            else:
+                available = False
+                notes.append(
+                    "OPKG rejected the no-action removal, usually because "
+                    "another package requires the target."
+                )
+        elif kind == "XBPS":
+            code, output = capture_any(
+                ["xbps-remove", "--dry-run", "--recursive"] + identifiers)
+            removed: list[str] = []
+            for line in output.splitlines():
+                fields = line.split()
+                if len(fields) >= 2 and fields[1].casefold() in {
+                        "remove", "removed", "uninstall"}:
+                    removed.append(split_xbps_pkgver(fields[0])[0])
+            if code == 0 and removed:
+                planned.extend(removed)
+                orphans.extend(
+                    name for name in removed if name not in identifiers)
+            elif code == 0:
+                planned.extend(identifiers)
+                available = False
+                notes.append(
+                    "XBPS completed a dry-run, but its additional removals "
+                    "could not be parsed reliably."
+                )
+            else:
+                available = False
+                notes.append(
+                    "XBPS rejected the dry-run, usually because reverse "
+                    "dependencies prevent removal."
+                )
+        elif kind == "Portage":
+            atoms = [
+                "=" + item.ident + (f"-{item.version}" if item.version else "")
+                for item in selected if item.kind == kind
+            ]
+            code, _output = capture_any([
+                "emerge", "--pretend", "--verbose", "--depclean", *atoms,
+            ])
+            planned.extend(identifiers)
+            available = False
+            notes.append(
+                "Portage completed a dependency-aware depclean preview, but "
+                "its removal set is intentionally left to emerge's final output."
+                if code == 0 else
+                "Portage rejected the dependency-aware depclean preview."
+            )
+        elif kind == "Slackware":
+            code, _output = capture_any(
+                ["removepkg", "-warn"] + identifiers)
+            planned.extend(identifiers)
+            available = False
+            notes.append(
+                "Slackware previewed package files, but pkgtools does not "
+                "track dependency impact."
+                if code == 0 else "Slackware's removepkg preview failed."
+            )
+        elif kind == "Eopkg":
+            planned.extend(identifiers)
+            available = False
+            code, _output = capture_any([
+                "eopkg", "--no-color", "remove", "--dry-run", *identifiers,
+            ])
+            notes.append(
+                "Eopkg completed a dry-run, but its removal set could not be "
+                "parsed reliably."
+                if code == 0 else "Eopkg's dry-run failed."
+            )
+        elif kind == "Swupd":
+            planned.extend(identifiers)
+            available = False
+            notes.append(
+                "Swupd checks installed bundle dependents during removal but "
+                "does not expose a read-only removal transaction."
+            )
         elif kind == "Zypper":
             code, output = capture_any(
                 ["zypper", "--non-interactive", "--dry-run", "remove"]
@@ -3312,11 +4493,14 @@ def native_removal_preview(
                 "Flatpak can also remove app-specific related extensions; "
                 "shared runtimes are not removed by this command."
             )
-        elif kind == "Nix":
+        elif kind in {"Nix", "Nix Legacy", "Guix"}:
             planned.extend(identifiers)
             notes.append(
-                "Nix removes the profile entries; unreachable store paths "
-                "remain until garbage collection."
+                ("Guix removes profile entries by creating a new profile "
+                 "generation; store items remain until garbage collection."
+                 if kind == "Guix" else
+                 "Nix removes the profile entries; unreachable store paths "
+                 "remain until garbage collection.")
             )
         elif kind in {
             "Homebrew Cask", "Cargo", "Pipx",
@@ -3378,15 +4562,18 @@ def dnf_protected_patterns() -> set[str]:
 
 def protection_reason(kind: str, name: str) -> str:
     base = package_base(name)
+    short_name = base.rsplit("/", 1)[-1]
     universal_core = {
-        "apk-tools", "apt", "base-files", "base-passwd", "basesystem",
+        "aaa_base", "aaa_glibc-solibs", "aaa_libraries", "apk-tools", "apt",
+        "base-files", "base-passwd", "base-system", "basesystem",
         "bash", "busybox", "coreutils", "dnf", "dnf5", "doas", "dpkg",
-        "filesystem", "glibc", "init", "libc6", "login", "musl", "openrc",
-        "pacman", "passwd", "portage", "rpm", "setup", "shadow",
-        "shadow-utils", "sudo", "systemd", "systemd-udev", "util-linux",
-        "xbps", "xbps-install", "yum", "zypper",
+        "eopkg", "filesystem", "glibc", "glibc-solibs", "init", "libc6",
+        "login", "musl", "openrc", "pacman", "passwd", "pkgtools", "portage",
+        "os-core", "rpm", "setup", "shadow", "swupd",
+        "shadow-utils", "sudo", "systemd", "systemd-udev", "util-linux", "opkg",
+        "transactional-update", "xbps", "xbps-install", "yum", "zypper",
     }
-    if base in universal_core or base.startswith("kernel"):
+    if short_name in universal_core or short_name.startswith("kernel"):
         return "core system package"
     if kind == "APT":
         if base in apt_held_packages():
@@ -3445,7 +4632,8 @@ def build_removal_plan(selected: list[Match]) -> RemovalPlan:
         report.direct_dependents or report.root_paths for report in reports)
     uncertain_kinds = {
         "APT", "DNF", "YUM", "Zypper", "RPM", "Pacman", "RPM-OSTree",
-        "Homebrew", "Snap", "Standalone",
+        "APK", "OPKG", "XBPS", "Portage", "Slackware", "Eopkg",
+        "Swupd", "Homebrew", "Snap", "Standalone",
     }
     if (protected_items or has_dependents
             or any(name not in orphans for name in additional)):
@@ -3792,11 +4980,12 @@ def find_user_data(selected: list[Match]) -> list[Path]:
 def privileged(command: list[str]) -> list[str]:
     if os.geteuid() == 0:
         return command
-    for helper in ("sudo", "doas"):
+    for helper in ("sudo", "doas", "pkexec"):
         if shutil.which(helper):
             return [helper] + command
     raise RuntimeError(
-        f"{command[0]} needs administrator privileges, but neither sudo nor doas is installed"
+        f"{command[0]} needs administrator privileges, but sudo, doas, and "
+        "pkexec are unavailable"
     )
 
 
@@ -3820,6 +5009,11 @@ def uninstall_command(item: Match, remove_data: bool) -> list[str]:
     if item.kind == "RPM-OSTree":
         return privileged(["rpm-ostree", "uninstall", item.ident])
     if item.kind == "Zypper":
+        if transactional_zypper_system():
+            return privileged([
+                "transactional-update", "--non-interactive", "pkg", "remove",
+                item.ident,
+            ])
         return privileged(["zypper", "remove", item.ident])
     if item.kind == "YUM":
         return privileged(["yum", "remove", item.ident])
@@ -3827,6 +5021,29 @@ def uninstall_command(item: Match, remove_data: bool) -> list[str]:
         return privileged(["rpm", "-e", item.ident])
     if item.kind == "Pacman":
         return privileged(["pacman", "-R", item.ident])
+    if item.kind == "APK":
+        return privileged(["apk", "del", item.ident])
+    if item.kind == "OPKG":
+        return privileged(["opkg", "remove", item.ident])
+    if item.kind == "XBPS":
+        return privileged([
+            "xbps-remove", "--recursive", "--yes", item.ident,
+        ])
+    if item.kind == "Portage":
+        atom = "=" + item.ident + (f"-{item.version}" if item.version else "")
+        command = [
+            "emerge", "--ask=n", "--verbose", "--depclean", atom,
+        ]
+        return command if item.scope == "user" else privileged(command)
+    if item.kind == "Slackware":
+        return privileged(["removepkg", item.ident])
+    if item.kind == "Eopkg":
+        command = ["eopkg", "remove", "--yes-all"]
+        if remove_data:
+            command.append("--purge")
+        return privileged(command + [item.ident])
+    if item.kind == "Swupd":
+        return privileged(["swupd", "bundle-remove", item.ident])
     if item.kind in {"Homebrew", "Homebrew Cask"}:
         command = ["brew", "uninstall"]
         if item.kind == "Homebrew Cask":
@@ -3847,6 +5064,13 @@ def uninstall_command(item: Match, remove_data: bool) -> list[str]:
         return command if item.scope == "user" else privileged(command)
     if item.kind == "Nix":
         return ["nix", "profile", "remove", item.ident]
+    if item.kind == "Nix Legacy":
+        return ["nix-env", "--uninstall", item.ident]
+    if item.kind == "Guix":
+        return [
+            "guix", "package", f"--profile={item.origin}",
+            f"--remove={item.ident}",
+        ]
     if item.kind == "Gear Lever" and item.path:
         command = gearlever_command()
         if not command:
@@ -3875,8 +5099,9 @@ def build_uninstall_batches(
     """Group packages when the real command safely accepts the same transaction."""
     groupable = {
         "Flatpak", "Snap", "APT", "DNF", "RPM-OSTree", "Zypper",
-        "YUM", "RPM", "Pacman", "Homebrew", "Homebrew Cask",
-        "NPM", "Nix", "Standalone",
+        "YUM", "RPM", "Pacman", "APK", "OPKG", "XBPS", "Portage", "Slackware",
+        "Eopkg", "Swupd", "Homebrew", "Homebrew Cask", "NPM", "Nix",
+        "Nix Legacy", "Guix", "Standalone",
     }
     grouped: dict[tuple[str, str], list[Match]] = {}
     order: list[tuple[str, str]] = []
@@ -3901,11 +5126,15 @@ def build_uninstall_batches(
         )
         command = uninstall_command(items[0], manager_cleanup)
         for item in items[1:]:
-            value = (
-                str(item.path)
-                if item.kind in {"AppImage", "Standalone"} and item.path
-                else item.ident
-            )
+            if item.kind in {"AppImage", "Standalone"} and item.path:
+                value = str(item.path)
+            elif item.kind == "Portage":
+                value = "=" + item.ident + (
+                    f"-{item.version}" if item.version else "")
+            elif item.kind == "Guix":
+                value = f"--remove={item.ident}"
+            else:
+                value = item.ident
             command.append(value)
         batches.append((items, command))
     return batches
@@ -3947,6 +5176,7 @@ def ask_cleanup(
         ("Flatpak", "Sandbox data and permissions"),
         ("APT", "Package-managed system configuration (not home data)"),
         ("Snap", "Do not create a recovery snapshot"),
+        ("Eopkg", "Package-managed changed configuration files (--purge)"),
         (
             "Homebrew Cask",
             "Declared associated files (--zap; may include shared files)",

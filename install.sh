@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-RELEASE_VERSION=0.16.0
+RELEASE_VERSION=0.17.0
 SOURCE_URL=${UNINSTALL_SOURCE_URL:-https://raw.githubusercontent.com/JaredTweed/uninstall/v${RELEASE_VERSION}/uninstall}
 PREFIX=${PREFIX:-/usr/local}
 DESTINATION="$PREFIX/bin/uninstall"
@@ -46,9 +46,11 @@ if [ ! -d "$destination_dir" ]; then
         sudo install -d -m 755 "$destination_dir"
     elif command -v doas >/dev/null 2>&1; then
         doas install -d -m 755 "$destination_dir"
+    elif command -v pkexec >/dev/null 2>&1; then
+        pkexec install -d -m 755 "$destination_dir"
     else
         printf '%s\n' \
-            "Cannot create $destination_dir; install sudo/doas, run as root, or set PREFIX." >&2
+            "Cannot create $destination_dir; install sudo/doas/pkexec, run as root, or set PREFIX." >&2
         exit 1
     fi
 fi
@@ -59,9 +61,11 @@ elif command -v sudo >/dev/null 2>&1; then
     sudo install -m 755 "$tmp_file" "$DESTINATION"
 elif command -v doas >/dev/null 2>&1; then
     doas install -m 755 "$tmp_file" "$DESTINATION"
+elif command -v pkexec >/dev/null 2>&1; then
+    pkexec install -m 755 "$tmp_file" "$DESTINATION"
 else
     printf '%s\n' \
-        "Cannot write to $destination_dir; install sudo/doas, run as root, or set PREFIX." >&2
+        "Cannot write to $destination_dir; install sudo/doas/pkexec, run as root, or set PREFIX." >&2
     exit 1
 fi
 
