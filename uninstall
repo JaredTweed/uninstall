@@ -22,7 +22,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable
 
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 
 
 @dataclass(frozen=True)
@@ -3121,10 +3121,16 @@ def show_compact_impact(plan: RemovalPlan) -> None:
             + ", ".join(display(name) for name in plan.protected_items)
         )
     if plan.level == "UNKNOWN":
-        print(
-            "\nWarning: a reliable preview was unavailable; "
-            "review the package manager's final transaction carefully."
-        )
+        if all(item.kind == "Standalone" for item in plan.selected):
+            print(
+                "\nExtra confirmation is required because related "
+                "standalone files cannot be identified."
+            )
+        else:
+            print(
+                "\nWarning: a reliable preview was unavailable; "
+                "review the removal command carefully."
+            )
 
 
 def choose(matches: list[Match], auto_select: bool = False) -> list[Match]:
@@ -3162,7 +3168,10 @@ def choose(matches: list[Match], auto_select: bool = False) -> list[Match]:
                     f"installed version {display(item.version)}"
                 )
         if item.kind == "Standalone":
-            print("      note: only this executable can be identified automatically")
+            print(
+                "      note: only this executable is known; "
+                "related files cannot be identified automatically"
+            )
     if auto_select and len(matches) == 1:
         print("\nAutomatically selected the only result.")
         return matches
@@ -3735,11 +3744,19 @@ def run_uninstall(
     for path in paths_to_remove:
         print("  " + display(shlex.join(cleanup_display_command(path))))
     if plan.level in {"HIGH", "UNKNOWN"}:
-        expected = ("REMOVE " + selected[0].ident if len(selected) == 1
-                    else "REMOVE ALL")
+        expected = (
+            "REMOVE " + display(selected[0].name)
+            if len(selected) == 1 else "REMOVE ALL"
+        )
         try:
+            impact_label = (
+                "Standalone removal"
+                if plan.level == "UNKNOWN" and all(
+                    item.kind == "Standalone" for item in selected)
+                else f"{plan.level.title()}-impact transaction"
+            )
             confirmation = input(
-                f"\n{plan.level.title()}-impact transaction. "
+                f"\n{impact_label}. "
                 f"Type '{expected}' to continue: "
             ).strip()
         except EOFError:

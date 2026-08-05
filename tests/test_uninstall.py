@@ -1237,6 +1237,39 @@ class UninstallTests(unittest.TestCase):
             self.assertEqual(MODULE.run_uninstall("tool"), 0)
         run.assert_not_called()
 
+    @patch.object(MODULE.subprocess, "run")
+    @patch.object(MODULE, "find_user_data", return_value=[])
+    @patch.object(MODULE, "build_removal_plan")
+    @patch.object(MODULE, "filter_dependency_matches")
+    @patch.object(MODULE, "annotate_roles")
+    @patch.object(MODULE, "find_matches")
+    def test_unknown_single_item_confirms_with_displayed_name_not_path(
+            self, find_matches, annotate, filter_matches, build_plan,
+            _find_data, run):
+        standalone_path = Path.home() / ".local/bin/edit"
+        item = MODULE.Match(
+            "Standalone", str(standalone_path), "edit",
+            scope="user", path=standalone_path,
+            role="explicit",
+        )
+        find_matches.return_value = [item]
+        annotate.return_value = [item]
+        filter_matches.return_value = ([item], 0)
+        build_plan.return_value = MODULE.RemovalPlan(
+            [item], [MODULE.DependencyReport(item, [], [])],
+            [item.ident], [], [], "UNKNOWN", False, [], [])
+        run.return_value.returncode = 0
+        with patch.object(MODULE, "preflight_file", return_value=""), \
+                patch.object(
+                    MODULE, "privileged",
+                    side_effect=lambda command: command,
+                ), \
+                patch("builtins.input", return_value="REMOVE edit") as prompt:
+            self.assertEqual(MODULE.run_uninstall("edit"), 0)
+        self.assertIn("Type 'REMOVE edit'", prompt.call_args.args[0])
+        run.assert_called_once_with(
+            ["rm", "--", str(standalone_path)], check=False)
+
     def test_removed_read_only_flags_are_rejected(self):
         for flag in ("--why", "--plan"):
             with self.subTest(flag=flag):

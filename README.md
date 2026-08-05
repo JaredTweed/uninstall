@@ -175,6 +175,8 @@ manager expects to remove. Routine internal details stay out of the way.
 dependents, newly unused dependencies, protected or critical packages, or an
 unavailable preview. High- and unknown-impact operations require typing the
 exact confirmation phrase instead of answering `y`.
+For one selected result, that phrase uses its displayed name (for example,
+`REMOVE edit`) rather than a potentially long internal identifier or path.
 
 When reliable metadata is available, the result line also shows the installed
 application size. The final estimate includes selected application files,
