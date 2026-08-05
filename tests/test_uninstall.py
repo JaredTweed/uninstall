@@ -1724,6 +1724,18 @@ class UninstallTests(unittest.TestCase):
                 [item],
             )
 
+    def test_standalone_result_uses_concise_related_files_note(self):
+        item = MODULE.Match(
+            "Standalone", "/home/test/.local/bin/edit", "edit")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            MODULE.choose([item], auto_select=True)
+        self.assertIn(
+            "note: related files cannot be identified automatically",
+            output.getvalue(),
+        )
+        self.assertNotIn("only this executable is known", output.getvalue())
+
     @patch.object(MODULE, "self_uninstall", return_value=0)
     @patch.object(MODULE.sys, "argv", ["uninstall", "uninstall"])
     def test_uninstall_uninstall_is_self_uninstall(self, self_uninstall):

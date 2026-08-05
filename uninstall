@@ -22,7 +22,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable
 
-VERSION = "0.15.0"
+VERSION = "0.15.1"
 
 
 @dataclass(frozen=True)
@@ -3168,10 +3168,7 @@ def choose(matches: list[Match], auto_select: bool = False) -> list[Match]:
                     f"installed version {display(item.version)}"
                 )
         if item.kind == "Standalone":
-            print(
-                "      note: only this executable is known; "
-                "related files cannot be identified automatically"
-            )
+            print("      note: related files cannot be identified automatically")
     if auto_select and len(matches) == 1:
         print("\nAutomatically selected the only result.")
         return matches
