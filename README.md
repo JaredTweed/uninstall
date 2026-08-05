@@ -191,6 +191,14 @@ are sent as one transaction—the same grouping used for its preview. Backends
 that accept one target at a time and mixed backends remain separate commands.
 User-data paths are deleted only if every command succeeds.
 
+Search backends run concurrently in a bounded four-worker pool. Within one
+invocation, each package-manager inventory is loaded once and reused for
+matching, ownership, dependency relationships, roles, provenance, and sizes.
+DNF history and package sizes are requested in batches, retained APT/Pacman/
+Zypper logs are indexed in one pass, and independent provenance and dry-run
+work overlaps. These are invocation-only caches: every new `uninstall` command
+reads the package managers' current state, with no daemon or stale disk cache.
+
 Dependency explanations are necessarily best effort: alternatives, rich
 conditional dependencies, pruned transaction history, package groups, and
 declarative systems do not always preserve the human reason an item was

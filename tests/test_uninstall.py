@@ -8,6 +8,7 @@ import unittest
 import os
 from contextlib import redirect_stdout
 from pathlib import Path
+from threading import Barrier, Event, Lock
 from unittest.mock import call, patch
 
 
@@ -23,6 +24,21 @@ SPEC.loader.exec_module(MODULE)
 
 class UninstallTests(unittest.TestCase):
     def setUp(self):
+        MODULE.norm.cache_clear()
+        MODULE.rpm_inventory.cache_clear()
+        MODULE.rpm_inventory_by_name.cache_clear()
+        MODULE.apt_inventory.cache_clear()
+        MODULE.apt_inventory_by_name.cache_clear()
+        MODULE.pacman_inventory.cache_clear()
+        MODULE.pacman_inventory_by_name.cache_clear()
+        MODULE.flatpak_inventory.cache_clear()
+        MODULE.snap_inventory.cache_clear()
+        MODULE.pipx_inventory.cache_clear()
+        MODULE.npm_global_prefix.cache_clear()
+        MODULE.npm_global_root.cache_clear()
+        MODULE.npm_inventory.cache_clear()
+        MODULE.homebrew_installed_metadata.cache_clear()
+        MODULE.cargo_install_records.cache_clear()
         MODULE.rpm_ostree_layered_packages.cache_clear()
         MODULE.zypper_userinstalled.cache_clear()
         MODULE.dnf_install_reasons.cache_clear()
@@ -34,12 +50,16 @@ class UninstallTests(unittest.TestCase):
         MODULE.dnf_installed_environment_inventory.cache_clear()
         MODULE.dnf_environment_details.cache_clear()
         MODULE.apt_history_event.cache_clear()
+        MODULE.apt_history_index.cache_clear()
         MODULE.pacman_history_event.cache_clear()
+        MODULE.pacman_history_index.cache_clear()
         MODULE.zypper_history_event.cache_clear()
+        MODULE.zypper_history_index.cache_clear()
         MODULE.legacy_rpm_history_event.cache_clear()
         MODULE.flatpak_history_entries.cache_clear()
         MODULE.flatpak_install_evidence.cache_clear()
         MODULE.snap_install_evidence.cache_clear()
+        MODULE.snap_changes.cache_clear()
         MODULE.homebrew_install_evidence.cache_clear()
         MODULE.nix_profile_metadata.cache_clear()
         MODULE.cargo_install_source.cache_clear()
@@ -55,6 +75,8 @@ class UninstallTests(unittest.TestCase):
         MODULE.dnf_protected_patterns.cache_clear()
         MODULE.path_disk_size.cache_clear()
         MODULE.package_installed_size.cache_clear()
+        MODULE._DNF_HISTORY_DETAILS.clear()
+        MODULE._DNF_INSTALL_RECORDS.clear()
 
     def test_installer_creates_a_completely_new_custom_prefix(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -140,16 +162,26 @@ class UninstallTests(unittest.TestCase):
             "org.freecad.FreeCAD",
         ])
 
-    @patch.object(MODULE, "capture", return_value="1000\n2000\n")
-    def test_rpm_size_sums_multiple_installed_architectures(self, capture):
+    @patch.object(MODULE, "rpm_inventory_by_name")
+    def test_rpm_size_sums_multiple_installed_architectures(self, inventory):
+        inventory.return_value = {
+            "example": (
+                MODULE.RpmPackageRecord(
+                    "example", "1", "", 1000, "", ""),
+                MODULE.RpmPackageRecord(
+                    "example", "1", "", 2000, "", ""),
+            ),
+        }
         self.assertEqual(
             MODULE.package_installed_size(
                 "DNF", "example", "system"),
             3000,
         )
-        capture.assert_called_once_with([
-            "rpm", "-q", "--qf", "%{SIZE}\\n", "--", "example",
-        ])
+        with patch.object(
+                MODULE.shutil, "which", return_value="/usr/bin/rpm"), \
+                patch.object(MODULE, "rpm_manager", return_value="DNF"):
+            [detected] = MODULE.detect_rpm("example")
+        self.assertEqual(detected.size_bytes, 3000)
 
     @patch.object(MODULE, "capture", return_value="2048")
     def test_apt_installed_size_converts_kibibytes(self, _capture):
@@ -169,6 +201,168 @@ class UninstallTests(unittest.TestCase):
                 "Pacman", "example", "system"),
             int(2.3 * 1024 * 1024),
         )
+
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/tool")
+    @patch.object(MODULE, "capture")
+    def test_rpm_inventory_is_shared_by_search_graph_size_and_metadata(
+            self, capture, _which):
+        capture.return_value = (
+            "P\texample\t1.2-3\tExample application\t4096\t"
+            "Tue Aug  4 10:00:00 2026\tExample Vendor\n"
+            "R\tlibexample.so.1()(64bit)\n"
+            "S\texample\n"
+            "P\tlibexample\t1.0-1\tExample library\t2048\t"
+            "Mon Aug  3 10:00:00 2026\tExample Vendor\n"
+            "S\tlibexample.so.1()(64bit)\n"
+        )
+
+        found = MODULE.detect_rpm("example")
+        reverse, complete = MODULE.rpm_reverse_graph()
+        size = MODULE.package_installed_size(
+            "DNF", "example", "system")
+        metadata = MODULE.rpm_install_metadata("example")
+
+        self.assertEqual([item.ident for item in found], ["example", "libexample"])
+        self.assertTrue(complete)
+        self.assertEqual(reverse["libexample"], {"example"})
+        self.assertEqual(size, 4096)
+        self.assertEqual(metadata, (
+            "Tue Aug  4 10:00:00 2026", "Example Vendor"))
+        capture.assert_called_once()
+
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/dpkg-query")
+    @patch.object(MODULE, "capture")
+    def test_apt_inventory_is_shared_by_search_graph_and_size(
+            self, capture, _which):
+        capture.return_value = (
+            "ii \tapp\t1.0\tExample app\t4\tlibfoo\t\t\n"
+            "ii \tlibfoo\t1.0\tExample library\t2\t\t\tvirtual-foo\n"
+        )
+        [item] = MODULE.detect_dpkg("Example app")
+        reverse, complete = MODULE.apt_reverse_graph()
+        size = MODULE.package_installed_size("APT", "app", "system")
+
+        self.assertTrue(complete)
+        self.assertEqual(reverse["libfoo"], {"app"})
+        self.assertEqual(size, 4096)
+        self.assertEqual(item.size_bytes, 4096)
+        capture.assert_called_once()
+
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/pacman")
+    @patch.object(MODULE, "capture")
+    def test_pacman_inventory_is_shared_by_search_role_graph_and_size(
+            self, capture, _which):
+        capture.return_value = (
+            "Name : app\nVersion : 1.0\nInstalled Size : 4 KiB\n"
+            "Install Reason : Explicitly installed\nRequired By : None\n\n"
+            "Name : libfoo\nVersion : 1.0\nInstalled Size : 2 KiB\n"
+            "Install Reason : Installed as a dependency\nRequired By : app\n"
+        )
+        [item] = MODULE.detect_pacman("app")
+        [annotated] = MODULE.annotate_roles([item])
+        reverse, complete = MODULE.pacman_reverse_graph()
+        size = MODULE.package_installed_size("Pacman", "app", "system")
+
+        self.assertEqual(annotated.role, "explicit")
+        self.assertTrue(complete)
+        self.assertEqual(reverse["libfoo"], {"app"})
+        self.assertEqual(size, 4096)
+        capture.assert_called_once()
+
+    @patch.object(MODULE, "package_installed_size")
+    def test_inventory_sizes_avoid_per_package_size_queries(self, package_size):
+        matches = [
+            MODULE.Match("DNF", "one", "one", size_bytes=100),
+            MODULE.Match("DNF", "two", "two", size_bytes=200),
+        ]
+        self.assertEqual(
+            [item.size_bytes for item in MODULE.add_installed_sizes(matches)],
+            [100, 200],
+        )
+        package_size.assert_not_called()
+
+    def test_invocation_cache_computes_a_concurrent_key_only_once(self):
+        entered = Event()
+        release = Event()
+        calls = 0
+        calls_lock = Lock()
+
+        @MODULE.synchronized_lru_cache(maxsize=1)
+        def inventory(scope):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            entered.set()
+            self.assertTrue(release.wait(timeout=2))
+            return scope
+
+        with MODULE.ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(inventory, "system")
+            self.assertTrue(entered.wait(timeout=2))
+            second = executor.submit(inventory, "system")
+            release.set()
+            self.assertEqual(first.result(timeout=2), "system")
+            self.assertEqual(second.result(timeout=2), "system")
+        self.assertEqual(calls, 1)
+
+    def test_discovery_runs_with_four_bounded_workers(self):
+        barrier = Barrier(4, timeout=2)
+        active = 0
+        peak = 0
+        active_lock = Lock()
+
+        def make_detector(number):
+            def detector(query):
+                nonlocal active, peak
+                with active_lock:
+                    active += 1
+                    peak = max(peak, active)
+                barrier.wait()
+                with active_lock:
+                    active -= 1
+                return [MODULE.Match(
+                    "Test", f"item-{number}", f"{query}-{number}")]
+            return detector
+
+        detectors = tuple(make_detector(number) for number in range(8))
+        with patch.object(MODULE, "DETECTORS", detectors):
+            found = MODULE.find_matches("example")
+        self.assertEqual(len(found), 8)
+        self.assertEqual(peak, 4)
+
+    def test_provenance_sizes_dependency_graph_and_preview_overlap(self):
+        item = MODULE.Match("Flatpak", "org.example.App", "Example")
+        decoration_barrier = Barrier(2, timeout=2)
+
+        def reasons(matches):
+            decoration_barrier.wait()
+            return [MODULE.replace(match, reason="requested") for match in matches]
+
+        def sizes(matches):
+            decoration_barrier.wait()
+            return [MODULE.replace(match, size_bytes=1024) for match in matches]
+
+        with patch.object(MODULE, "add_install_reasons", side_effect=reasons), \
+                patch.object(MODULE, "add_installed_sizes", side_effect=sizes):
+            decorated = MODULE.decorate_matches([item])
+        self.assertEqual((decorated[0].reason, decorated[0].size_bytes),
+                         ("requested", 1024))
+
+        plan_barrier = Barrier(2, timeout=2)
+
+        def report(target):
+            plan_barrier.wait()
+            return MODULE.DependencyReport(target, [], [], True)
+
+        def preview(_selected):
+            plan_barrier.wait()
+            return [item.ident], [], True, []
+
+        with patch.object(MODULE, "dependency_report", side_effect=report), \
+                patch.object(MODULE, "native_removal_preview", side_effect=preview):
+            plan = MODULE.build_removal_plan([item])
+        self.assertTrue(plan.preview_available)
+        self.assertEqual(plan.planned_removals, [item.ident])
 
     def test_command_lookup_tolerates_unambiguous_case_mistakes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -797,6 +991,62 @@ class UninstallTests(unittest.TestCase):
         self.assertIsNotNone(record)
         self.assertEqual(record.reason, "User")
 
+    @patch.object(MODULE.shutil, "which")
+    @patch.object(MODULE, "capture")
+    def test_dnf_history_batches_many_packages_and_transactions(
+            self, capture, which):
+        which.side_effect = (
+            lambda command: "/usr/bin/dnf5" if command == "dnf5" else None)
+
+        def output(command):
+            if command[:3] == ["dnf5", "history", "list"]:
+                return MODULE.json.dumps([
+                    {"id": 7, "command_line": "dnf install alpha-tool"},
+                    {"id": 9, "command_line": "dnf install beta"},
+                ])
+            if command[:3] == ["dnf5", "history", "info"]:
+                return MODULE.json.dumps([
+                    {
+                        "id": 7,
+                        "description": "dnf install alpha-tool",
+                        "packages": [{
+                            "nevra": "alpha-tool-0:1.0-1.x86_64",
+                            "action": "Install",
+                            "reason": "User",
+                        }],
+                    },
+                    {
+                        "id": 9,
+                        "description": "dnf install beta",
+                        "packages": [{
+                            "nevra": "beta-0:2.0-1.x86_64",
+                            "action": "Install",
+                            "reason": "Weak Dependency",
+                        }],
+                    },
+                ])
+            self.fail(f"unexpected command: {command}")
+
+        capture.side_effect = output
+        MODULE.prefetch_dnf_install_records(("alpha-tool", "beta"))
+
+        self.assertEqual(
+            MODULE.dnf_install_record("alpha-tool").transaction_id, 7)
+        self.assertEqual(
+            MODULE.dnf_install_record("beta").reason, "Weak Dependency")
+        self.assertEqual(capture.call_count, 2)
+        self.assertEqual(
+            capture.call_args_list[0].args[0],
+            [
+                "dnf5", "history", "list",
+                "--contains-pkgs=alpha-tool,beta", "--json",
+            ],
+        )
+        self.assertEqual(
+            capture.call_args_list[1].args[0],
+            ["dnf5", "history", "info", "7", "9", "--json"],
+        )
+
     @patch.object(
         MODULE, "dnf_environment_details",
         return_value=(
@@ -967,6 +1217,47 @@ class UninstallTests(unittest.TestCase):
             ("2026-07-01 10:00:00", "installed from repo-oss"),
         )
 
+    def test_each_history_file_is_parsed_once_for_many_packages(self):
+        cases = (
+            (
+                MODULE.apt_history_index,
+                MODULE.apt_history_event,
+                "Start-Date: 2026-07-01  10:20:00\n"
+                "Commandline: apt install alpha beta\n"
+                "Install: alpha:amd64 (1.0), beta:amd64 (2.0)\n",
+                ("alpha", "beta"),
+            ),
+            (
+                MODULE.pacman_history_index,
+                MODULE.pacman_history_event,
+                "[2026-07-01T10:00:00+0000] [PACMAN] "
+                "Running 'pacman -S alpha beta'\n"
+                "[2026-07-01T10:00:01+0000] [ALPM] installed alpha (1-1)\n"
+                "[2026-07-01T10:00:02+0000] [ALPM] installed beta (1-1)\n",
+                ("alpha", "beta"),
+            ),
+            (
+                MODULE.zypper_history_index,
+                MODULE.zypper_history_event,
+                "2026-07-01 10:00:00|install|alpha|1|x86_64|root|repo-a|x|\n"
+                "2026-07-01 10:00:01|install|beta|1|x86_64|root|repo-b|x|\n",
+                ("alpha", "beta"),
+            ),
+        )
+        fake_log = Path("/var/log/fake-history")
+        for index_function, event_function, text, packages in cases:
+            with self.subTest(index=index_function.__name__):
+                index_function.cache_clear()
+                event_function.cache_clear()
+                with patch.object(
+                        MODULE.Path, "glob", return_value=[fake_log]), \
+                        patch.object(
+                            MODULE, "read_history_file",
+                            return_value=text) as read:
+                    self.assertIsNotNone(event_function(packages[0]))
+                    self.assertIsNotNone(event_function(packages[1]))
+                read.assert_called_once_with(fake_log)
+
     def test_legacy_dnf_history_parser_recovers_original_command(self):
         text = (
             "Transaction ID : 42\n"
@@ -982,7 +1273,7 @@ class UninstallTests(unittest.TestCase):
     @patch.object(MODULE, "capture")
     def test_flatpak_evidence_includes_remote_and_install_event(self, capture):
         capture.side_effect = [
-            "flathub\n",
+            "org.freecad.FreeCAD\tFreeCAD\t1.0\tflathub\n",
             MODULE.json.dumps([
                 {
                     "time": "Jul 1 10:00:00",
@@ -1002,6 +1293,34 @@ class UninstallTests(unittest.TestCase):
                 "install org.freecad.FreeCAD",
             ),
         )
+
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/flatpak")
+    @patch.object(MODULE, "capture")
+    def test_flatpak_search_and_provenance_share_inventory_origin(
+            self, capture, _which):
+        def output(command):
+            if command[:3] == ["flatpak", "list", "--app"]:
+                if "--system" in command:
+                    return "org.example.App\tExample App\t1.0\tflathub\n"
+                return ""
+            if command[:2] == ["flatpak", "history"]:
+                return "[]"
+            self.fail(f"unexpected command: {command}")
+
+        capture.side_effect = output
+        [item] = MODULE.detect_flatpak("example app")
+        remote, _event = MODULE.flatpak_install_evidence(
+            item.ident, item.scope)
+
+        self.assertEqual(remote, "flathub")
+        self.assertFalse(any(
+            command.args[0][:2] == ["flatpak", "info"]
+            for command in capture.call_args_list
+        ))
+        self.assertEqual(sum(
+            command.args[0][:3] == ["flatpak", "list", "--app"]
+            for command in capture.call_args_list
+        ), 2)
 
     @patch.object(MODULE, "capture")
     def test_snap_evidence_includes_channel_publisher_and_change(
@@ -1028,6 +1347,32 @@ class UninstallTests(unittest.TestCase):
             MODULE.homebrew_install_evidence("Homebrew", "ripgrep"),
             ("homebrew/core", True),
         )
+
+    @patch.object(MODULE.shutil, "which", return_value="/opt/homebrew/bin/brew")
+    @patch.object(MODULE, "capture")
+    def test_homebrew_search_role_and_source_use_one_json_inventory(
+            self, capture, _which):
+        capture.return_value = MODULE.json.dumps({
+            "formulae": [{
+                "name": "ripgrep",
+                "tap": "homebrew/core",
+                "installed": [{
+                    "version": "14.1.1",
+                    "installed_on_request": True,
+                }],
+            }],
+            "casks": [],
+        })
+        [item] = MODULE.detect_homebrew("ripgrep")
+        [annotated] = MODULE.annotate_roles([item])
+        reason = MODULE.install_reason(annotated)
+
+        self.assertEqual((annotated.version, annotated.role),
+                         ("14.1.1", "explicit"))
+        self.assertIn("homebrew/core", reason)
+        capture.assert_called_once_with([
+            "brew", "info", "--json=v2", "--installed",
+        ])
 
     @patch.object(MODULE, "nix_profile_metadata")
     def test_nix_reason_uses_original_flake_reference(self, metadata):
@@ -1326,6 +1671,21 @@ class UninstallTests(unittest.TestCase):
 
     @patch.object(MODULE.shutil, "which")
     @patch.object(MODULE, "capture")
+    def test_non_node_command_does_not_query_the_npm_prefix(
+            self, capture, which):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "edit"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
+            which.side_effect = {
+                "edit": str(executable),
+                "npm": "/usr/bin/npm",
+            }.get
+            MODULE.detect_executable_owner("edit")
+        capture.assert_not_called()
+
+    @patch.object(MODULE.shutil, "which")
+    @patch.object(MODULE, "capture")
     def test_exposed_global_npm_command_uses_npm_uninstaller(
             self, capture, which):
         with tempfile.TemporaryDirectory() as directory:
@@ -1400,6 +1760,30 @@ class UninstallTests(unittest.TestCase):
             ("httpie", "3.2.4"),
         )
 
+    @patch.object(MODULE.shutil, "which", return_value="/usr/bin/pipx")
+    @patch.object(MODULE, "capture")
+    def test_pipx_source_reuses_the_discovery_inventory(
+            self, capture, _which):
+        capture.return_value = MODULE.json.dumps({
+            "venvs": {
+                "httpie": {
+                    "metadata": {
+                        "main_package": {
+                            "package": "httpie",
+                            "package_version": "3.2.4",
+                            "package_or_url": "https://example.test/httpie.whl",
+                        },
+                    },
+                },
+            },
+        })
+        [item] = MODULE.pipx_inventory("user")
+        self.assertEqual(
+            MODULE.pipx_install_source(item.ident, item.scope),
+            "https://example.test/httpie.whl",
+        )
+        capture.assert_called_once_with(["pipx", "list", "--json"])
+
     @patch.object(MODULE.shutil, "which")
     @patch.object(MODULE, "capture", return_value=(
         "ripgrep v14.1.1:\n"
@@ -1416,6 +1800,31 @@ class UninstallTests(unittest.TestCase):
             result = MODULE.detect_cargo("rg")
         self.assertEqual((result[0].kind, result[0].ident), ("Cargo", "ripgrep"))
         self.assertEqual(result[0].provides, "/home/test/.cargo/bin/rg")
+
+    @patch.object(MODULE.shutil, "which")
+    def test_cargo_search_and_source_share_local_install_metadata(self, which):
+        with tempfile.TemporaryDirectory() as directory:
+            cargo_root = Path(directory)
+            (cargo_root / ".crates2.json").write_text(
+                MODULE.json.dumps({
+                    "installs": {
+                        "ripgrep 14.1.1 (registry+https://example.test/index)": {
+                            "bins": ["rg"],
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+            which.side_effect = {
+                "cargo": "/usr/bin/cargo",
+                "rg": str(cargo_root / "bin/rg"),
+            }.get
+            with patch.dict(os.environ, {"CARGO_HOME": str(cargo_root)}):
+                [item] = MODULE.detect_cargo("rg")
+                source = MODULE.cargo_install_source(item.ident)
+
+        self.assertEqual((item.ident, item.version), ("ripgrep", "14.1.1"))
+        self.assertEqual(source, "registry+https://example.test/index")
 
     def test_nix_profile_parser_handles_named_and_indexed_formats(self):
         text = (

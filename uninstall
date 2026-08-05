@@ -17,12 +17,31 @@ import sys
 import unicodedata
 import xml.etree.ElementTree as ET
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
+from threading import Lock
 from typing import Callable, Iterable
 
-VERSION = "0.15.1"
+VERSION = "0.16.0"
+
+
+def synchronized_lru_cache(maxsize: int):
+    """Provide an invocation cache that computes each key only once."""
+    def decorate(function):
+        cached = lru_cache(maxsize=maxsize)(function)
+        lock = Lock()
+
+        @wraps(function)
+        def wrapper(*args, **kwargs):
+            with lock:
+                return cached(*args, **kwargs)
+
+        wrapper.cache_clear = cached.cache_clear
+        wrapper.cache_info = cached.cache_info
+        return wrapper
+    return decorate
 
 
 @dataclass(frozen=True)
@@ -78,6 +97,34 @@ class DnfInstallRecord:
     repository: str = ""
 
 
+@dataclass(frozen=True)
+class RpmPackageRecord:
+    name: str
+    version: str
+    summary: str
+    size_bytes: int | None
+    install_time: str
+    vendor: str
+    requires: tuple[str, ...] = ()
+    recommends: tuple[str, ...] = ()
+    suggests: tuple[str, ...] = ()
+    supplements: tuple[str, ...] = ()
+    enhances: tuple[str, ...] = ()
+    provides: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class AptPackageRecord:
+    ident: str
+    version: str
+    summary: str
+    size_bytes: int | None
+    depends: str = ""
+    pre_depends: str = ""
+    provides: str = ""
+
+
+@lru_cache(maxsize=16384)
 def norm(value: str) -> str:
     decomposed = unicodedata.normalize("NFKD", value.casefold())
     return "".join(
@@ -168,20 +215,36 @@ def package_installed_size(
         ]).strip()
         return int(output) if output.isdigit() else parse_size(output)
     if kind == "APT":
+        record = apt_inventory_by_name().get(ident)
+        if not record:
+            record = apt_inventory_by_name().get(package_base(ident))
+        if record and record.size_bytes is not None:
+            return record.size_bytes
         output = capture([
             "dpkg-query", "-W", "-f=${Installed-Size}", ident,
         ]).strip()
         return int(output) * 1024 if output.isdigit() else None
     if kind in {"DNF", "YUM", "Zypper", "RPM", "RPM-OSTree"}:
+        records = rpm_inventory_by_name().get(package_base(ident), ())
+        sizes = [
+            record.size_bytes for record in records
+            if record.size_bytes is not None
+        ]
+        if sizes:
+            return sum(sizes)
         output = capture([
             "rpm", "-q", "--qf", "%{SIZE}\\n", "--", ident,
         ]).strip()
-        sizes = [
+        fallback_sizes = [
             int(line) for line in output.splitlines()
             if line.strip().isdigit()
         ]
-        return sum(sizes) if sizes else None
+        return sum(fallback_sizes) if fallback_sizes else None
     if kind == "Pacman":
+        record = pacman_inventory_by_name().get(ident)
+        retained = parse_size(record.get("Installed Size", "")) if record else None
+        if retained is not None:
+            return retained
         output = capture(["pacman", "-Qi", ident])
         for line in output.splitlines():
             if line.casefold().startswith("installed size") and ":" in line:
@@ -203,7 +266,7 @@ def package_installed_size(
     if kind in {"AppImage", "Gear Lever", "Standalone"} and path_text:
         return file_disk_size(Path(path_text))
     if kind == "NPM":
-        root = capture(["npm", "root", "--global"]).strip()
+        root = npm_global_root()
         return path_disk_size(str(Path(root) / ident)) if root else None
     if kind == "Pipx":
         candidates = (
@@ -221,16 +284,21 @@ def package_installed_size(
 
 
 def add_installed_sizes(matches: list[Match]) -> list[Match]:
-    return [
-        replace(
+    def add_size(item: Match) -> Match:
+        if item.size_bytes is not None:
+            return item
+        return replace(
             item,
             size_bytes=package_installed_size(
                 item.kind, item.ident, item.scope,
                 str(item.path or item.provides or ""),
             ),
         )
-        for item in matches
-    ]
+
+    if len(matches) < 2:
+        return [add_size(item) for item in matches]
+    with ThreadPoolExecutor(max_workers=min(4, len(matches))) as executor:
+        return list(executor.map(add_size, matches))
 
 
 def configure_output() -> None:
@@ -362,6 +430,86 @@ def rpm_manager() -> str:
     return "RPM" if shutil.which("rpm") else ""
 
 
+@synchronized_lru_cache(maxsize=1)
+def rpm_inventory() -> tuple[RpmPackageRecord, ...]:
+    """Load RPM discovery, size, metadata, and dependency data once."""
+    if not shutil.which("rpm"):
+        return ()
+    text = capture([
+        "rpm", "-qa", "--qf",
+        "P\\t%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{SUMMARY}\\t%{SIZE}\\t"
+        "%{INSTALLTIME:date}\\t%{VENDOR}\\n"
+        "[R\\t%{REQUIRENAME}\\n]"
+        "[W\\t%{RECOMMENDNAME}\\n]"
+        "[G\\t%{SUGGESTNAME}\\n]"
+        "[U\\t%{SUPPLEMENTNAME}\\n]"
+        "[E\\t%{ENHANCENAME}\\n]"
+        "[S\\t%{PROVIDENAME}\\n]",
+    ])
+    records: list[RpmPackageRecord] = []
+    current: dict[str, object] | None = None
+
+    def finish() -> None:
+        nonlocal current
+        if not current:
+            return
+        records.append(RpmPackageRecord(
+            name=str(current["name"]),
+            version=str(current["version"]),
+            summary=str(current["summary"]),
+            size_bytes=current["size"] if isinstance(
+                current["size"], int) else None,
+            install_time=str(current["install_time"]),
+            vendor=str(current["vendor"]),
+            requires=tuple(current["requires"]),
+            recommends=tuple(current["recommends"]),
+            suggests=tuple(current["suggests"]),
+            supplements=tuple(current["supplements"]),
+            enhances=tuple(current["enhances"]),
+            provides=tuple(current["provides"]),
+        ))
+        current = None
+
+    relation_keys = {
+        "R": "requires", "W": "recommends", "G": "suggests",
+        "U": "supplements", "E": "enhances", "S": "provides",
+    }
+    for line in text.splitlines():
+        if line.startswith("P\t"):
+            finish()
+            fields = line.split("\t", 6)
+            if len(fields) < 2 or not fields[1]:
+                continue
+            current = {
+                "name": fields[1],
+                "version": fields[2] if len(fields) > 2 else "",
+                "summary": fields[3] if len(fields) > 3 else "",
+                "size": (int(fields[4])
+                         if len(fields) > 4 and fields[4].isdigit() else None),
+                "install_time": fields[5] if len(fields) > 5 else "",
+                "vendor": fields[6] if len(fields) > 6 else "",
+                "requires": [], "recommends": [], "suggests": [],
+                "supplements": [], "enhances": [], "provides": [],
+            }
+        elif current and len(line) > 2 and line[1] == "\t":
+            key = relation_keys.get(line[0])
+            value = line[2:].strip()
+            if key and value:
+                values = current[key]
+                if isinstance(values, list):
+                    values.append(value)
+    finish()
+    return tuple(records)
+
+
+@synchronized_lru_cache(maxsize=1)
+def rpm_inventory_by_name() -> dict[str, tuple[RpmPackageRecord, ...]]:
+    grouped: dict[str, list[RpmPackageRecord]] = defaultdict(list)
+    for record in rpm_inventory():
+        grouped[record.name].append(record)
+    return {name: tuple(records) for name, records in grouped.items()}
+
+
 @lru_cache(maxsize=1)
 def rpm_ostree_layered_packages() -> tuple[bool, set[str]]:
     if not shutil.which("rpm-ostree"):
@@ -404,45 +552,108 @@ def rpm_ostree_layered_packages() -> tuple[bool, set[str]]:
     return True, names
 
 
-def detect_flatpak(query: str) -> list[Match]:
+@synchronized_lru_cache(maxsize=2)
+def flatpak_inventory(scope: str) -> tuple[Match, ...]:
     if not shutil.which("flatpak"):
-        return []
+        return ()
+    text = capture([
+        "flatpak", "list", "--app", f"--{scope}",
+        "--columns=application,name,version,origin",
+    ])
+    found: list[Match] = []
+    for line in text.splitlines():
+        fields = line.split("\t")
+        if len(fields) >= 2:
+            found.append(Match(
+                "Flatpak", fields[0], fields[1],
+                fields[2] if len(fields) > 2 else "", scope,
+                origin=fields[3] if len(fields) > 3 else "",
+            ))
+    return tuple(found)
+
+
+def detect_flatpak(query: str) -> list[Match]:
     found: list[Match] = []
     for scope in ("user", "system"):
-        text = capture(["flatpak", "list", "--app", f"--{scope}",
-                        "--columns=application,name,version"])
-        for line in text.splitlines():
-            fields = line.split("\t")
-            if len(fields) >= 2 and relevant(query, fields[0], fields[1]):
-                found.append(Match("Flatpak", fields[0], fields[1],
-                                   fields[2] if len(fields) > 2 else "", scope))
+        found.extend(
+            item for item in flatpak_inventory(scope)
+            if relevant(query, item.ident, item.name)
+        )
     return found
 
 
-def detect_snap(query: str) -> list[Match]:
+@synchronized_lru_cache(maxsize=1)
+def snap_inventory() -> tuple[Match, ...]:
     if not shutil.which("snap"):
-        return []
+        return ()
     found: list[Match] = []
     for line in capture(["snap", "list"]).splitlines()[1:]:
         fields = line.split()
-        if len(fields) >= 2 and relevant(query, fields[0]):
+        if len(fields) >= 2:
             found.append(Match("Snap", fields[0], fields[0], fields[1], "system"))
+    return tuple(found)
+
+
+def detect_snap(query: str) -> list[Match]:
+    found = [item for item in snap_inventory() if relevant(query, item.ident)]
     return found
+
+
+@synchronized_lru_cache(maxsize=1)
+def apt_inventory() -> tuple[AptPackageRecord, ...]:
+    fmt = (
+        "${db:Status-Abbrev}\\t${binary:Package}\\t${Version}\\t"
+        "${binary:Summary}\\t${Installed-Size}\\t${Depends}\\t"
+        "${Pre-Depends}\\t${Provides}\\n"
+    )
+    records: list[AptPackageRecord] = []
+    for line in capture(["dpkg-query", "-W", "-f=" + fmt]).splitlines():
+        fields = line.split("\t", 7)
+        if len(fields) == 6 and fields[0] == "P":
+            status, ident, depends, pre_depends, provides = fields[1:]
+            if len(status) > 1 and status[1] == "i" and ident:
+                records.append(AptPackageRecord(
+                    ident, "", "", None,
+                    depends, pre_depends, provides,
+                ))
+            continue
+        if len(fields) == 4:
+            status, ident, version, summary = fields
+            if len(status) > 1 and status[1] == "i" and ident:
+                records.append(AptPackageRecord(
+                    ident, version, summary, None))
+            continue
+        installed = fields and len(fields[0]) > 1 and fields[0][1] == "i"
+        if not installed or len(fields) != 8:
+            continue
+        records.append(AptPackageRecord(
+            ident=fields[1],
+            version=fields[2],
+            summary=fields[3],
+            size_bytes=(int(fields[4]) * 1024
+                        if fields[4].isdigit() else None),
+            depends=fields[5],
+            pre_depends=fields[6],
+            provides=fields[7],
+        ))
+    return tuple(records)
+
+
+@synchronized_lru_cache(maxsize=1)
+def apt_inventory_by_name() -> dict[str, AptPackageRecord]:
+    return {record.ident: record for record in apt_inventory()}
 
 
 def detect_dpkg(query: str) -> list[Match]:
     if not shutil.which("dpkg-query"):
         return []
-    fmt = "${db:Status-Abbrev}\\t${binary:Package}\\t${Version}\\t${binary:Summary}\\n"
     found: list[Match] = []
-    for line in capture(["dpkg-query", "-W", "-f=" + fmt]).splitlines():
-        fields = line.split("\t", 3)
-        installed = fields and len(fields[0]) > 1 and fields[0][1] == "i"
-        if (installed and len(fields) >= 3
-                and relevant(query, fields[1],
-                             fields[3] if len(fields) > 3 else "")):
-            found.append(Match("APT", fields[1], fields[1],
-                               fields[2], "system"))
+    for record in apt_inventory():
+        if relevant(query, record.ident, record.summary):
+            found.append(Match(
+                "APT", record.ident, record.ident, record.version, "system",
+                size_bytes=record.size_bytes,
+            ))
     return found
 
 
@@ -458,15 +669,19 @@ def detect_rpm(query: str) -> list[Match]:
     )
     if kind == "RPM-OSTree" and not layered_ok:
         return []
-    fmt = "%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{SUMMARY}\\n"
     found: list[Match] = []
-    for line in capture(["rpm", "-qa", "--qf", fmt]).splitlines():
-        fields = line.split("\t", 2)
-        if (len(fields) >= 2
-                and (kind != "RPM-OSTree" or fields[0] in layered)
-                and relevant(
-                    query, fields[0], fields[2] if len(fields) > 2 else "")):
-            found.append(Match(kind, fields[0], fields[0], fields[1], "system"))
+    for name, records in rpm_inventory_by_name().items():
+        record = records[-1]
+        if ((kind != "RPM-OSTree" or name in layered)
+                and relevant(query, name, record.summary)):
+            retained_sizes = [
+                item.size_bytes for item in records
+                if item.size_bytes is not None
+            ]
+            found.append(Match(
+                kind, name, name, record.version, "system",
+                size_bytes=(sum(retained_sizes) if retained_sizes else None),
+            ))
     return found
 
 
@@ -474,17 +689,71 @@ def detect_pacman(query: str) -> list[Match]:
     if not shutil.which("pacman"):
         return []
     found: list[Match] = []
-    for line in capture(["pacman", "-Q"]).splitlines():
-        fields = line.rsplit(maxsplit=1)
-        if fields and relevant(query, fields[0]):
-            found.append(Match("Pacman", fields[0], fields[0],
-                               fields[1] if len(fields) > 1 else "", "system"))
+    for record in pacman_inventory():
+        name = record.get("Name", "")
+        if name and relevant(query, name):
+            found.append(Match(
+                "Pacman", name, name, record.get("Version", ""), "system",
+                size_bytes=parse_size(record.get("Installed Size", "")),
+            ))
     return found
+
+
+@synchronized_lru_cache(maxsize=1)
+def homebrew_installed_metadata(
+) -> dict[tuple[str, str], tuple[str, str, bool | None]]:
+    if not shutil.which("brew"):
+        return {}
+    try:
+        payload = json.loads(capture([
+            "brew", "info", "--json=v2", "--installed",
+        ]))
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    metadata: dict[tuple[str, str], tuple[str, str, bool | None]] = {}
+    for kind, key in (("Homebrew", "formulae"),
+                      ("Homebrew Cask", "casks")):
+        entries = payload.get(key, [])
+        if not isinstance(entries, list):
+            continue
+        for details in entries:
+            if not isinstance(details, dict):
+                continue
+            ident = str(details.get("name") or details.get("token") or "")
+            if not ident:
+                continue
+            installed = details.get("installed", [])
+            latest = (
+                installed[-1]
+                if isinstance(installed, list) and installed else {}
+            )
+            if isinstance(latest, dict):
+                version = str(latest.get("version") or "")
+                raw_requested = latest.get("installed_on_request")
+                requested = (
+                    raw_requested if isinstance(raw_requested, bool) else None)
+            else:
+                version = str(latest) if latest else ""
+                requested = None
+            if not version:
+                version = str(details.get("version") or "")
+            metadata[(kind, ident)] = (
+                version, str(details.get("tap") or ""), requested)
+    return metadata
 
 
 def detect_homebrew(query: str) -> list[Match]:
     if not shutil.which("brew"):
         return []
+    metadata = homebrew_installed_metadata()
+    if metadata:
+        return [
+            Match(kind, ident, ident, version, "user", origin=tap)
+            for (kind, ident), (version, tap, _requested) in metadata.items()
+            if relevant(query, ident)
+        ]
     found: list[Match] = []
     for kind, option in (("Homebrew", "--formula"), ("Homebrew Cask", "--cask")):
         for line in capture(["brew", "list", option, "--versions"]).splitlines():
@@ -499,7 +768,13 @@ def gearlever_command() -> list[str]:
     if shutil.which("gearlever"):
         return ["gearlever"]
     if shutil.which("flatpak"):
-        return ["flatpak", "run", "it.mijorus.gearlever"]
+        app_id = "it.mijorus.gearlever"
+        if any(
+            item.ident == app_id
+            for scope in ("user", "system")
+            for item in flatpak_inventory(scope)
+        ):
+            return ["flatpak", "run", app_id]
     return []
 
 
@@ -579,77 +854,157 @@ def detect_gearlever(query: str) -> list[Match]:
     return found
 
 
-def detect_pipx(query: str) -> list[Match]:
+@synchronized_lru_cache(maxsize=2)
+def pipx_inventory(scope: str) -> tuple[Match, ...]:
     if not shutil.which("pipx"):
-        return []
+        return ()
+    extra = ["--global"] if scope == "system" else []
     found: list[Match] = []
-    for scope, extra in (("user", []), ("system", ["--global"])):
-        text = capture(["pipx", "list", "--json"] + extra)
-        parsed = False
-        try:
-            payload = json.loads(text)
-        except (json.JSONDecodeError, TypeError):
-            payload = {}
-        venvs = payload.get("venvs", {}) if isinstance(payload, dict) else {}
-        if isinstance(venvs, dict):
-            for environment, metadata in venvs.items():
-                if not isinstance(environment, str) or not isinstance(metadata, dict):
-                    continue
-                details = metadata.get("metadata", metadata)
-                main = (
-                    details.get("main_package", {})
-                    if isinstance(details, dict) else {}
-                )
-                package = (
-                    main.get("package", environment)
-                    if isinstance(main, dict) else environment
-                )
-                version = (
-                    main.get("package_version", "")
-                    if isinstance(main, dict) else ""
-                )
-                if not isinstance(package, str):
-                    package = environment
-                if not isinstance(version, str):
-                    version = ""
-                if relevant(query, environment, package):
-                    found.append(Match(
-                        "Pipx", environment, package, version, scope))
-            parsed = bool(text)
-        if parsed:
-            continue
-        for line in capture(["pipx", "list", "--short"] + extra).splitlines():
-            fields = line.split()
-            if fields and relevant(query, fields[0]):
-                found.append(Match(
-                    "Pipx", fields[0], fields[0],
-                    fields[1] if len(fields) > 1 else "", scope))
+    text = capture(["pipx", "list", "--json"] + extra)
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        payload = {}
+    venvs = payload.get("venvs", {}) if isinstance(payload, dict) else {}
+    if isinstance(venvs, dict):
+        for environment, metadata in venvs.items():
+            if not isinstance(environment, str) or not isinstance(metadata, dict):
+                continue
+            details = metadata.get("metadata", metadata)
+            main = (
+                details.get("main_package", {})
+                if isinstance(details, dict) else {}
+            )
+            package = (
+                main.get("package", environment)
+                if isinstance(main, dict) else environment
+            )
+            version = (
+                main.get("package_version", "")
+                if isinstance(main, dict) else ""
+            )
+            source = (
+                main.get("package_or_url") or package
+                if isinstance(main, dict) else package
+            )
+            if not isinstance(package, str):
+                package = environment
+            if not isinstance(version, str):
+                version = ""
+            found.append(Match(
+                "Pipx", environment, package, version, scope,
+                origin=source if isinstance(source, str) else "",
+            ))
+        if text:
+            return tuple(found)
+    for line in capture(["pipx", "list", "--short"] + extra).splitlines():
+        fields = line.split()
+        if fields:
+            found.append(Match(
+                "Pipx", fields[0], fields[0],
+                fields[1] if len(fields) > 1 else "", scope))
+    return tuple(found)
+
+
+def detect_pipx(query: str) -> list[Match]:
+    found: list[Match] = []
+    for scope in ("user", "system"):
+        found.extend(
+            item for item in pipx_inventory(scope)
+            if relevant(query, item.ident, item.name)
+        )
     return found
 
 
-def detect_npm(query: str) -> list[Match]:
+@synchronized_lru_cache(maxsize=1)
+def npm_global_prefix() -> str:
+    return capture(["npm", "prefix", "--global"]).strip()
+
+
+@synchronized_lru_cache(maxsize=1)
+def npm_global_root() -> str:
+    return capture(["npm", "root", "--global"]).strip()
+
+
+@synchronized_lru_cache(maxsize=1)
+def npm_inventory() -> tuple[Match, ...]:
     if not shutil.which("npm"):
-        return []
-    prefix = capture(["npm", "prefix", "--global"]).strip()
+        return ()
+    prefix = npm_global_prefix()
     try:
         payload = json.loads(capture(["npm", "list", "--global", "--depth=0", "--json"]))
     except (json.JSONDecodeError, TypeError):
-        return []
+        return ()
     dependencies = payload.get("dependencies", {}) if isinstance(payload, dict) else {}
     scope = ("user" if prefix
              and path_is_within(Path(prefix).expanduser(), Path.home())
              else "system")
     found: list[Match] = []
     for name, metadata in dependencies.items():
-        if relevant(query, name):
-            version = metadata.get("version", "") if isinstance(metadata, dict) else ""
-            found.append(Match("NPM", name, name, version, scope))
+        version = metadata.get("version", "") if isinstance(metadata, dict) else ""
+        found.append(Match("NPM", name, name, version, scope))
+    return tuple(found)
+
+
+def detect_npm(query: str) -> list[Match]:
+    found = [item for item in npm_inventory() if relevant(query, item.ident)]
     return found
+
+
+def cargo_install_root() -> Path:
+    return Path(
+        os.environ.get("CARGO_INSTALL_ROOT")
+        or os.environ.get("CARGO_HOME")
+        or Path.home() / ".cargo"
+    ).expanduser()
+
+
+@synchronized_lru_cache(maxsize=1)
+def cargo_install_records(
+) -> dict[str, tuple[str, str, tuple[str, ...]]]:
+    try:
+        payload = json.loads((cargo_install_root() / ".crates2.json").read_text(
+            encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    installs = payload.get("installs", {}) if isinstance(payload, dict) else {}
+    if not isinstance(installs, dict):
+        return {}
+    records: dict[str, tuple[str, str, tuple[str, ...]]] = {}
+    pattern = re.compile(r"^(.+?)\s+(\S+)\s+\((.+)\)$")
+    for key, details in installs.items():
+        match = pattern.match(str(key))
+        if not match:
+            continue
+        ident, version, source = match.groups()
+        raw_bins = details.get("bins", []) if isinstance(details, dict) else []
+        bins = tuple(
+            value for value in raw_bins if isinstance(value, str)
+        ) if isinstance(raw_bins, list) else ()
+        records[ident] = (version, source, bins)
+    return records
 
 
 def detect_cargo(query: str) -> list[Match]:
     if not shutil.which("cargo"):
         return []
+    retained = cargo_install_records()
+    if retained:
+        found: list[Match] = []
+        cargo_bin = (cargo_install_root() / "bin").resolve()
+        for crate, (version, _source, binaries) in retained.items():
+            if not (relevant(query, crate)
+                    or any(relevant(query, item) for item in binaries)):
+                continue
+            command_path = shutil.which(query) if query in binaries else ""
+            if (command_path
+                    and Path(command_path).resolve().parent != cargo_bin):
+                command_path = ""
+            found.append(Match(
+                "Cargo", crate, crate, version, "user",
+                provides=command_path or "",
+            ))
+        return found
     found: list[Match] = []
     crate = ""
     version = ""
@@ -658,11 +1013,7 @@ def detect_cargo(query: str) -> list[Match]:
     def add_crate() -> None:
         if crate and (relevant(query, crate) or any(relevant(query, item) for item in binaries)):
             command_path = shutil.which(query) if query in binaries else ""
-            cargo_root = Path(
-                os.environ.get("CARGO_INSTALL_ROOT")
-                or os.environ.get("CARGO_HOME")
-                or Path.home() / ".cargo"
-            ).expanduser()
+            cargo_root = cargo_install_root()
             if (command_path and
                     Path(command_path).resolve().parent != (cargo_root / "bin").resolve()):
                 command_path = ""
@@ -727,8 +1078,16 @@ def detect_nix(query: str) -> list[Match]:
     executable = find_executable(query) if Path(query).name == query else None
     resolved = str(Path(executable).resolve()) if executable else ""
     found: list[Match] = []
-    text = capture(["nix", "profile", "list", "--json"])
-    entries = parse_nix_profile_json(text)
+    metadata = nix_profile_metadata()
+    entries: list[tuple[str, list[str]]] = []
+    for ident, details in metadata.items():
+        raw_paths = details.get(
+            "storePaths", details.get("store_paths", []))
+        stores = [
+            path for path in raw_paths if isinstance(path, str)
+        ] if isinstance(raw_paths, list) else []
+        if stores:
+            entries.append((ident, stores))
     if not entries:
         entries = parse_nix_profile(capture(["nix", "profile", "list"]))
     for ident, stores in entries:
@@ -761,11 +1120,9 @@ def snap_command_owner(query: str, visible: Path) -> list[Match]:
         if len(fields) >= 2 and fields[1] == visible.name:
             package = fields[0].split(".", 1)[0]
             break
-    for line in capture(["snap", "list", package]).splitlines()[1:]:
-        fields = line.split()
-        if len(fields) >= 2 and fields[0] == package:
-            return [Match("Snap", package, package, fields[1], "system",
-                          provides=str(visible))]
+    for item in snap_inventory():
+        if item.ident == package:
+            return [replace(item, provides=str(visible))]
     return []
 
 
@@ -776,15 +1133,9 @@ def flatpak_command_owner(visible: Path) -> list[Match]:
     app_id = visible.name
     found: list[Match] = []
     for scope in ("user", "system"):
-        text = capture(["flatpak", "list", "--app", f"--{scope}",
-                        "--columns=application,name,version"])
-        for line in text.splitlines():
-            fields = line.split("\t")
-            if fields and fields[0] == app_id:
-                found.append(Match("Flatpak", app_id,
-                                   fields[1] if len(fields) > 1 else app_id,
-                                   fields[2] if len(fields) > 2 else "", scope,
-                                   provides=str(visible)))
+        for item in flatpak_inventory(scope):
+            if item.ident == app_id:
+                found.append(replace(item, provides=str(visible)))
     return found
 
 
@@ -841,7 +1192,10 @@ def detect_executable_owner(query: str) -> list[Match]:
                       provides=str(visible))]
 
     node_parts = path_after(resolved.parts, "node_modules")
-    npm_prefix = capture(["npm", "prefix", "--global"]).strip() if shutil.which("npm") else ""
+    npm_prefix = (
+        npm_global_prefix()
+        if node_parts and shutil.which("npm") else ""
+    )
     npm_prefix_path = Path(npm_prefix).resolve() if npm_prefix else None
     npm_exposed = bool(
         npm_prefix_path and visible.parent.resolve() == npm_prefix_path / "bin"
@@ -1116,8 +1470,12 @@ def find_matches(query: str) -> list[Match]:
     if archive_matches:
         return sorted(archive_matches, key=lambda item: score(item, query))
     matches: list[Match] = []
-    for detector in DETECTORS:
-        matches.extend(detector(query))
+    detectors = tuple(DETECTORS)
+    if detectors:
+        with ThreadPoolExecutor(max_workers=min(4, len(detectors))) as executor:
+            for detected in executor.map(
+                    lambda detector: detector(query), detectors):
+                matches.extend(detected)
     unique = {(m.kind, m.ident, m.scope): m for m in matches}
     results = list(unique.values())
     gearlever_paths = {
@@ -1294,18 +1652,44 @@ def annotate_roles(matches: list[Match]) -> list[Match]:
                     "explicit" if item.ident in explicit else "dependency")
 
     if by_kind.get("Pacman") and shutil.which("pacman"):
-        ok, explicit = command_lines(["pacman", "-Qqe"])
-        if ok:
+        inventory = pacman_inventory_by_name()
+        if inventory:
             for item in by_kind["Pacman"]:
-                role = "explicit" if item.ident in explicit else "dependency"
-                roles[(item.kind, item.ident, item.scope)] = role
+                reason = inventory.get(item.ident, {}).get(
+                    "Install Reason", "").casefold()
+                if reason:
+                    role = (
+                        "dependency" if "dependency" in reason
+                        else "explicit"
+                    )
+                    roles[(item.kind, item.ident, item.scope)] = role
+        else:
+            ok, explicit = command_lines(["pacman", "-Qqe"])
+            if ok:
+                for item in by_kind["Pacman"]:
+                    role = (
+                        "explicit" if item.ident in explicit else "dependency")
+                    roles[(item.kind, item.ident, item.scope)] = role
 
     if by_kind.get("Homebrew") and shutil.which("brew"):
-        ok, explicit = command_lines([
-            "brew", "list", "--formula", "--installed-on-request",
-        ])
+        metadata = homebrew_installed_metadata()
+        unresolved: list[Match] = []
+        for item in by_kind["Homebrew"]:
+            details = metadata.get((item.kind, item.ident))
+            requested = details[2] if details else None
+            if requested is None:
+                unresolved.append(item)
+            else:
+                roles[(item.kind, item.ident, item.scope)] = (
+                    "explicit" if requested else "dependency")
+        if unresolved:
+            ok, explicit = command_lines([
+                "brew", "list", "--formula", "--installed-on-request",
+            ])
+        else:
+            ok, explicit = True, set()
         if ok:
-            for item in by_kind["Homebrew"]:
+            for item in unresolved:
                 role = "explicit" if item.ident in explicit else "dependency"
                 roles[(item.kind, item.ident, item.scope)] = role
 
@@ -1347,47 +1731,22 @@ def rpm_dependency_graph() -> tuple[
         dict[str, set[str]], dict[str, set[str]],
         dict[tuple[str, str], set[str]], bool,
 ]:
-    text = capture([
-        "rpm", "-qa", "--qf",
-        "P\\t%{NAME}\\n"
-        "[R\\t%{REQUIRENAME}\\n]"
-        "[W\\t%{RECOMMENDNAME}\\n]"
-        "[G\\t%{SUGGESTNAME}\\n]"
-        "[U\\t%{SUPPLEMENTNAME}\\n]"
-        "[E\\t%{ENHANCENAME}\\n]"
-        "[S\\t%{PROVIDENAME}\\n]",
-    ])
-    if not text:
+    inventory = rpm_inventory()
+    if not inventory:
         return {}, {}, {}, False
     dependency_maps: dict[str, dict[str, set[str]]] = {
         relation: defaultdict(set)
         for relation in (
             "requires", "recommends", "suggests", "supplements", "enhances")
     }
-    line_relations = {
-        "R": "requires",
-        "W": "recommends",
-        "G": "suggests",
-        "U": "supplements",
-        "E": "enhances",
-    }
     provide_map: dict[str, set[str]] = defaultdict(set)
-    packages: set[str] = set()
-    current = ""
-    for line in text.splitlines():
-        if line.startswith("P\t"):
-            current = line[2:].strip()
-            if current:
-                packages.add(current)
-        elif (current and len(line) > 2 and line[1] == "\t"
-              and line[0] in line_relations):
-            capability = line[2:].strip()
-            if capability and not capability.startswith("rpmlib("):
-                dependency_maps[line_relations[line[0]]][current].add(capability)
-        elif current and line.startswith("S\t"):
-            provided = line[2:].strip()
-            if provided:
-                provide_map[current].add(provided)
+    packages = {record.name for record in inventory}
+    for record in inventory:
+        for relation in dependency_maps:
+            for capability in getattr(record, relation):
+                if capability and not capability.startswith("rpmlib("):
+                    dependency_maps[relation][record.name].add(capability)
+        provide_map[record.name].update(record.provides)
     providers: dict[str, set[str]] = defaultdict(set)
     for package in packages:
         providers[package].add(package)
@@ -1446,32 +1805,24 @@ def split_debian_relationships(value: str) -> list[list[str]]:
 
 @lru_cache(maxsize=1)
 def apt_reverse_graph() -> tuple[dict[str, set[str]], bool]:
-    fmt = (
-        "P\\t${db:Status-Abbrev}\\t${binary:Package}\\t${Depends}\\t${Pre-Depends}"
-        "\\t${Provides}\\n"
-    )
-    text = capture(["dpkg-query", "-W", "-f=" + fmt])
-    if not text:
+    inventory = apt_inventory()
+    if not inventory:
         return {}, False
     installed_names: set[str] = set()
-    records: list[tuple[str, str, str, str]] = []
     virtuals: dict[str, set[str]] = defaultdict(set)
-    for line in text.splitlines():
-        fields = line.split("\t", 5)
-        is_installed = len(fields) > 1 and len(fields[1]) > 1 and fields[1][1] == "i"
-        if len(fields) < 6 or fields[0] != "P" or not is_installed:
-            continue
-        package = fields[2]
+    for record in inventory:
+        package = record.ident
         installed_names.update({package, package_base(package)})
-        records.append((package, fields[3], fields[4], fields[5]))
-        for provided in fields[5].split(","):
+        for provided in record.provides.split(","):
             capability = re.sub(r"\s*\(.*?\)", "", provided).strip()
             if capability:
                 virtuals[capability].add(package)
     reverse: dict[str, set[str]] = defaultdict(set)
-    for dependent, depends, pre_depends, _provides in records:
+    for record in inventory:
+        dependent = record.ident
         for alternatives in split_debian_relationships(
-                ",".join(value for value in (depends, pre_depends) if value)):
+                ",".join(value for value in (
+                    record.depends, record.pre_depends) if value)):
             candidate_providers: set[str] = set()
             for alternative in alternatives:
                 if alternative in installed_names:
@@ -1508,13 +1859,27 @@ def parse_pacman_info(text: str) -> list[dict[str, str]]:
     return records
 
 
+@synchronized_lru_cache(maxsize=1)
+def pacman_inventory() -> tuple[dict[str, str], ...]:
+    return tuple(parse_pacman_info(capture(["pacman", "-Qi"])))
+
+
+@synchronized_lru_cache(maxsize=1)
+def pacman_inventory_by_name() -> dict[str, dict[str, str]]:
+    return {
+        record["Name"]: record
+        for record in pacman_inventory()
+        if record.get("Name")
+    }
+
+
 @lru_cache(maxsize=1)
 def pacman_reverse_graph() -> tuple[dict[str, set[str]], bool]:
-    text = capture(["pacman", "-Qi"])
-    if not text:
+    inventory = pacman_inventory()
+    if not inventory:
         return {}, False
     reverse: dict[str, set[str]] = defaultdict(set)
-    for record in parse_pacman_info(text):
+    for record in inventory:
         package = record.get("Name", "")
         required_by = record.get("Required By", "")
         if not package or required_by == "None":
@@ -1580,65 +1945,81 @@ def relationship_root_paths(
     return detailed, complete
 
 
+_DNF_HISTORY_DETAILS: dict[int, dict[str, object]] = {}
+_DNF_INSTALL_RECORDS: dict[str, DnfInstallRecord | None] = {}
+_DNF_HISTORY_LOCK = Lock()
+
+
+def dnf_history_transactions(
+        transaction_ids: Iterable[int],
+) -> dict[int, dict[str, object]]:
+    requested = tuple(dict.fromkeys(transaction_ids))
+    missing = [
+        transaction_id for transaction_id in requested
+        if transaction_id not in _DNF_HISTORY_DETAILS
+    ]
+    if missing:
+        try:
+            details = json.loads(capture([
+                "dnf5", "history", "info",
+                *(str(transaction_id) for transaction_id in missing),
+                "--json",
+            ]))
+        except (json.JSONDecodeError, TypeError):
+            details = []
+        if isinstance(details, list):
+            for detail in details:
+                if (isinstance(detail, dict)
+                        and isinstance(detail.get("id"), int)):
+                    _DNF_HISTORY_DETAILS[detail["id"]] = detail
+    return {
+        transaction_id: _DNF_HISTORY_DETAILS[transaction_id]
+        for transaction_id in requested
+        if transaction_id in _DNF_HISTORY_DETAILS
+    }
+
+
 @lru_cache(maxsize=64)
 def dnf_history_transaction(transaction_id: int) -> dict[str, object] | None:
-    try:
-        details = json.loads(capture([
-            "dnf5", "history", "info", str(transaction_id), "--json",
-        ]))
-    except (json.JSONDecodeError, TypeError):
-        return None
-    if not isinstance(details, list) or not details:
-        return None
-    detail = details[0]
-    return detail if isinstance(detail, dict) else None
+    return dnf_history_transactions((transaction_id,)).get(transaction_id)
 
 
-@lru_cache(maxsize=64)
-def dnf_install_record(target: str) -> DnfInstallRecord | None:
-    if not shutil.which("dnf5"):
-        return None
-    text = capture([
-        "dnf5", "history", "list",
-        f"--contains-pkgs={target}", "--json",
-    ])
-    try:
-        transactions = json.loads(text)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    if not isinstance(transactions, list):
-        return None
-    valid_transactions = [
-        transaction for transaction in transactions
-        if isinstance(transaction, dict)
-        and isinstance(transaction.get("id"), int)
+def prefetch_dnf_install_records(targets: Iterable[str]) -> None:
+    requested = tuple(dict.fromkeys(package_base(target) for target in targets))
+    unresolved = [
+        target for target in requested if target not in _DNF_INSTALL_RECORDS
     ]
-    for transaction in sorted(
-            valid_transactions, key=lambda value: value["id"]):
-        transaction_id = transaction["id"]
-        detail = dnf_history_transaction(transaction_id)
-        if not detail:
-            continue
-        packages = detail.get("packages", [])
-        if not isinstance(packages, list):
-            continue
-        for package in packages:
-            if not isinstance(package, dict):
+    if not unresolved or not shutil.which("dnf5"):
+        return
+    with _DNF_HISTORY_LOCK:
+        unresolved = [
+            target for target in unresolved
+            if target not in _DNF_INSTALL_RECORDS
+        ]
+        if not unresolved:
+            return
+        try:
+            transactions = json.loads(capture([
+                "dnf5", "history", "list",
+                "--contains-pkgs=" + ",".join(unresolved), "--json",
+            ]))
+        except (json.JSONDecodeError, TypeError):
+            transactions = []
+        valid = [
+            transaction for transaction in transactions
+            if isinstance(transaction, dict)
+            and isinstance(transaction.get("id"), int)
+        ] if isinstance(transactions, list) else []
+        summaries = {
+            transaction["id"]: transaction for transaction in valid
+        }
+        details = dnf_history_transactions(summaries)
+        unresolved_set = set(unresolved)
+        for transaction_id in sorted(details):
+            detail = details[transaction_id]
+            packages = detail.get("packages", [])
+            if not isinstance(packages, list):
                 continue
-            nevra = package.get("nevra", "")
-            action = str(package.get("action", ""))
-            if (not isinstance(nevra, str)
-                    or not re.match(
-                        rf"^{re.escape(target)}-\d+:", nevra)
-                    or action.casefold() != "install"):
-                continue
-            command = str(
-                detail.get("description")
-                or transaction.get("command_line")
-                or "unknown command"
-            )
-            reason = str(package.get("reason") or "unknown reason")
-            repository = str(package.get("repository") or "")
             raw_groups = detail.get("groups", [])
             raw_environments = detail.get("environments", [])
             groups = tuple(
@@ -1656,10 +2037,43 @@ def dnf_install_record(target: str) -> DnfInstallRecord | None:
                     environment.get("action", "")).casefold() == "install"
                 and isinstance(environment.get("environment"), str)
             ) if isinstance(raw_environments, list) else ()
-            return DnfInstallRecord(
-                transaction_id, command, reason, groups, environments,
-                repository)
-    return None
+            for package in packages:
+                if not isinstance(package, dict):
+                    continue
+                nevra = package.get("nevra", "")
+                match = (
+                    re.match(r"^(.*)-\d+:", nevra)
+                    if isinstance(nevra, str) else None
+                )
+                target = match.group(1) if match else ""
+                if (target not in unresolved_set
+                        or target in _DNF_INSTALL_RECORDS
+                        or str(package.get("action", "")).casefold()
+                        != "install"):
+                    continue
+                summary = summaries.get(transaction_id, {})
+                command = str(
+                    detail.get("description")
+                    or summary.get("command_line")
+                    or "unknown command"
+                )
+                _DNF_INSTALL_RECORDS[target] = DnfInstallRecord(
+                    transaction_id,
+                    command,
+                    str(package.get("reason") or "unknown reason"),
+                    groups,
+                    environments,
+                    str(package.get("repository") or ""),
+                )
+        for target in unresolved:
+            _DNF_INSTALL_RECORDS.setdefault(target, None)
+
+
+@lru_cache(maxsize=64)
+def dnf_install_record(target: str) -> DnfInstallRecord | None:
+    target = package_base(target)
+    prefetch_dnf_install_records((target,))
+    return _DNF_INSTALL_RECORDS.get(target)
 
 
 @lru_cache(maxsize=64)
@@ -2063,15 +2477,43 @@ def parse_apt_history(
 
 @lru_cache(maxsize=64)
 def apt_history_event(target: str) -> tuple[str, str] | None:
-    events: list[tuple[str, str]] = []
+    return apt_history_index().get(package_base(target))
+
+
+@lru_cache(maxsize=1)
+def apt_history_index() -> dict[str, tuple[str, str]]:
+    events: dict[str, tuple[str, str]] = {}
     try:
         paths = list(Path("/var/log/apt").glob("history.log*"))
     except OSError:
         paths = []
     for path in paths:
         text = read_history_file(path)
-        events.extend(parse_apt_history(text, target))
-    return min(events, key=lambda item: item[0]) if events else None
+        for block in re.split(r"\n\s*\n", text):
+            fields: dict[str, str] = {}
+            current_key = ""
+            for line in block.splitlines():
+                if ": " in line and line and not line[0].isspace():
+                    current_key, value = line.split(": ", 1)
+                    fields[current_key] = value.strip()
+                elif current_key and line[:1].isspace():
+                    fields[current_key] += " " + line.strip()
+            command = fields.get("Commandline", "")
+            if not command:
+                continue
+            package_lines = " ".join(
+                fields.get(key, "")
+                for key in ("Install", "Reinstall", "Upgrade")
+            )
+            event = (fields.get("Start-Date", ""), command)
+            for match in re.finditer(
+                    r"(?:^|,\s*)([A-Za-z0-9+.-]+)"
+                    r"(?::[A-Za-z0-9_-]+)?\s+\(", package_lines):
+                package = match.group(1)
+                retained = events.get(package)
+                if retained is None or event[0] < retained[0]:
+                    events[package] = event
+    return events
 
 
 def parse_pacman_history(
@@ -2092,18 +2534,36 @@ def parse_pacman_history(
 
 @lru_cache(maxsize=64)
 def pacman_history_event(target: str) -> tuple[str, str] | None:
+    return pacman_history_index().get(package_base(target))
+
+
+@lru_cache(maxsize=1)
+def pacman_history_index() -> dict[str, tuple[str, str]]:
     try:
         paths = list(Path("/var/log").glob("pacman.log*"))
     except OSError:
-        return None
-    events = [
-        event for event in (
-            parse_pacman_history(read_history_file(path), target)
-            for path in paths
-        )
-        if event
-    ]
-    return min(events, key=lambda item: item[0]) if events else None
+        return {}
+    events: dict[str, tuple[str, str]] = {}
+    pattern = re.compile(r"\[ALPM\] installed ([^ ]+) \(")
+    for path in paths:
+        current_command = ""
+        for line in read_history_file(path).splitlines():
+            if "[PACMAN] Running " in line:
+                current_command = line.split(
+                    "[PACMAN] Running ", 1)[1].strip("'")
+            match = pattern.search(line)
+            if not match:
+                continue
+            package = package_base(match.group(1))
+            date = line[1:line.find("]")] if line.startswith("[") else ""
+            event = (
+                date,
+                current_command or f"installed {package}",
+            )
+            retained = events.get(package)
+            if retained is None or event[0] < retained[0]:
+                events[package] = event
+    return events
 
 
 def parse_zypper_history(
@@ -2126,18 +2586,34 @@ def parse_zypper_history(
 
 @lru_cache(maxsize=64)
 def zypper_history_event(target: str) -> tuple[str, str] | None:
+    return zypper_history_index().get(package_base(target))
+
+
+@lru_cache(maxsize=1)
+def zypper_history_index() -> dict[str, tuple[str, str]]:
     try:
         paths = list(Path("/var/log/zypp").glob("history*"))
     except OSError:
-        return None
-    events = [
-        event for event in (
-            parse_zypper_history(read_history_file(path), target)
-            for path in paths
-        )
-        if event
-    ]
-    return min(events, key=lambda item: item[0]) if events else None
+        return {}
+    events: dict[str, tuple[str, str]] = {}
+    for path in paths:
+        for line in read_history_file(path).splitlines():
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split("|")
+            if len(fields) < 7 or fields[1].casefold() != "install":
+                continue
+            package = package_base(fields[2])
+            repository = fields[6].strip()
+            detail = (
+                f"installed from {repository}"
+                if repository else f"installed {package}"
+            )
+            event = (fields[0].strip(), detail)
+            retained = events.get(package)
+            if retained is None or event[0] < retained[0]:
+                events[package] = event
+    return events
 
 
 def parse_legacy_rpm_history_info(
@@ -2199,9 +2675,14 @@ def flatpak_history_entries(scope: str) -> tuple[dict[str, object], ...]:
 def flatpak_install_evidence(
         ident: str, scope: str,
 ) -> tuple[str, str]:
-    origin = capture([
-        "flatpak", "info", f"--{scope}", "--show-origin", ident,
-    ]).strip()
+    origin = next((
+        item.origin for item in flatpak_inventory(scope)
+        if item.ident == ident
+    ), "")
+    if not origin:
+        origin = capture([
+            "flatpak", "info", f"--{scope}", "--show-origin", ident,
+        ]).strip()
     event: dict[str, object] | None = None
     for entry in flatpak_history_entries(scope):
         if entry.get("application") != ident:
@@ -2233,7 +2714,7 @@ def snap_install_evidence(ident: str) -> tuple[str, str, str]:
         elif key.strip().casefold() == "publisher":
             publisher = value.strip()
     change = ""
-    for line in capture(["snap", "changes"]).splitlines()[1:]:
+    for line in snap_changes():
         fields = line.split(maxsplit=4)
         if len(fields) == 5 and ident.casefold() in fields[4].casefold():
             if re.search(r"\binstall\b", fields[4], flags=re.IGNORECASE):
@@ -2242,10 +2723,18 @@ def snap_install_evidence(ident: str) -> tuple[str, str, str]:
     return tracking, publisher, change
 
 
+@lru_cache(maxsize=1)
+def snap_changes() -> tuple[str, ...]:
+    return tuple(capture(["snap", "changes"]).splitlines()[1:])
+
+
 @lru_cache(maxsize=64)
 def homebrew_install_evidence(
         kind: str, ident: str,
 ) -> tuple[str, bool | None]:
+    retained = homebrew_installed_metadata().get((kind, ident))
+    if retained:
+        return retained[1], retained[2]
     try:
         payload = json.loads(capture(["brew", "info", "--json=v2", ident]))
     except (json.JSONDecodeError, TypeError):
@@ -2281,51 +2770,21 @@ def nix_profile_metadata() -> dict[str, dict[str, object]]:
 
 @lru_cache(maxsize=64)
 def cargo_install_source(ident: str) -> str:
-    cargo_root = Path(
-        os.environ.get("CARGO_INSTALL_ROOT")
-        or os.environ.get("CARGO_HOME")
-        or Path.home() / ".cargo"
-    ).expanduser()
-    try:
-        payload = json.loads((cargo_root / ".crates2.json").read_text(
-            encoding="utf-8", errors="replace"))
-    except (OSError, json.JSONDecodeError, TypeError):
-        return ""
-    installs = payload.get("installs", {}) if isinstance(payload, dict) else {}
-    if not isinstance(installs, dict):
-        return ""
-    pattern = re.compile(
-        rf"^{re.escape(ident)}\s+\S+\s+\((.+)\)$")
-    for key in installs:
-        match = pattern.match(str(key))
-        if match:
-            return match.group(1)
-    return ""
+    details = cargo_install_records().get(ident)
+    return details[1] if details else ""
 
 
 @lru_cache(maxsize=64)
 def pipx_install_source(ident: str, scope: str) -> str:
-    extra = ["--global"] if scope == "system" else []
-    try:
-        payload = json.loads(capture(["pipx", "list", "--json"] + extra))
-    except (json.JSONDecodeError, TypeError):
-        return ""
-    venvs = payload.get("venvs", {}) if isinstance(payload, dict) else {}
-    metadata = venvs.get(ident, {}) if isinstance(venvs, dict) else {}
-    details = metadata.get("metadata", metadata) if isinstance(metadata, dict) else {}
-    main = details.get("main_package", {}) if isinstance(details, dict) else {}
-    if not isinstance(main, dict):
-        return ""
-    return str(
-        main.get("package_or_url")
-        or main.get("package")
-        or ""
-    )
+    return next((
+        item.origin for item in pipx_inventory(scope)
+        if item.ident == ident
+    ), "")
 
 
 @lru_cache(maxsize=64)
 def npm_install_source(ident: str) -> str:
-    root = capture(["npm", "root", "--global"]).strip()
+    root = npm_global_root()
     if not root:
         return ""
     lock_path = Path(root) / ".package-lock.json"
@@ -2349,14 +2808,10 @@ def friendly_cargo_source(source: str) -> str:
 
 @lru_cache(maxsize=64)
 def rpm_install_metadata(ident: str) -> tuple[str, str]:
-    output = capture([
-        "rpm", "-q", "--qf",
-        "%{INSTALLTIME:date}\\t%{VENDOR}\\n", "--", ident,
-    ]).strip().splitlines()
-    if not output:
+    records = rpm_inventory_by_name().get(package_base(ident), ())
+    if not records:
         return "", ""
-    date, separator, vendor = output[0].partition("\t")
-    return date.strip(), vendor.strip() if separator else ""
+    return records[0].install_time, records[0].vendor
 
 
 def explicit_install_reason(item: Match) -> str:
@@ -2681,9 +3136,53 @@ def install_reason(item: Match) -> str:
 
 
 def add_install_reasons(matches: list[Match]) -> list[Match]:
+    tasks: list[Callable[[], object]] = []
+    dnf_items = [item for item in matches if item.kind == "DNF"]
+    if dnf_items:
+        targets = tuple(package_base(item.ident) for item in dnf_items)
+        tasks.append(lambda: prefetch_dnf_install_records(targets))
+        if any(item.role == "group" for item in dnf_items):
+            tasks.extend((
+                dnf_installed_group_inventory,
+                dnf_installed_environment_inventory,
+            ))
+    for scope in {
+            item.scope for item in matches if item.kind == "Flatpak"}:
+        tasks.append(lambda scope=scope: flatpak_history_entries(scope))
+    kinds = {item.kind for item in matches}
+    if "Snap" in kinds:
+        tasks.append(snap_changes)
+    if "APT" in kinds:
+        tasks.append(apt_history_index)
+    if "Pacman" in kinds:
+        tasks.append(pacman_history_index)
+    if "Zypper" in kinds:
+        tasks.append(zypper_history_index)
+    if tasks:
+        with ThreadPoolExecutor(max_workers=min(4, len(tasks))) as executor:
+            futures = [executor.submit(task) for task in tasks]
+            for future in futures:
+                future.result()
+    if len(matches) < 2:
+        return [replace(item, reason=install_reason(item)) for item in matches]
+    with ThreadPoolExecutor(max_workers=min(4, len(matches))) as executor:
+        reasons = executor.map(install_reason, matches)
+        return [
+            replace(item, reason=reason)
+            for item, reason in zip(matches, reasons)
+        ]
+
+
+def decorate_matches(matches: list[Match]) -> list[Match]:
+    """Add provenance and sizes concurrently while retaining result order."""
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        reasons_future = executor.submit(add_install_reasons, matches)
+        sizes_future = executor.submit(add_installed_sizes, matches)
+        reasoned = reasons_future.result()
+        sized = sizes_future.result()
     return [
-        replace(item, reason=install_reason(item))
-        for item in matches
+        replace(item, size_bytes=size.size_bytes)
+        for item, size in zip(reasoned, sized)
     ]
 
 
@@ -2918,8 +3417,12 @@ def protection_reason(kind: str, name: str) -> str:
 
 
 def build_removal_plan(selected: list[Match]) -> RemovalPlan:
-    reports = [dependency_report(item) for item in selected]
-    planned, orphans, preview_available, notes = native_removal_preview(selected)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        reports_future = executor.submit(
+            lambda: [dependency_report(item) for item in selected])
+        preview_future = executor.submit(native_removal_preview, selected)
+        reports = reports_future.result()
+        planned, orphans, preview_available, notes = preview_future.result()
     requested = {package_base(item.ident) for item in selected}
     additional = [
         name for name in planned
@@ -3704,7 +4207,15 @@ def run_uninstall(
         else:
             print("No likely installed apps found.")
         return 1
-    matches = add_installed_sizes(add_install_reasons(matches))
+    prebuilt_plan: RemovalPlan | None = None
+    if len(matches) == 1:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            matches_future = executor.submit(decorate_matches, matches)
+            plan_future = executor.submit(build_removal_plan, matches)
+            matches = matches_future.result()
+            prebuilt_plan = plan_future.result()
+    else:
+        matches = decorate_matches(matches)
     try:
         selected = choose(
             matches, auto_select=len(matches) == 1)
@@ -3722,7 +4233,8 @@ def run_uninstall(
                   file=sys.stderr)
             return 1
 
-    plan = build_removal_plan(selected)
+    plan = prebuilt_plan or build_removal_plan(selected)
+    plan.selected = selected
     show_compact_impact(plan)
 
     paths = find_user_data(selected)
