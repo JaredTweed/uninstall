@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-RELEASE_VERSION=0.19.0
+RELEASE_VERSION=0.20.0
 PREFIX=${PREFIX:-/usr/local}
 
 case "$PREFIX" in

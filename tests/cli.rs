@@ -60,7 +60,7 @@ fn version_is_the_release_version() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        "uninstall 0.19.0"
+        "uninstall 0.20.0"
     );
 }
 
