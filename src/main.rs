@@ -124,14 +124,24 @@ fn show_matches(items: &[Match]) {
                 .collect::<Vec<_>>()
                 .join(" | ")
         );
-        if let Some(identifier) = detail_identifier(item) {
-            println!("      {}", sanitize(&identifier));
+        let identifier = detail_identifier(item);
+        if let Some(identifier) = &identifier {
+            if item.backend == Backend::Standalone {
+                println!("      executable: {}", sanitize(identifier));
+            } else {
+                println!("      {}", sanitize(identifier));
+            }
         }
         if let Some(path) = &item.command_path {
-            println!(
-                "      provides command: {}",
-                sanitize(&path.display().to_string())
-            );
+            let duplicates_identifier = identifier
+                .as_deref()
+                .is_some_and(|identifier| Path::new(identifier) == path);
+            if !duplicates_identifier {
+                println!(
+                    "      provides command: {}",
+                    sanitize(&path.display().to_string())
+                );
+            }
         }
         println!("      Why installed: {}", sanitize(&item.reason));
         if item.backend == Backend::Standalone {

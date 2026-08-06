@@ -60,7 +60,7 @@ fn version_is_the_release_version() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        "uninstall 0.20.0"
+        "uninstall 0.20.1"
     );
 }
 
@@ -82,6 +82,14 @@ fn standalone_result_has_clear_source_and_related_file_note() {
     let output = run(directory.path(), &["rust-uninstall-fixture-show"], "\n");
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("[Standalone]"), "{text}");
+    assert!(
+        text.contains(&format!("executable: {}", executable.display())),
+        "{text}"
+    );
+    assert!(
+        !text.contains(&format!("provides command: {}", executable.display())),
+        "{text}"
+    );
     assert!(text.contains("its original source is unknown"), "{text}");
     assert!(
         text.contains("note: related files cannot be identified automatically"),
