@@ -58,6 +58,28 @@ Ready to run (freeing about 8.5 MiB):
 Continue? [y/N] 
 ```
 
+```console
+$ uninstall Freecad
+Checking installed applications…
+
+Found 2 likely installed options:
+
+   1. FreeCAD  [Flatpak]  1.1.3 | system | 1.5 GiB
+      org.freecad.FreeCAD
+      Why installed: explicitly requested through Flatpak remote flathub
+   2. FreeCAD  [Gear Lever] | user | 783 MiB
+      /home/jared/AppImages/freecad.appimage
+      Why installed: managed by Gear Lever at /home/jared/AppImages/freecad.appimage; original download source is unavailable
+
+Choose numbers separated by commas, 'a' for all, or Enter to cancel.
+> 2
+
+Ready to run (freeing about 783 MiB):
+  /usr/bin/flatpak run it.mijorus.gearlever --remove /home/jared/AppImages/freecad.appimage --yes
+
+Continue? [y/N] 
+```
+
 It searches:
 
 - Flatpak (including named system installations), Snap, AppImage, and
