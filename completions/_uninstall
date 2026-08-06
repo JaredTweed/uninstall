@@ -1,0 +1,10 @@
+#compdef uninstall
+_arguments \
+  '--show-dependencies[include fuzzy dependency matches]' \
+  '--json[print a read-only JSON report]' \
+  '--debug[show backend diagnostics]' \
+  '--backend[select an exact backend]:backend:' \
+  '--confirm[authorize exact non-interactive removal]:authorization:' \
+  '--self-uninstall[remove uninstall itself]' \
+  '--version[show version]' \
+  '1:application, command, package ID, or archive:_files'

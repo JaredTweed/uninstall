@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.8", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests -v
+      - run: python -m py_compile uninstall
+      - run: sh -n install.sh
+      - run: git diff --check
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ruff
+      - run: ruff check uninstall tests
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: shellcheck install.sh tests/integration_remove.sh
+
+  distro-smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - debian:stable-slim
+          - ubuntu:latest
+          - fedora:latest
+          - alpine:latest
+          - archlinux:latest
+          - opensuse/tumbleweed:latest
+          - voidlinux/voidlinux:latest
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Python when absent
+        shell: sh
+        run: |
+          if command -v python3 >/dev/null 2>&1; then exit 0; fi
+          if command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y python3; exit 0; fi
+          if command -v dnf >/dev/null 2>&1; then dnf install -y python3; exit 0; fi
+          if command -v apk >/dev/null 2>&1; then apk add python3; exit 0; fi
+          if command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm python; exit 0; fi
+          if command -v zypper >/dev/null 2>&1; then zypper --non-interactive install python3; exit 0; fi
+          if command -v xbps-install >/dev/null 2>&1; then
+            repository_file=/usr/share/xbps.d/00-repository-main.conf
+            if [ -f "$repository_file" ]; then
+              sed -i 's|alpha.de.repo.voidlinux.org|repo-default.voidlinux.org|' "$repository_file"
+            fi
+            xbps-install -Suy xbps && xbps-install -Sy python3
+            exit 0
+          fi
+          exit 1
+      - run: python3 -m py_compile uninstall
+      - run: ./uninstall --version
+      - run: ./uninstall --help >/dev/null
+      - name: Perform a real disposable removal where an exact backend is available
+        run: sh tests/integration_remove.sh

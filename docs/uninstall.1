@@ -1,0 +1,50 @@
+.TH UNINSTALL 1 "August 2026" "uninstall 0.18.0"
+.SH NAME
+uninstall \- find, explain, preview, and safely remove Linux software
+.SH SYNOPSIS
+.B uninstall
+[
+.B --show-dependencies
+] [
+.B --json
+] [
+.B --debug
+] [APP]
+.br
+.B uninstall --self-uninstall
+.SH DESCRIPTION
+.B uninstall
+resolves application names, desktop names, commands, package identifiers, and
+supported local package archives across native and user-level Linux package
+managers. It displays retained installation provenance, uses a native read-only
+removal preview where available, optionally selects associated data, repeats and
+fingerprints the final preview, and asks for confirmation before changing state.
+.SH OPTIONS
+.TP
+.B --show-dependencies
+Include fuzzy matches installed as dependencies.
+.TP
+.B --json
+Print a read-only machine-readable discovery and preview report. No state is
+changed.
+.TP
+.B --debug
+Show per-backend timing and failure diagnostics.
+.TP
+.B --backend BACKEND --confirm "REMOVE Backend:package-id"
+Guarded non-interactive removal for automation. It requires one exact package
+identity and refuses blocked, unknown, or high-impact transactions.
+.TP
+.B --self-uninstall
+Remove the installed command itself.
+.TP
+.B --version
+Print the version.
+.SH SAFETY
+The program must not be run wholesale through sudo. It requests narrowly scoped
+privilege only for a system package-manager command. Unknown-impact operations
+require a typed confirmation. Associated user data is never selected by default.
+.SH EXIT STATUS
+Zero means cancellation or successful completion. One means no match, blocked
+removal, changed preview, failed removal, failed verification, or cleanup error.
+Two means invalid command-line usage.

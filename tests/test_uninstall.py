@@ -1,19 +1,20 @@
-import importlib.util
+import hashlib
 import importlib.machinery
+import importlib.util
 import io
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
-import os
 from contextlib import redirect_stdout
 from pathlib import Path
 from threading import Barrier, Event, Lock
 from unittest.mock import call, patch
 
-
 SCRIPT = Path(__file__).parents[1] / "uninstall"
 INSTALLER = Path(__file__).parents[1] / "install.sh"
+CHECKSUM = Path(__file__).parents[1] / "uninstall.sha256"
 LOADER = importlib.machinery.SourceFileLoader("uninstall_cli", str(SCRIPT))
 SPEC = importlib.util.spec_from_loader("uninstall_cli", LOADER)
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -26,6 +27,7 @@ class UninstallTests(unittest.TestCase):
     def setUp(self):
         MODULE.norm.cache_clear()
         MODULE.rpm_inventory.cache_clear()
+        MODULE.rpm_dependency_inventory.cache_clear()
         MODULE.rpm_inventory_by_name.cache_clear()
         MODULE.apt_inventory.cache_clear()
         MODULE.apt_inventory_by_name.cache_clear()
@@ -55,8 +57,12 @@ class UninstallTests(unittest.TestCase):
         MODULE.swupd_inventory.cache_clear()
         MODULE.swupd_reverse_dependencies.cache_clear()
         MODULE.flatpak_inventory.cache_clear()
+        MODULE.desktop_inventory.cache_clear()
+        MODULE.appstream_inventory.cache_clear()
         MODULE.snap_inventory.cache_clear()
         MODULE.pipx_inventory.cache_clear()
+        MODULE.uv_tool_inventory.cache_clear()
+        MODULE.conda_environments.cache_clear()
         MODULE.npm_global_prefix.cache_clear()
         MODULE.npm_global_root.cache_clear()
         MODULE.npm_inventory.cache_clear()
@@ -101,6 +107,12 @@ class UninstallTests(unittest.TestCase):
         MODULE.path_disk_size.cache_clear()
         MODULE.package_installed_size.cache_clear()
         MODULE.transactional_zypper_system.cache_clear()
+        MODULE.os_release.cache_clear()
+        MODULE.immutable_host.cache_clear()
+        MODULE.runtime_protected_packages.cache_clear()
+        MODULE.nix_profile_metadata.cache_clear()
+        MODULE._DIAGNOSTICS.clear()
+        MODULE._CLEANUP_SNAPSHOTS.clear()
         MODULE._DNF_HISTORY_DETAILS.clear()
         MODULE._DNF_INSTALL_RECORDS.clear()
 
@@ -159,6 +171,18 @@ class UninstallTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("version mismatch", result.stderr)
+
+    def test_published_source_checksum_matches_release_artifact(self):
+        expected = CHECKSUM.read_text(encoding="utf-8").split()[0]
+        actual = hashlib.sha256(SCRIPT.read_bytes()).hexdigest()
+        self.assertEqual(actual, expected)
+
+    def test_release_versions_do_not_drift(self):
+        installer = INSTALLER.read_text(encoding="utf-8")
+        self.assertIn(f"RELEASE_VERSION={MODULE.VERSION}", installer)
+        self.assertIn(f"uninstall {MODULE.VERSION}", (
+            Path(__file__).parents[1] / "docs/uninstall.1"
+        ).read_text(encoding="utf-8"))
 
     def test_matching_ignores_case_and_punctuation(self):
         self.assertTrue(MODULE.relevant("FreeCAD", "org.freecad.FreeCAD"))
@@ -230,17 +254,22 @@ class UninstallTests(unittest.TestCase):
 
     @patch.object(MODULE.shutil, "which", return_value="/usr/bin/tool")
     @patch.object(MODULE, "capture")
-    def test_rpm_inventory_is_shared_by_search_graph_size_and_metadata(
+    def test_rpm_search_inventory_defers_large_dependency_metadata(
             self, capture, _which):
-        capture.return_value = (
+        lightweight = (
             "P\texample\t1.2-3\tExample application\t4096\t"
             "Tue Aug  4 10:00:00 2026\tExample Vendor\n"
-            "R\tlibexample.so.1()(64bit)\n"
-            "S\texample\n"
             "P\tlibexample\t1.0-1\tExample library\t2048\t"
             "Mon Aug  3 10:00:00 2026\tExample Vendor\n"
+        )
+        relationships = (
+            "P\texample\n"
+            "R\tlibexample.so.1()(64bit)\n"
+            "S\texample\n"
+            "P\tlibexample\n"
             "S\tlibexample.so.1()(64bit)\n"
         )
+        capture.side_effect = [lightweight, relationships]
 
         found = MODULE.detect_rpm("example")
         reverse, complete = MODULE.rpm_reverse_graph()
@@ -254,7 +283,7 @@ class UninstallTests(unittest.TestCase):
         self.assertEqual(size, 4096)
         self.assertEqual(metadata, (
             "Tue Aug  4 10:00:00 2026", "Example Vendor"))
-        capture.assert_called_once()
+        self.assertEqual(capture.call_count, 2)
 
     @patch.object(MODULE.shutil, "which", return_value="/usr/bin/dpkg-query")
     @patch.object(MODULE, "capture")
@@ -325,8 +354,8 @@ class UninstallTests(unittest.TestCase):
             self, capture_any):
         capture_any.return_value = (
             0,
-            "(1/2) Purging nano (8.0-r0)\n"
-            "(2/2) Purging oniguruma (6.9-r0)\n",
+            ("(1/2) Purging nano (8.0-r0)\n"
+            "(2/2) Purging oniguruma (6.9-r0)\n"),
         )
         selected = [MODULE.Match("APK", "nano", "nano", scope="system")]
         planned, orphans, available, _notes = (
@@ -402,8 +431,8 @@ class UninstallTests(unittest.TestCase):
 
     @patch.object(MODULE, "capture_any", return_value=(
         0,
-        "nano-8.0_1 remove x86_64 repo 4096 0\n"
-        "oniguruma-6.9_1 remove x86_64 repo 2048 0\n",
+        ("nano-8.0_1 remove x86_64 repo 4096 0\n"
+        "oniguruma-6.9_1 remove x86_64 repo 2048 0\n"),
     ))
     def test_xbps_recursive_dry_run_is_parsed(self, capture_any):
         selected = [MODULE.Match("XBPS", "nano", "nano", scope="system")]
@@ -577,9 +606,9 @@ class UninstallTests(unittest.TestCase):
     @patch.object(MODULE.shutil, "which", return_value="/usr/bin/swupd")
     @patch.object(MODULE, "capture_any", return_value=(
         0,
-        "os-core: installed\n"
+        ("os-core: installed\n"
         "desktop: explicitly installed\n"
-        "graphics: installed, experimental\n",
+        "graphics: installed, experimental\n"),
     ))
     def test_swupd_inventory_preserves_explicit_bundle_tracking(
             self, capture_any, _which):
@@ -853,7 +882,7 @@ class UninstallTests(unittest.TestCase):
             archive_path = Path(archive.name).absolute()
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].kind, "DNF")
-        self.assertEqual(result[0].ident, "example")
+        self.assertEqual(result[0].ident, "example.x86_64")
         self.assertEqual(result[0].version, "2.0-3")
         self.assertEqual(result[0].archive_version, "1.0-1")
         self.assertEqual(result[0].archive, archive_path)
@@ -945,7 +974,8 @@ class UninstallTests(unittest.TestCase):
         self.assertEqual(result[0].ident, "aalib")
         self.assertEqual(result[0].provides, "/usr/bin/aafire")
         capture.assert_called_once_with([
-            "rpm", "-qf", "--qf", "%{NAME}\\t%{VERSION}-%{RELEASE}\\n",
+            "rpm", "-qf", "--qf",
+            "%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{ARCH}\\n",
             "/usr/bin/aafire",
         ])
 
@@ -1117,9 +1147,9 @@ class UninstallTests(unittest.TestCase):
             self, _which, capture_any):
         capture_any.return_value = (
             0,
-            '<?xml version="1.0"?><stream><package-list>'
+            ('<?xml version="1.0"?><stream><package-list>'
             '<solvable kind="package" name="editor"/>'
-            '</package-list></stream>',
+            '</package-list></stream>'),
         )
         matches = [
             MODULE.Match("Zypper", "editor", "editor"),
@@ -1585,25 +1615,25 @@ class UninstallTests(unittest.TestCase):
             (
                 MODULE.apt_history_index,
                 MODULE.apt_history_event,
-                "Start-Date: 2026-07-01  10:20:00\n"
+                ("Start-Date: 2026-07-01  10:20:00\n"
                 "Commandline: apt install alpha beta\n"
-                "Install: alpha:amd64 (1.0), beta:amd64 (2.0)\n",
+                "Install: alpha:amd64 (1.0), beta:amd64 (2.0)\n"),
                 ("alpha", "beta"),
             ),
             (
                 MODULE.pacman_history_index,
                 MODULE.pacman_history_event,
-                "[2026-07-01T10:00:00+0000] [PACMAN] "
+                ("[2026-07-01T10:00:00+0000] [PACMAN] "
                 "Running 'pacman -S alpha beta'\n"
                 "[2026-07-01T10:00:01+0000] [ALPM] installed alpha (1-1)\n"
-                "[2026-07-01T10:00:02+0000] [ALPM] installed beta (1-1)\n",
+                "[2026-07-01T10:00:02+0000] [ALPM] installed beta (1-1)\n"),
                 ("alpha", "beta"),
             ),
             (
                 MODULE.zypper_history_index,
                 MODULE.zypper_history_event,
-                "2026-07-01 10:00:00|install|alpha|1|x86_64|root|repo-a|x|\n"
-                "2026-07-01 10:00:01|install|beta|1|x86_64|root|repo-b|x|\n",
+                ("2026-07-01 10:00:00|install|alpha|1|x86_64|root|repo-a|x|\n"
+                "2026-07-01 10:00:01|install|beta|1|x86_64|root|repo-b|x|\n"),
                 ("alpha", "beta"),
             ),
         )
@@ -1652,8 +1682,8 @@ class UninstallTests(unittest.TestCase):
                 "org.freecad.FreeCAD", "system"),
             (
                 "flathub",
-                "Flatpak history Jul 1 10:00:00: "
-                "install org.freecad.FreeCAD",
+                ("Flatpak history Jul 1 10:00:00: "
+                "install org.freecad.FreeCAD"),
             ),
         )
 
@@ -1690,8 +1720,8 @@ class UninstallTests(unittest.TestCase):
             self, capture):
         capture.side_effect = [
             "tracking: latest/stable\npublisher: KDE\u2713\n",
-            "ID Status Spawn Ready Summary\n"
-            "84 Done now now Install \"okular\" snap\n",
+            ("ID Status Spawn Ready Summary\n"
+            "84 Done now now Install \"okular\" snap\n"),
         ]
         self.assertEqual(
             MODULE.snap_install_evidence("okular"),
@@ -1863,8 +1893,8 @@ class UninstallTests(unittest.TestCase):
     def test_dnf_native_preview_is_read_only(self, _which, capture_any):
         capture_any.return_value = (
             1,
-            "Removing:\n target x86_64 1 repo 1 MiB\n\n"
-            "Transaction Summary:\nOperation aborted by the user.\n",
+            ("Removing:\n target x86_64 1 repo 1 MiB\n\n"
+            "Transaction Summary:\nOperation aborted by the user.\n"),
         )
         item = MODULE.Match("DNF", "target", "target")
         planned, _orphans, available, _notes = (
@@ -2421,10 +2451,14 @@ class UninstallTests(unittest.TestCase):
         find_matches.return_value = [item]
         find_user_data.return_value = [Path("/home/test/.config/Example")]
         run.return_value.returncode = 1
-        with patch("builtins.input", side_effect=["a", "y"]):
+        with patch("builtins.input", side_effect=["a", "REMOVE Example"]), \
+                patch.object(MODULE, "revalidate_package_identity", return_value=""):
             self.assertEqual(MODULE.run_uninstall("Example"), 1)
         remove_paths.assert_not_called()
-        self.assertIn("--delete-data", run.call_args.args[0])
+        self.assertTrue(any(
+            "--delete-data" in recorded.args[0]
+            for recorded in run.call_args_list
+        ))
 
     def test_user_can_choose_individual_cleanup_paths(self):
         paths = [Path("/tmp/first"), Path("/tmp/second")]
@@ -2447,11 +2481,11 @@ class UninstallTests(unittest.TestCase):
                 MODULE, "manager_cleanup_size",
                 return_value=512 * 1024 * 1024), \
                 patch.object(
-                    MODULE, "path_disk_size",
-                    side_effect=[
-                        184 * 1024 * 1024,
-                        int(2.3 * 1024 * 1024),
-                    ]), \
+                    MODULE, "path_disk_sizes",
+                    return_value={
+                        paths[0].absolute(): 184 * 1024 * 1024,
+                        paths[1].absolute(): int(2.3 * 1024 * 1024),
+                    }), \
                 redirect_stdout(output), \
                 patch("builtins.input", return_value="1,3"):
             cleanup_kinds, selected_paths = MODULE.ask_cleanup(selected, paths)
@@ -2496,17 +2530,18 @@ class UninstallTests(unittest.TestCase):
         self.assertEqual(total, 1408 * 1024 * 1024)
         self.assertEqual(
             MODULE.ready_heading(total, complete),
-            "Ready to run (freeing about 1.4 GiB):",
+            "Ready to run (estimated installed data affected: about 1.4 GiB):",
         )
 
     def test_unknown_sizes_are_disclosed_in_ready_heading(self):
         self.assertEqual(
             MODULE.ready_heading(1024 * 1024, False),
-            "Ready to run (freeing at least 1 MiB; some sizes unknown):",
+            "Ready to run (at least 1 MiB installed data affected; "
+            "some sizes and reclaimed space unknown):",
         )
         self.assertEqual(
             MODULE.ready_heading(0, False),
-            "Ready to run (space estimate unavailable):",
+            "Ready to run (affected size and reclaimed space unknown):",
         )
 
     def test_manager_cleanup_choices_are_independent(self):
@@ -2593,6 +2628,195 @@ class UninstallTests(unittest.TestCase):
     def test_uninstall_uninstall_is_self_uninstall(self, self_uninstall):
         self.assertEqual(MODULE.main(), 0)
         self_uninstall.assert_called_once_with()
+
+    def test_apt_history_resets_origin_after_remove_and_reinstall(self):
+        history = (
+            "Start-Date: 2025-01-01 10:00:00\n"
+            "Commandline: apt install wine\n"
+            "Install: dosbox:amd64 (1.0)\n\n"
+            "Start-Date: 2025-02-01 10:00:00\n"
+            "Commandline: apt remove dosbox\n"
+            "Remove: dosbox:amd64 (1.0)\n\n"
+            "Start-Date: 2025-03-01 10:00:00\n"
+            "Commandline: apt install dosbox\n"
+            "Install: dosbox:amd64 (1.0)\n"
+        )
+        with patch.object(MODULE.Path, "glob", return_value=[Path("history")]), \
+                patch.object(MODULE, "read_history_file", return_value=history):
+            self.assertEqual(
+                MODULE.apt_history_index()["dosbox"][1],
+                "apt install dosbox",
+            )
+
+    def test_pacman_history_resets_origin_after_removal(self):
+        history = (
+            "[2025-01-01] [PACMAN] Running 'pacman -S wine'\n"
+            "[2025-01-01] [ALPM] installed dosbox (1.0)\n"
+            "[2025-02-01] [ALPM] removed dosbox (1.0)\n"
+            "[2025-03-01] [PACMAN] Running 'pacman -S dosbox'\n"
+            "[2025-03-01] [ALPM] installed dosbox (1.0)\n"
+        )
+        with patch.object(MODULE.Path, "glob", return_value=[Path("pacman.log")]), \
+                patch.object(MODULE, "read_history_file", return_value=history):
+            self.assertEqual(
+                MODULE.pacman_history_index()["dosbox"][1],
+                "pacman -S dosbox",
+            )
+
+    @patch.object(MODULE, "capture_any", return_value=(
+        0, ("World updated, but the following packages are not removed due to:\n"
+        "  pcre2: git requires pcre2\n"),
+    ))
+    def test_apk_successful_noop_is_blocked_not_planned(self, _capture):
+        item = MODULE.Match("APK", "pcre2", "pcre2", scope="system")
+        preview = MODULE.native_removal_preview([item])
+        self.assertEqual(preview.status, MODULE.PreviewStatus.BLOCKED)
+        self.assertEqual(preview.planned, ())
+        plan = MODULE.build_removal_plan([item])
+        self.assertEqual(plan.level, "BLOCKED")
+        self.assertEqual(plan.planned_removals, [])
+
+    def test_broad_xdg_system_root_is_rejected(self):
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": "/etc"}), \
+                patch.object(MODULE.Path, "home", return_value=Path("/home/test")):
+            self.assertEqual(
+                MODULE.xdg_dir("XDG_CONFIG_HOME", Path("/home/test/.config")),
+                Path("/home/test/.config"),
+            )
+
+    def test_cleanup_refuses_a_replaced_selected_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / "Example"
+            candidate.mkdir()
+            snapshot = MODULE.snapshot_cleanup_candidate(candidate)
+            self.assertIsNotNone(snapshot)
+            MODULE._CLEANUP_SNAPSHOTS[candidate.absolute()] = snapshot
+            candidate.rmdir()
+            candidate.mkdir()
+            with patch.object(MODULE, "user_data_roots", return_value=[root]):
+                self.assertFalse(MODULE.remove_paths([candidate]))
+            self.assertTrue(candidate.exists())
+
+    def test_named_flatpak_installation_is_preserved_in_command(self):
+        item = MODULE.Match(
+            "Flatpak", "org.example.App", "Example", scope="system",
+            installation="work",
+        )
+        self.assertEqual(
+            MODULE.uninstall_command(item, False),
+            ["flatpak", "uninstall", "-y", "--installation=work",
+             "org.example.App"],
+        )
+
+    def test_cleanup_choice_changes_apt_preview_to_purge(self):
+        item = MODULE.Match("APT", "example", "example", scope="system")
+        with patch.object(MODULE, "capture_any", return_value=(
+                0, "Remv example [1.0]\n")) as capture:
+            preview = MODULE.native_removal_preview([item], {"APT"})
+        self.assertEqual(preview.status, MODULE.PreviewStatus.EXACT)
+        capture.assert_called_once_with([
+            "apt-get", "--simulate", "purge", "example",
+        ])
+
+    def test_zypper_xml_preview_is_exact_and_preserves_architecture(self):
+        output = (
+            "<?xml version='1.0'?><stream><install-summary>"
+            "<to-remove>"
+            "<solvable type='package' name='ed' arch='x86_64'/>"
+            "<solvable type='package' name='helper' arch='noarch'/>"
+            "</to-remove></install-summary></stream>"
+        )
+        item = MODULE.Match("Zypper", "ed.x86_64", "ed", scope="system")
+        with patch.object(MODULE, "capture_any", return_value=(0, output)) \
+                as capture:
+            preview = MODULE.native_removal_preview([item])
+        self.assertEqual(preview.status, MODULE.PreviewStatus.EXACT)
+        self.assertEqual(preview.planned, ("ed.x86_64", "helper.noarch"))
+        capture.assert_called_once_with([
+            "zypper", "--xmlout", "--non-interactive",
+            "remove", "--dry-run", "ed.x86_64",
+        ])
+
+    def test_unknown_preview_takes_precedence_over_dependency_caution(self):
+        item = MODULE.Match(
+            "Zypper", "example.x86_64", "example",
+            role="dependency", scope="system",
+        )
+        preview = MODULE.PreviewResult(
+            MODULE.PreviewStatus.UNKNOWN,
+            ("example.x86_64",), fingerprint="preview",
+        )
+        report = MODULE.DependencyReport(item, [], [], True)
+        with patch.object(MODULE, "native_removal_preview", return_value=preview), \
+                patch.object(MODULE, "dependency_report", return_value=report):
+            plan = MODULE.build_removal_plan([item])
+        self.assertEqual(plan.level, "UNKNOWN")
+
+    def test_rpm_multiarch_matches_keep_exact_architecture(self):
+        records = (
+            MODULE.RpmPackageRecord(
+                "library", "1-1", "Library", 1000, "", "",
+                architecture="x86_64"),
+            MODULE.RpmPackageRecord(
+                "library", "1-1", "Library", 900, "", "",
+                architecture="i686"),
+        )
+        with patch.object(MODULE.shutil, "which", return_value="/usr/bin/rpm"), \
+                patch.object(MODULE, "rpm_manager", return_value="DNF"), \
+                patch.object(MODULE, "rpm_inventory", return_value=records):
+            found = MODULE.detect_rpm("library")
+        self.assertEqual(
+            {item.ident for item in found},
+            {"library.x86_64", "library.i686"},
+        )
+        self.assertEqual(
+            {item.architecture for item in found}, {"x86_64", "i686"})
+
+    def test_rpm_exact_multiarch_identifier_selects_only_that_architecture(self):
+        records = (
+            MODULE.RpmPackageRecord(
+                "library", "1-1", "Library", 1000, "", "",
+                architecture="x86_64"),
+            MODULE.RpmPackageRecord(
+                "library", "1-1", "Library", 900, "", "",
+                architecture="i686"),
+        )
+        with patch.object(MODULE.shutil, "which", return_value="/usr/bin/rpm"), \
+                patch.object(MODULE, "rpm_manager", return_value="DNF"), \
+                patch.object(MODULE, "rpm_inventory", return_value=records):
+            found = MODULE.detect_rpm("library.i686")
+        self.assertEqual([item.ident for item in found], ["library.i686"])
+
+    def test_pinning_preserves_dispatch_symlink_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "rustup"
+            target.write_text("", encoding="utf-8")
+            target.chmod(0o755)
+            cargo = root / "cargo"
+            cargo.symlink_to(target)
+            with patch.object(MODULE.shutil, "which", return_value=str(cargo)):
+                self.assertEqual(
+                    MODULE.pinned_command(["cargo", "uninstall", "tool"])[0],
+                    str(cargo),
+                )
+
+    def test_noninteractive_mode_refuses_unknown_preview(self):
+        item = MODULE.Match("Standalone", "/tmp/tool", "tool")
+        plan = MODULE.RemovalPlan(
+            [item], [], [item.ident], [], [], "UNKNOWN", False, [], [],
+            MODULE.PreviewStatus.UNSUPPORTED.value, "fingerprint", [],
+        )
+        with patch.object(MODULE, "find_matches", return_value=[item]), \
+                patch.object(MODULE, "annotate_roles", return_value=[item]), \
+                patch.object(MODULE, "decorate_matches", return_value=[item]), \
+                patch.object(MODULE, "build_removal_plan", return_value=plan), \
+                patch.object(MODULE.subprocess, "run") as run:
+            result = MODULE.exact_noninteractive_remove(
+                "/tmp/tool", "Standalone", "REMOVE Standalone:/tmp/tool")
+        self.assertEqual(result, 1)
+        run.assert_not_called()
 
     @patch.object(MODULE, "run_uninstall", return_value=0)
     @patch.object(MODULE.sys, "argv", ["uninstall", "uninstall-helper"])

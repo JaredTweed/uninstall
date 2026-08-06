@@ -1,0 +1,7 @@
+complete -c uninstall -l show-dependencies -d 'Include fuzzy dependency matches'
+complete -c uninstall -l json -d 'Print a read-only JSON report'
+complete -c uninstall -l debug -d 'Show backend diagnostics'
+complete -c uninstall -l backend -r -d 'Select an exact backend'
+complete -c uninstall -l confirm -r -d 'Authorize exact non-interactive removal'
+complete -c uninstall -l self-uninstall -d 'Remove uninstall itself'
+complete -c uninstall -l version -d 'Show version'

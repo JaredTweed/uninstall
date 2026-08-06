@@ -16,7 +16,7 @@ Automatically selected the only result.
 
 Also expected to remove 8 now-unused dependencies: SDL2_net, fluid-soundfont-common, fluid-soundfont-gm, fluidsynth-libs, iir1, mt32emu, opusfile, speexdsp
 
-Ready to run (freeing about 159 MiB):
+Ready to run (estimated installed data affected: about 159 MiB):
   sudo dnf5 remove dosbox-staging
 
 Continue? [y/N]
@@ -24,15 +24,20 @@ Continue? [y/N]
 
 It searches:
 
-- Flatpak, Snap, AppImage, and AppImages managed by Gear Lever
-- APT/dpkg, DNF/YUM/RPM, layered rpm-ostree packages, Zypper/RPM, and Pacman
+- Flatpak (including named system installations), Snap, AppImage, and
+  AppImages managed by Gear Lever
+- APT/dpkg, APT-RPM, DNF/DNF5/microdnf/YUM/RPM, URPMI, layered rpm-ostree
+  packages, Zypper/RPM, and Pacman
 - Alpine/OpenWrt APK, legacy OpenWrt OPKG, Void XBPS, Gentoo Portage
   (including Gentoo Prefix), Slackware pkgtools, Solus Eopkg, and Clear Linux
-  Swupd bundles
-- local `.rpm`, `.deb`, and Arch `.pkg.tar.*` archives that correspond to
+  Swupd and third-party Swupd bundles
+- local `.rpm`, `.deb`, `.apk`, `.ipk`/`.opk`, `.xbps`, Slackware,
+  `.eopkg`, Flatpak, and Arch `.pkg.tar.*` archives that correspond to
   installed packages
-- Homebrew, modern and legacy Nix profiles, Guix profiles, Cargo, pipx, and
-  global npm packages
+- Homebrew, named modern Nix profiles, legacy Nix and Guix profiles, Cargo,
+  pipx, uv tools, Conda/Micromamba environments, and global npm packages
+- applications exported from Distrobox or Toolbox, which are explained and
+  safely blocked from being mistaken for unmanaged host executables
 - standalone executables on `PATH`
 
 You choose the exact result, decide separately whether its data should go too,
@@ -87,7 +92,10 @@ is an advanced `rpm-ostree override remove` operation and is reported as such.
 The installer checks for Python 3.8+, `curl`, and the standard system utilities it
 needs before changing anything. It downloads the matching pinned release to a
 temporary file, verifies the CLI can start and reports the exact expected
-version, and only then installs it.
+version, verifies the published SHA-256 digest, stages it in the destination
+filesystem, and only then atomically replaces the installed command. If Python
+3.8 is unavailable, tagged releases provide self-contained glibc and musl
+executables for x86-64 and AArch64.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/JaredTweed/uninstall/main/install.sh | sh
@@ -95,6 +103,8 @@ curl -fsSL https://raw.githubusercontent.com/JaredTweed/uninstall/main/install.s
 
 The installer uses `sudo`, `doas`, or `pkexec` only when `/usr/local/bin` is not
 writable.
+Release executables also include keyless Sigstore bundles beside their checksum
+files for independent verification with `cosign verify-blob`.
 For a user-only installation:
 
 ```sh
@@ -112,9 +122,19 @@ uninstall FreeCAD
 uninstall org.freecad.FreeCAD
 uninstall ~/Downloads/example.rpm
 uninstall --show-dependencies lib
+uninstall FreeCAD --json
+uninstall FreeCAD --debug
 uninstall --help
 uninstall uninstall
 uninstall --self-uninstall
+```
+
+For automation, `--json` never changes state. Guarded non-interactive removal
+requires an exact package ID, backend, and authorization phrase, and refuses
+unknown or high-impact transactions:
+
+```sh
+uninstall ed --backend APT --confirm 'REMOVE APT:ed'
 ```
 
 Matching is Unicode-aware and case-insensitive. A sole result is selected
@@ -181,7 +201,9 @@ unavailable rather than replaced with a guess. Likewise, passing a matching
 unless retained history supports that conclusion.
 
 Before asking for confirmation, native simulations determine what the package
-manager expects to remove. Routine internal details stay out of the way.
+manager expects to remove. A preview records whether the operation is exact,
+blocked, a successful no-op, failed, unknown, or unsupported. Routine internal
+details stay out of the way.
 `uninstall` prints the information that can change the decision: installed
 dependents, newly unused dependencies, protected or critical packages, or an
 unavailable preview. High- and unknown-impact operations require typing the
@@ -214,8 +236,11 @@ Dependency explanations are necessarily best effort: alternatives, rich
 conditional dependencies, pruned transaction history, package groups, and
 declarative systems do not always preserve the human reason an item was
 installed. When metadata or a dry-run is unavailable the result says `UNKNOWN`;
-it never silently claims the operation is safe. The package manager's final
-transaction is always authoritative.
+it never silently claims the operation is safe. After cleanup choices, the
+exact final command is previewed again. Its transaction is fingerprinted and
+repeated immediately before execution; a change aborts instead of silently
+accepting a different transaction. The executable is pinned before crossing a
+privilege boundary, and installed state is queried again after execution.
 
 APK, OPKG, XBPS, Portage, and Eopkg use their native no-action, dry-run, or
 pretend operations. Portage removal uses dependency-aware `--depclean`, never
