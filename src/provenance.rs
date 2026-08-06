@@ -1,6 +1,6 @@
 use crate::command::{exists, output, run};
-use crate::discovery::dnf_binary;
-use crate::model::{Match, Role};
+use crate::model::{Backend, Match, Role};
+use crate::platform::dnf_binary;
 use crate::util::{package_base, sanitize};
 use flate2::read::GzDecoder;
 use regex::Regex;
@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(45);
@@ -76,55 +76,54 @@ fn dnf_reasons() -> &'static HashMap<String, (Role, String)> {
     })
 }
 
-fn apt_auto() -> Option<HashSet<String>> {
-    command_lines("apt-mark", &["showauto"])
-        .map(|items| items.into_iter().map(|item| package_base(&item)).collect())
+fn apt_auto() -> &'static Option<HashSet<String>> {
+    static CACHE: OnceLock<Option<HashSet<String>>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        command_lines("apt-mark", &["showauto"])
+            .map(|items| items.into_iter().map(|item| package_base(&item)).collect())
+    })
 }
 
-fn zypper_userinstalled() -> Option<HashSet<String>> {
-    let result = run(
-        "zypper",
-        [
-            "--no-refresh",
-            "--xmlout",
-            "packages",
-            "--installed-only",
-            "--userinstalled",
-        ],
-        TIMEOUT,
-    );
-    if !result.ok() {
-        return None;
-    }
-    let expression =
-        Regex::new(r#"(?i)<solvable\b[^>]*\bname=[\"']([^\"']+)[\"']"#).expect("valid expression");
-    let mut names: HashSet<String> = expression
-        .captures_iter(&result.stdout)
-        .map(|found| found[1].to_owned())
-        .collect();
-    if names.is_empty() {
-        for line in result.stdout.lines() {
-            let fields: Vec<&str> = line.split('|').map(str::trim).collect();
-            if fields.len() >= 4 && fields[0].starts_with("i+") && !fields[2].is_empty() {
-                names.insert(fields[2].to_owned());
+fn zypper_userinstalled() -> &'static Option<HashSet<String>> {
+    static CACHE: OnceLock<Option<HashSet<String>>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let result = run(
+            "zypper",
+            [
+                "--no-refresh",
+                "--xmlout",
+                "packages",
+                "--installed-only",
+                "--userinstalled",
+            ],
+            TIMEOUT,
+        );
+        if !result.ok() {
+            return None;
+        }
+        static EXPRESSION: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            Regex::new(r#"(?i)<solvable\b[^>]*\bname=[\"']([^\"']+)[\"']"#)
+                .expect("valid expression")
+        });
+        let mut names: HashSet<String> = EXPRESSION
+            .captures_iter(&result.stdout)
+            .map(|found| found[1].to_owned())
+            .collect();
+        if names.is_empty() {
+            for line in result.stdout.lines() {
+                let fields: Vec<&str> = line.split('|').map(str::trim).collect();
+                if fields.len() >= 4 && fields[0].starts_with("i+") && !fields[2].is_empty() {
+                    names.insert(fields[2].to_owned());
+                }
             }
         }
-    }
-    Some(names)
+        Some(names)
+    })
 }
 
-pub fn annotate_roles(items: &mut [Match]) {
-    let dnf = items
-        .iter()
-        .any(|item| item.backend == "DNF")
-        .then(dnf_reasons);
-    let apt = (items.iter().any(|item| item.backend == "APT") && exists("apt-mark"))
-        .then(apt_auto)
-        .flatten();
-    let zypper = (items.iter().any(|item| item.backend == "Zypper") && exists("zypper"))
-        .then(zypper_userinstalled)
-        .flatten();
-    let yum = if items.iter().any(|item| item.backend == "YUM") {
+fn yum_userinstalled() -> &'static Option<HashSet<String>> {
+    static CACHE: OnceLock<Option<HashSet<String>>> = OnceLock::new();
+    CACHE.get_or_init(|| {
         command_lines(
             "yum",
             &[
@@ -135,9 +134,25 @@ pub fn annotate_roles(items: &mut [Match]) {
                 "%{name}\n",
             ],
         )
-    } else {
-        None
-    };
+    })
+}
+
+pub fn annotate_roles(items: &mut [Match]) {
+    let dnf = items
+        .iter()
+        .any(|item| item.backend == Backend::Dnf)
+        .then(dnf_reasons);
+    let apt = (items.iter().any(|item| item.backend == Backend::Apt) && exists("apt-mark"))
+        .then(|| apt_auto().as_ref())
+        .flatten();
+    let zypper = (items.iter().any(|item| item.backend == Backend::Zypper) && exists("zypper"))
+        .then(|| zypper_userinstalled().as_ref())
+        .flatten();
+    let yum = items
+        .iter()
+        .any(|item| item.backend == Backend::Yum)
+        .then(|| yum_userinstalled().as_ref())
+        .flatten();
     for item in items {
         let base = package_base(&item.id);
         match item.backend.as_str() {
@@ -150,7 +165,7 @@ pub fn annotate_roles(items: &mut [Match]) {
                 }
             }
             "APT" => {
-                if let Some(auto) = &apt {
+                if let Some(auto) = apt {
                     item.role = if auto.contains(&base) {
                         Role::Dependency
                     } else {
@@ -159,7 +174,7 @@ pub fn annotate_roles(items: &mut [Match]) {
                 }
             }
             "Zypper" => {
-                if let Some(explicit) = &zypper {
+                if let Some(explicit) = zypper {
                     item.role = if explicit.contains(&base) {
                         Role::Explicit
                     } else {
@@ -168,7 +183,7 @@ pub fn annotate_roles(items: &mut [Match]) {
                 }
             }
             "YUM" => {
-                if let Some(explicit) = &yum {
+                if let Some(explicit) = yum {
                     item.role = if explicit.contains(&base) {
                         Role::Explicit
                     } else {
@@ -230,8 +245,10 @@ fn compact_command(command: &str) -> String {
 
 fn apt_history(target: &str) -> Option<String> {
     let base = package_base(target);
-    let field = Regex::new(r"(?m)^(Start-Date|Commandline|Install|Remove|Purge):\s*(.+)$")
-        .expect("valid expression");
+    static FIELD: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^(Start-Date|Commandline|Install|Remove|Purge):\s*(.+)$")
+            .expect("valid expression")
+    });
     let package = Regex::new(&format!(
         r"(?:^|[,\s]){}(?::[^\s,(]+)?(?:[:\s,(]|$)",
         regex::escape(&base)
@@ -243,7 +260,7 @@ fn apt_history(target: &str) -> Option<String> {
             let mut command = "";
             let mut date = "";
             let mut event = false;
-            for capture in field.captures_iter(block) {
+            for capture in FIELD.captures_iter(block) {
                 match &capture[1] {
                     "Commandline" => command = capture.get(2).map_or("", |value| value.as_str()),
                     "Start-Date" => date = capture.get(2).map_or("", |value| value.as_str()),
@@ -346,7 +363,8 @@ fn dnf_record(target: &str) -> Option<DnfRecord> {
     let option = format!("--contains-pkgs={}", package_base(target));
     let listed = run("dnf5", ["history", "list", &option, "--json"], TIMEOUT);
     let summaries: Vec<Value> = serde_json::from_str(&listed.stdout).ok()?;
-    let nevra_expression = Regex::new(r"^(.*)-\d+:").expect("valid NEVRA expression");
+    static NEVRA_EXPRESSION: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^(.*)-\d+:").expect("valid NEVRA expression"));
     for summary in summaries.iter().rev() {
         let id = summary.get("id").and_then(Value::as_i64)?;
         let result = run(
@@ -371,7 +389,7 @@ fn dnf_record(target: &str) -> Option<DnfRecord> {
             };
             let name = text_field(package, &["name"]);
             let nevra = text_field(package, &["nevra"]);
-            let nevra_name = nevra_expression
+            let nevra_name = NEVRA_EXPRESSION
                 .captures(nevra)
                 .map(|capture| capture[1].to_owned())
                 .unwrap_or_default();
@@ -439,8 +457,9 @@ impl OrElseEmpty for String {
 fn legacy_dnf_history(target: &str) -> Option<DnfRecord> {
     let manager = dnf_binary().unwrap_or("dnf");
     let result = run(manager, ["history", "list", target], TIMEOUT);
-    let expression = Regex::new(r"(?m)^\s*(\d+)\s*\|").expect("valid expression");
-    let id = expression
+    static EXPRESSION: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^\s*(\d+)\s*\|").expect("valid expression"));
+    let id = EXPRESSION
         .captures_iter(&result.stdout)
         .last()
         .map(|found| found[1].to_owned())?;
@@ -485,7 +504,7 @@ fn parse_key_records(text: &str) -> Vec<BTreeMap<String, String>> {
     records
 }
 
-fn dnf_group_inventory(subject: &str) -> Vec<(String, String, Vec<String>)> {
+fn dnf_group_inventory(subject: &str) -> &'static [(String, String, Vec<String>)] {
     static GROUPS: OnceLock<Vec<(String, String, Vec<String>)>> = OnceLock::new();
     static ENVIRONMENTS: OnceLock<Vec<(String, String, Vec<String>)>> = OnceLock::new();
     let cache = if subject == "group" {
@@ -493,9 +512,7 @@ fn dnf_group_inventory(subject: &str) -> Vec<(String, String, Vec<String>)> {
     } else {
         &ENVIRONMENTS
     };
-    cache
-        .get_or_init(|| dnf_group_inventory_uncached(subject))
-        .clone()
+    cache.get_or_init(|| dnf_group_inventory_uncached(subject))
 }
 
 fn dnf_group_inventory_uncached(subject: &str) -> Vec<(String, String, Vec<String>)> {
@@ -555,7 +572,7 @@ fn dnf_group_reason(target: &str, record: Option<&DnfRecord>) -> String {
         return "installed as part of a package group".to_owned();
     };
     let memberships: Vec<_> = dnf_group_inventory("group")
-        .into_iter()
+        .iter()
         .filter(|(id, _, members)| {
             record.groups.contains(id) && members.iter().any(|member| member == target)
         })
@@ -569,7 +586,7 @@ fn dnf_group_reason(target: &str, record: Option<&DnfRecord>) -> String {
     }
     let (group_id, group_name, _) = &memberships[0];
     let environments: Vec<_> = dnf_group_inventory("environment")
-        .into_iter()
+        .iter()
         .filter(|(id, _, groups)| record.environments.contains(id) && groups.contains(group_id))
         .collect();
     let group = format!("{group_name} ({group_id})");
@@ -761,7 +778,7 @@ pub fn install_reason(item: &Match) -> String {
         "Zypper" => zypper_history(&item.id),
         _ => None,
     };
-    if item.backend == "DNF" {
+    if item.backend == Backend::Dnf {
         let record = dnf_record(&item.id);
         if item.role == Role::Group {
             return dnf_group_reason(&package_base(&item.id), record.as_ref());
@@ -829,6 +846,10 @@ pub fn install_reason(item: &Match) -> String {
 
 pub fn decorate(items: &mut [Match]) {
     annotate_roles(items);
+    explain(items);
+}
+
+pub fn explain(items: &mut [Match]) {
     for item in items {
         item.reason = install_reason(item);
     }
@@ -840,7 +861,7 @@ mod tests {
 
     #[test]
     fn standalone_reason_is_explicit_about_unknown_source() {
-        let item = Match::new("Standalone", "/home/me/.local/bin/edit", "edit");
+        let item = Match::new(Backend::Standalone, "/home/me/.local/bin/edit", "edit");
         assert!(install_reason(&item).contains("original source is unknown"));
     }
 

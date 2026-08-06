@@ -24,26 +24,55 @@ pub fn sanitize(value: &str) -> String {
         .collect()
 }
 
-pub fn relevant(query: &str, values: &[&str]) -> bool {
-    let needle = norm(query);
-    if needle.is_empty() {
-        return false;
-    }
-    values.iter().any(|value| {
-        let normalized = norm(value);
-        if needle.len() < 3 {
-            needle == normalized
-                || value
-                    .rsplit('.')
-                    .next()
-                    .is_some_and(|tail| needle == norm(tail))
-        } else {
-            normalized.contains(&needle)
-        }
-    })
+/// A normalized query that can be reused across an inventory scan.
+///
+/// Normalizing once matters for native package and AppStream inventories, which
+/// can contain thousands of records. Keeping the matching policy in this type
+/// also prevents optimized detectors from drifting away from `relevant`.
+#[derive(Debug, Clone)]
+pub struct QueryMatcher {
+    needle: String,
 }
 
-pub fn package_base(name: &str) -> String {
+impl QueryMatcher {
+    pub fn new(query: &str) -> Self {
+        Self {
+            needle: norm(query),
+        }
+    }
+
+    pub fn relevant(&self, values: &[&str]) -> bool {
+        if self.needle.is_empty() {
+            return false;
+        }
+        values.iter().any(|value| {
+            let normalized = norm(value);
+            if self.needle.len() < 3 {
+                self.needle == normalized
+                    || value
+                        .rsplit('.')
+                        .next()
+                        .is_some_and(|tail| self.needle == norm(tail))
+            } else {
+                normalized.contains(&self.needle)
+            }
+        })
+    }
+
+    pub fn exact(&self, value: &str) -> bool {
+        norm(value) == self.needle
+    }
+
+    pub fn normalized(&self) -> &str {
+        &self.needle
+    }
+}
+
+pub fn relevant(query: &str, values: &[&str]) -> bool {
+    QueryMatcher::new(query).relevant(values)
+}
+
+pub fn package_base_ref(name: &str) -> &str {
     let base = name.split(':').next().unwrap_or(name);
     const ARCHES: &[&str] = &[
         "aarch64", "alpha", "armv7hl", "armv7hnl", "i386", "i486", "i586", "i686", "ia64",
@@ -51,10 +80,14 @@ pub fn package_base(name: &str) -> String {
     ];
     if let Some((prefix, suffix)) = base.rsplit_once('.') {
         if ARCHES.contains(&suffix) {
-            return prefix.to_owned();
+            return prefix;
         }
     }
-    base.to_owned()
+    base
+}
+
+pub fn package_base(name: &str) -> String {
+    package_base_ref(name).to_owned()
 }
 
 pub fn parse_size(value: &str) -> Option<u64> {
@@ -161,6 +194,16 @@ mod tests {
     #[test]
     fn longer_queries_allow_substring_matches() {
         assert!(relevant("freecad", &["org.freecad.FreeCAD"]));
+    }
+
+    #[test]
+    fn reusable_matcher_has_identical_short_and_fuzzy_rules() {
+        let short = QueryMatcher::new("ed");
+        assert!(!short.relevant(&["editor"]));
+        assert!(short.relevant(&["org.example.ed"]));
+        let fuzzy = QueryMatcher::new("Frée-CAD");
+        assert!(fuzzy.relevant(&["org.freecad.FreeCAD"]));
+        assert!(fuzzy.exact("freecad"));
     }
 
     #[test]

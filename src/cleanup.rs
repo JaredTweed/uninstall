@@ -1,5 +1,5 @@
 use crate::command::{exists, run};
-use crate::model::Match;
+use crate::model::{Backend, Match};
 use crate::util::{absolute_path, home, norm, path_within};
 use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, Mode, OFlags, open, openat, renameat, statat, unlinkat};
@@ -30,7 +30,7 @@ pub struct CleanupCandidate {
 pub struct DataOption {
     pub label: String,
     pub path: Option<PathBuf>,
-    pub backend: Option<String>,
+    pub backend: Option<Backend>,
     pub size_bytes: Option<u64>,
 }
 
@@ -53,7 +53,7 @@ pub fn manager_cleanup_label(item: &Match) -> Option<String> {
 }
 
 fn flatpak_data_path(item: &Match) -> Option<PathBuf> {
-    (item.backend == "Flatpak").then(|| home().join(".var/app").join(&item.id))
+    (item.backend == Backend::Flatpak).then(|| home().join(".var/app").join(&item.id))
 }
 
 pub fn manager_cleanup_size(item: &Match) -> Option<u64> {
@@ -162,7 +162,7 @@ pub fn data_options(items: &[Match], detected: &[PathBuf]) -> Vec<DataOption> {
     let mut options = Vec::new();
     let mut seen = BTreeSet::new();
     for item in items {
-        if manager_cleanup_supported(item) && seen.insert(item.backend.clone()) {
+        if manager_cleanup_supported(item) && seen.insert(item.backend) {
             let backend_items: Vec<&Match> = items
                 .iter()
                 .filter(|candidate| candidate.backend == item.backend)
@@ -178,7 +178,7 @@ pub fn data_options(items: &[Match], detected: &[PathBuf]) -> Vec<DataOption> {
                     manager_cleanup_label(item).unwrap_or_default()
                 ),
                 path: None,
-                backend: Some(item.backend.clone()),
+                backend: Some(item.backend),
                 size_bytes: sizes
                     .iter()
                     .all(Option::is_some)

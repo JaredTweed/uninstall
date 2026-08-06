@@ -1,6 +1,10 @@
 use crate::command::{exists, output, run, which};
-use crate::model::{Match, Role};
-use crate::util::{absolute_path, home, norm, package_base, parse_size, path_within, relevant};
+use crate::model::{Backend, Match, Role};
+use crate::platform::{NativeFamily, native_family, rpm_manager};
+use crate::util::{
+    QueryMatcher, absolute_path, home, norm, package_base, package_base_ref, parse_size,
+    path_within,
+};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use rayon::prelude::*;
@@ -11,9 +15,12 @@ use std::fs;
 use std::io::{Cursor, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 use walkdir::WalkDir;
+
+type OwnerResult = Arc<OnceLock<Vec<Match>>>;
+type OwnerCache = Mutex<HashMap<String, OwnerResult>>;
 
 fn read(path: &Path) -> String {
     fs::read(path)
@@ -21,100 +28,11 @@ fn read(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn os_release() -> HashMap<String, String> {
-    let mut values = HashMap::new();
-    for line in read(Path::new("/etc/os-release")).lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        values.insert(key.to_owned(), value.trim_matches(['\'', '"']).to_owned());
-    }
-    values
-}
-
-fn distro_ids() -> HashSet<String> {
-    let release = os_release();
-    let mut ids = HashSet::new();
-    for key in ["ID", "ID_LIKE"] {
-        if let Some(value) = release.get(key) {
-            ids.extend(value.split_whitespace().map(str::to_owned));
-        }
-    }
-    ids
-}
-
-pub fn rpm_manager() -> Option<&'static str> {
-    let ids = distro_ids();
-    if Path::new("/run/ostree-booted").exists() && exists("rpm-ostree") {
-        return Some("RPM-OSTree");
-    }
-    if ids.contains("opensuse") || ids.contains("suse") || ids.contains("sles") {
-        return exists("zypper").then_some("Zypper");
-    }
-    if ids.contains("mageia") || ids.contains("openmandriva") {
-        return exists("urpme").then_some("URPMI");
-    }
-    if ids.contains("altlinux") && exists("apt-get") {
-        return Some("APT-RPM");
-    }
-    if exists("dnf5") || exists("dnf") || exists("microdnf") {
-        return Some("DNF");
-    }
-    if exists("yum") {
-        return Some("YUM");
-    }
-    exists("rpm").then_some("RPM")
-}
-
-pub fn dnf_binary() -> Option<&'static str> {
-    ["dnf5", "dnf", "microdnf"]
-        .into_iter()
-        .find(|name| exists(name))
-}
-
-fn native_family() -> &'static str {
-    let ids = distro_ids();
-    if ids
-        .iter()
-        .any(|id| ["debian", "ubuntu", "linuxmint", "pop"].contains(&id.as_str()))
-    {
-        "apt"
-    } else if ids
-        .iter()
-        .any(|id| ["arch", "manjaro", "endeavouros"].contains(&id.as_str()))
-    {
-        "pacman"
-    } else if ids.contains("alpine") {
-        "apk"
-    } else if ids.contains("void") {
-        "xbps"
-    } else if ids.contains("gentoo") {
-        "portage"
-    } else if ids.contains("slackware") {
-        "slackware"
-    } else if ids.contains("solus") {
-        "eopkg"
-    } else if ids.contains("clear-linux-os") {
-        "swupd"
-    } else if rpm_manager().is_some() {
-        "rpm"
-    } else if exists("dpkg-query") {
-        "apt"
-    } else if exists("pacman") {
-        "pacman"
-    } else if exists("apk") {
-        "apk"
-    } else if exists("xbps-query") {
-        "xbps"
-    } else {
-        ""
-    }
-}
-
 fn detect_flatpak(query: &str) -> Vec<Match> {
     if !exists("flatpak") {
         return Vec::new();
     }
+    let matcher = QueryMatcher::new(query);
     let mut locations = vec![
         ("user".to_owned(), String::new()),
         ("system".to_owned(), String::new()),
@@ -152,10 +70,10 @@ fn detect_flatpak(query: &str) -> Vec<Match> {
         );
         for line in text.lines() {
             let fields: Vec<&str> = line.split('\t').collect();
-            if fields.len() < 2 || !relevant(query, &[fields[0], fields[1]]) {
+            if fields.len() < 2 || !matcher.relevant(&[fields[0], fields[1]]) {
                 continue;
             }
-            let mut item = Match::new("Flatpak", fields[0], fields[1]);
+            let mut item = Match::new(Backend::Flatpak, fields[0], fields[1]);
             item.version = fields.get(2).copied().unwrap_or_default().to_owned();
             item.origin = fields.get(3).copied().unwrap_or_default().to_owned();
             item.installed_size_bytes = fields.get(4).and_then(|size| parse_size(size));
@@ -172,15 +90,16 @@ fn detect_snap(query: &str) -> Vec<Match> {
     if !exists("snap") {
         return Vec::new();
     }
+    let matcher = QueryMatcher::new(query);
     output("snap", &["list"])
         .lines()
         .skip(1)
         .filter_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 2 || !relevant(query, &[fields[0]]) {
+            if fields.len() < 2 || !matcher.relevant(&[fields[0]]) {
                 return None;
             }
-            let mut item = Match::new("Snap", fields[0], fields[0]);
+            let mut item = Match::new(Backend::Snap, fields[0], fields[0]);
             item.version = fields[1].to_owned();
             item.role = Role::Explicit;
             Some(item)
@@ -200,7 +119,7 @@ fn apt_inventory_uncached() -> Vec<Match> {
             if fields.len() != 5 || fields[0].as_bytes().get(1) != Some(&b'i') {
                 return None;
             }
-            let mut item = Match::new("APT", fields[1], fields[1]);
+            let mut item = Match::new(Backend::Apt, fields[1], fields[1]);
             item.version = fields[2].to_owned();
             item.summary = fields[3].to_owned();
             item.installed_size_bytes = fields[4].parse::<u64>().ok().map(|size| size * 1024);
@@ -209,15 +128,17 @@ fn apt_inventory_uncached() -> Vec<Match> {
         .collect()
 }
 
-fn apt_inventory() -> Vec<Match> {
+fn apt_inventory() -> &'static [Match] {
     static CACHE: OnceLock<Vec<Match>> = OnceLock::new();
-    CACHE.get_or_init(apt_inventory_uncached).clone()
+    CACHE.get_or_init(apt_inventory_uncached)
 }
 
 fn detect_apt(query: &str) -> Vec<Match> {
+    let matcher = QueryMatcher::new(query);
     apt_inventory()
-        .into_iter()
-        .filter(|item| relevant(query, &[&item.id, &item.summary]))
+        .iter()
+        .filter(|item| matcher.relevant(&[&item.id, &item.summary]))
+        .cloned()
         .collect()
 }
 
@@ -240,6 +161,7 @@ fn rpm_inventory_uncached() -> Vec<Match> {
     let Some(kind) = rpm_manager() else {
         return Vec::new();
     };
+    let backend = Backend::parse(kind).expect("known RPM backend");
     if !exists("rpm") {
         return Vec::new();
     }
@@ -262,7 +184,7 @@ fn rpm_inventory_uncached() -> Vec<Match> {
         } else {
             format!("{}.{}", fields[1], fields[5])
         };
-        let mut item = Match::new(kind, id, fields[1]);
+        let mut item = Match::new(backend, id, fields[1]);
         item.version = fields[2].to_owned();
         item.summary = fields[3].to_owned();
         item.installed_size_bytes = fields[4].parse().ok();
@@ -275,19 +197,20 @@ fn rpm_inventory_uncached() -> Vec<Match> {
     found
 }
 
-fn rpm_inventory() -> Vec<Match> {
+fn rpm_inventory() -> &'static [Match] {
     static CACHE: OnceLock<Vec<Match>> = OnceLock::new();
-    CACHE.get_or_init(rpm_inventory_uncached).clone()
+    CACHE.get_or_init(rpm_inventory_uncached)
 }
 
 fn detect_rpm(query: &str) -> Vec<Match> {
-    let needle = norm(query);
+    let matcher = QueryMatcher::new(query);
     let mut records: Vec<Match> = rpm_inventory()
-        .into_iter()
-        .filter(|item| relevant(query, &[&item.name, &item.summary]) || norm(&item.id) == needle)
+        .iter()
+        .filter(|item| matcher.relevant(&[&item.name, &item.summary]) || matcher.exact(&item.id))
+        .cloned()
         .collect();
-    if records.iter().any(|item| norm(&item.id) == needle) {
-        records.retain(|item| norm(&item.id) == needle);
+    if records.iter().any(|item| matcher.exact(&item.id)) {
+        records.retain(|item| matcher.exact(&item.id));
     }
     records
 }
@@ -323,7 +246,7 @@ fn pacman_inventory_uncached() -> Vec<Match> {
         .into_iter()
         .filter_map(|record| {
             let name = record.get("Name")?.clone();
-            let mut item = Match::new("Pacman", &name, &name);
+            let mut item = Match::new(Backend::Pacman, &name, &name);
             item.version = record.get("Version").cloned().unwrap_or_default();
             item.summary = record.get("Description").cloned().unwrap_or_default();
             item.installed_size_bytes = record
@@ -342,15 +265,17 @@ fn pacman_inventory_uncached() -> Vec<Match> {
         .collect()
 }
 
-fn pacman_inventory() -> Vec<Match> {
+fn pacman_inventory() -> &'static [Match] {
     static CACHE: OnceLock<Vec<Match>> = OnceLock::new();
-    CACHE.get_or_init(pacman_inventory_uncached).clone()
+    CACHE.get_or_init(pacman_inventory_uncached)
 }
 
 fn detect_pacman(query: &str) -> Vec<Match> {
+    let matcher = QueryMatcher::new(query);
     pacman_inventory()
-        .into_iter()
-        .filter(|item| relevant(query, &[&item.id, &item.summary]))
+        .iter()
+        .filter(|item| matcher.relevant(&[&item.id, &item.summary]))
+        .cloned()
         .collect()
 }
 
@@ -419,24 +344,17 @@ fn apk_inventory_uncached() -> Vec<PackageRecord> {
         .collect()
 }
 
-fn apk_inventory() -> Vec<PackageRecord> {
+fn apk_inventory() -> &'static [PackageRecord] {
     static CACHE: OnceLock<Vec<PackageRecord>> = OnceLock::new();
-    CACHE.get_or_init(apk_inventory_uncached).clone()
+    CACHE.get_or_init(apk_inventory_uncached)
 }
 
 fn detect_apk(query: &str) -> Vec<Match> {
+    let matcher = QueryMatcher::new(query);
     apk_inventory()
-        .into_iter()
-        .filter(|record| relevant(query, &[&record.name, &record.summary]))
-        .map(|record| {
-            let mut item = Match::new("APK", &record.name, &record.name);
-            item.version = record.version;
-            item.summary = record.summary;
-            item.installed_size_bytes = record.size;
-            item.role = record.role;
-            item.origin = record.origin;
-            item
-        })
+        .iter()
+        .filter(|record| matcher.relevant(&[&record.name, &record.summary]))
+        .map(|record| package_record_match(Backend::Apk, record))
         .collect()
 }
 
@@ -506,29 +424,32 @@ fn opkg_inventory_uncached() -> Vec<PackageRecord> {
         .collect()
 }
 
-fn opkg_inventory() -> Vec<PackageRecord> {
+fn opkg_inventory() -> &'static [PackageRecord] {
     static CACHE: OnceLock<Vec<PackageRecord>> = OnceLock::new();
-    CACHE.get_or_init(opkg_inventory_uncached).clone()
+    CACHE.get_or_init(opkg_inventory_uncached)
 }
 
-fn records_to_matches(query: &str, backend: &str, records: Vec<PackageRecord>) -> Vec<Match> {
+fn records_to_matches(query: &str, backend: Backend, records: &[PackageRecord]) -> Vec<Match> {
+    let matcher = QueryMatcher::new(query);
     records
-        .into_iter()
-        .filter(|record| relevant(query, &[&record.name, &record.summary]))
-        .map(|record| {
-            let mut item = Match::new(backend, &record.name, &record.name);
-            item.version = record.version;
-            item.summary = record.summary;
-            item.installed_size_bytes = record.size;
-            item.role = record.role;
-            item.origin = record.origin;
-            item
-        })
+        .iter()
+        .filter(|record| matcher.relevant(&[&record.name, &record.summary]))
+        .map(|record| package_record_match(backend, record))
         .collect()
 }
 
+fn package_record_match(backend: Backend, record: &PackageRecord) -> Match {
+    let mut item = Match::new(backend, &record.name, &record.name);
+    item.version.clone_from(&record.version);
+    item.summary.clone_from(&record.summary);
+    item.installed_size_bytes = record.size;
+    item.role = record.role;
+    item.origin.clone_from(&record.origin);
+    item
+}
+
 fn detect_opkg(query: &str) -> Vec<Match> {
-    records_to_matches(query, "OPKG", opkg_inventory())
+    records_to_matches(query, Backend::Opkg, opkg_inventory())
 }
 
 fn split_xbps(value: &str) -> (String, String) {
@@ -575,19 +496,20 @@ fn xbps_inventory_uncached() -> Vec<PackageRecord> {
         .collect()
 }
 
-fn xbps_inventory() -> Vec<PackageRecord> {
+fn xbps_inventory() -> &'static [PackageRecord] {
     static CACHE: OnceLock<Vec<PackageRecord>> = OnceLock::new();
-    CACHE.get_or_init(xbps_inventory_uncached).clone()
+    CACHE.get_or_init(xbps_inventory_uncached)
 }
 
 fn detect_xbps(query: &str) -> Vec<Match> {
-    records_to_matches(query, "XBPS", xbps_inventory())
+    records_to_matches(query, Backend::Xbps, xbps_inventory())
 }
 
 fn detect_portage(query: &str) -> Vec<Match> {
     if !exists("emerge") {
         return Vec::new();
     }
+    let matcher = QueryMatcher::new(query);
     let prefix = std::env::var_os("EPREFIX").map_or_else(|| PathBuf::from("/"), PathBuf::from);
     let root = prefix.join("var/db/pkg");
     let world = read(&prefix.join("var/lib/portage/world"));
@@ -607,10 +529,10 @@ fn detect_portage(query: &str) -> Vec<Match> {
             }
             let id = format!("{}/{}", category.file_name().to_string_lossy(), name);
             let summary = read(&package.path().join("DESCRIPTION")).trim().to_owned();
-            if !relevant(query, &[&id, &name, &summary]) {
+            if !matcher.relevant(&[&id, &name, &summary]) {
                 continue;
             }
-            let mut item = Match::new("Portage", id, name);
+            let mut item = Match::new(Backend::Portage, id, name);
             item.version = read(&package.path().join("PVR")).trim().to_owned();
             item.summary = summary;
             item.origin = read(&package.path().join("repository")).trim().to_owned();
@@ -657,16 +579,17 @@ fn detect_slackware(query: &str) -> Vec<Match> {
     static EXPRESSION: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"^(.+)-([^-]+)-([^-]+)-([^-]+)$").expect("valid Slackware expression")
     });
+    let matcher = QueryMatcher::new(query);
     entries
         .flatten()
         .filter_map(|entry| {
             let package = entry.file_name().to_string_lossy().into_owned();
             let capture = EXPRESSION.captures(&package);
             let name = capture.as_ref().map_or(package.as_str(), |value| &value[1]);
-            if !relevant(query, &[name]) {
+            if !matcher.relevant(&[name]) {
                 return None;
             }
-            let mut item = Match::new("Slackware", name, name);
+            let mut item = Match::new(Backend::Slackware, name, name);
             item.version = capture.map_or_else(String::new, |value| value[2].to_owned());
             Some(item)
         })
@@ -677,11 +600,13 @@ fn detect_eopkg(query: &str) -> Vec<Match> {
     if !exists("eopkg") {
         return Vec::new();
     }
+    let matcher = QueryMatcher::new(query);
     eopkg_inventory()
-        .into_iter()
-        .filter(|record| relevant(query, &[&record.name, &record.summary]))
+        .iter()
+        .filter(|record| matcher.relevant(&[&record.name, &record.summary]))
+        .cloned()
         .map(|record| {
-            let mut item = Match::new("Eopkg", &record.name, &record.name);
+            let mut item = Match::new(Backend::Eopkg, &record.name, &record.name);
             item.version = record.version;
             item.role = record.role;
             item.summary = record.summary;
@@ -720,15 +645,16 @@ fn eopkg_inventory_uncached() -> Vec<PackageRecord> {
         .collect()
 }
 
-fn eopkg_inventory() -> Vec<PackageRecord> {
+fn eopkg_inventory() -> &'static [PackageRecord] {
     static CACHE: OnceLock<Vec<PackageRecord>> = OnceLock::new();
-    CACHE.get_or_init(eopkg_inventory_uncached).clone()
+    CACHE.get_or_init(eopkg_inventory_uncached)
 }
 
 fn detect_swupd(query: &str) -> Vec<Match> {
     if !exists("swupd") {
         return Vec::new();
     }
+    let matcher = QueryMatcher::new(query);
     let result = run(
         "swupd",
         ["bundle-list", "--status", "--quiet"],
@@ -739,10 +665,10 @@ fn detect_swupd(query: &str) -> Vec<Match> {
         let Some((name, detail)) = line.split_once(':') else {
             continue;
         };
-        if !relevant(query, &[name]) {
+        if !matcher.relevant(&[name]) {
             continue;
         }
-        let mut item = Match::new("Swupd", name.trim(), name.trim());
+        let mut item = Match::new(Backend::Swupd, name.trim(), name.trim());
         item.role = if detail.to_ascii_lowercase().contains("explicit") {
             Role::Explicit
         } else {
@@ -757,17 +683,20 @@ fn detect_swupd_third_party(query: &str) -> Vec<Match> {
     if !exists("swupd") {
         return Vec::new();
     }
+    let matcher = QueryMatcher::new(query);
     let list = run("swupd", ["3rd-party", "list"], Duration::from_secs(30));
     if !list.ok() {
         return Vec::new();
     }
-    let repo_expression = Regex::new(r"(?i)(?:repo|repository)\s*[: ]\s*([A-Za-z0-9+_.-]+)")
-        .expect("valid Swupd expression");
+    static REPOSITORY_EXPRESSION: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)(?:repo|repository)\s*[: ]\s*([A-Za-z0-9+_.-]+)")
+            .expect("valid Swupd expression")
+    });
     let repositories: BTreeSet<String> = list
         .combined()
         .lines()
         .filter_map(|line| {
-            repo_expression
+            REPOSITORY_EXPRESSION
                 .captures(line)
                 .map(|value| value[1].to_owned())
         })
@@ -787,8 +716,8 @@ fn detect_swupd_third_party(query: &str) -> Vec<Match> {
             .lines()
             .filter_map(|line| line.split_whitespace().next())
         {
-            if relevant(query, &[id]) {
-                let mut item = Match::new("Swupd 3rd-party", id, id);
+            if matcher.relevant(&[id]) {
+                let mut item = Match::new(Backend::SwupdThirdParty, id, id);
                 item.origin = repository.clone();
                 item.role = Role::Explicit;
                 found.push(item);
@@ -802,10 +731,14 @@ fn detect_homebrew(query: &str) -> Vec<Match> {
     if !exists("brew") {
         return Vec::new();
     }
+    let matcher = QueryMatcher::new(query);
     let value: Value = serde_json::from_str(&output("brew", &["info", "--json=v2", "--installed"]))
         .unwrap_or(Value::Null);
     let mut found = Vec::new();
-    for (backend, key) in [("Homebrew", "formulae"), ("Homebrew Cask", "casks")] {
+    for (backend, key) in [
+        (Backend::Homebrew, "formulae"),
+        (Backend::HomebrewCask, "casks"),
+    ] {
         for details in value
             .get(key)
             .and_then(Value::as_array)
@@ -819,7 +752,7 @@ fn detect_homebrew(query: &str) -> Vec<Match> {
             else {
                 continue;
             };
-            if !relevant(query, &[id]) {
+            if !matcher.relevant(&[id]) {
                 continue;
             }
             let installed = details
@@ -872,6 +805,7 @@ fn gearlever_command() -> Option<(String, Vec<String>)> {
 }
 
 fn detect_gearlever(query: &str) -> Vec<Match> {
+    let matcher = QueryMatcher::new(query);
     let Some((program, prefix)) = gearlever_command() else {
         return Vec::new();
     };
@@ -903,19 +837,16 @@ fn detect_gearlever(query: &str) -> Vec<Match> {
         if !path.is_absolute() || (!path.is_file() && !path.is_symlink()) {
             continue;
         }
-        if !relevant(
-            query,
-            &[
-                name,
-                path.file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or_default(),
-                path_value,
-            ],
-        ) {
+        if !matcher.relevant(&[
+            name,
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default(),
+            path_value,
+        ]) {
             continue;
         }
-        let mut item = Match::new("Gear Lever", path_value, name);
+        let mut item = Match::new(Backend::GearLever, path_value, name);
         item.source_path = Some(path);
         item.scope = "user".to_owned();
         item.version = details
@@ -943,6 +874,7 @@ fn detect_pipx(query: &str) -> Vec<Match> {
     if !exists("pipx") {
         return Vec::new();
     }
+    let matcher = QueryMatcher::new(query);
     let mut found = Vec::new();
     for (scope, global) in [("user", false), ("system", true)] {
         let args = if global {
@@ -968,12 +900,12 @@ fn detect_pipx(query: &str) -> Vec<Match> {
                     .flatten()
                     .filter_map(Value::as_str)
                     .collect();
-                if !relevant(query, &[environment, name])
-                    && !apps.iter().any(|app| relevant(query, &[*app]))
+                if !matcher.relevant(&[environment, name])
+                    && !apps.iter().any(|app| matcher.relevant(&[*app]))
                 {
                     continue;
                 }
-                let mut item = Match::new("Pipx", environment, name);
+                let mut item = Match::new(Backend::Pipx, environment, name);
                 item.version = main
                     .and_then(|value| value.get("package_version"))
                     .and_then(Value::as_str)
@@ -986,7 +918,7 @@ fn detect_pipx(query: &str) -> Vec<Match> {
                     .to_owned();
                 item.scope = scope.to_owned();
                 item.role = Role::Explicit;
-                if let Some(app) = apps.iter().find(|app| relevant(query, &[*app])) {
+                if let Some(app) = apps.iter().find(|app| matcher.relevant(&[*app])) {
                     item.command_path = which(app);
                 }
                 found.push(item);
@@ -1000,6 +932,7 @@ fn detect_uv(query: &str) -> Vec<Match> {
     if !exists("uv") {
         return Vec::new();
     }
+    let matcher = QueryMatcher::new(query);
     let text = output("uv", &["tool", "list"]);
     let mut records: Vec<(String, String, Vec<String>)> = Vec::new();
     for line in text.lines() {
@@ -1031,15 +964,16 @@ fn detect_uv(query: &str) -> Vec<Match> {
     }
     let mut found = Vec::new();
     for (name, version, commands) in records {
-        if !relevant(query, &[&name]) && !commands.iter().any(|command| relevant(query, &[command]))
+        if !matcher.relevant(&[&name])
+            && !commands.iter().any(|command| matcher.relevant(&[command]))
         {
             continue;
         }
-        let mut item = Match::new("UV Tool", &name, &name);
+        let mut item = Match::new(Backend::UvTool, &name, &name);
         item.version = version;
         item.scope = "user".to_owned();
         item.role = Role::Explicit;
-        if let Some(command) = commands.iter().find(|command| relevant(query, &[command])) {
+        if let Some(command) = commands.iter().find(|command| matcher.relevant(&[command])) {
             item.command_path = which(command);
         }
         found.push(item);
@@ -1047,22 +981,56 @@ fn detect_uv(query: &str) -> Vec<Match> {
     found
 }
 
+fn npm_global_names(prefix: &Path) -> Option<Vec<String>> {
+    let root = prefix.join("lib/node_modules");
+    let entries = fs::read_dir(root).ok()?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.ok()?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('@') {
+            let scoped = fs::read_dir(entry.path()).ok()?;
+            for package in scoped {
+                let package = package.ok()?;
+                names.push(format!("{name}/{}", package.file_name().to_string_lossy()));
+            }
+        } else {
+            names.push(name);
+        }
+    }
+    Some(names)
+}
+
 fn detect_npm(query: &str) -> Vec<Match> {
     if !exists("npm") {
+        return Vec::new();
+    }
+    let matcher = QueryMatcher::new(query);
+    let prefix_text = output("npm", &["prefix", "--global"]);
+    let prefix = PathBuf::from(prefix_text.trim());
+    if !prefix.as_os_str().is_empty()
+        && npm_global_names(&prefix)
+            .is_some_and(|names| !names.iter().any(|name| matcher.relevant(&[name])))
+    {
         return Vec::new();
     }
     let value: Value =
         serde_json::from_str(&output("npm", &["list", "--global", "--depth=0", "--json"]))
             .unwrap_or(Value::Null);
-    let prefix = PathBuf::from(output("npm", &["prefix", "--global"]).trim());
-    value
+    let matching: Vec<_> = value
         .get("dependencies")
         .and_then(Value::as_object)
         .into_iter()
         .flatten()
-        .filter(|(name, _)| relevant(query, &[name]))
+        .filter(|(name, _)| matcher.relevant(&[name]))
+        .collect();
+    if matching.is_empty() {
+        return Vec::new();
+    }
+    matching
+        .into_iter()
         .map(|(name, metadata)| {
-            let mut item = Match::new("NPM", name, name);
+            let mut item = Match::new(Backend::Npm, name, name);
             item.version = metadata
                 .get("version")
                 .and_then(Value::as_str)
@@ -1095,6 +1063,7 @@ fn detect_cargo(query: &str) -> Vec<Match> {
     if !exists("cargo") {
         return Vec::new();
     }
+    let matcher = QueryMatcher::new(query);
     let value: Value =
         serde_json::from_str(&read(&cargo_root().join(".crates2.json"))).unwrap_or(Value::Null);
     static EXPRESSION: LazyLock<Regex> = LazyLock::new(|| {
@@ -1117,12 +1086,12 @@ fn detect_cargo(query: &str) -> Vec<Match> {
             .flatten()
             .filter_map(Value::as_str)
             .collect();
-        if !relevant(query, &[&capture[1]])
-            && !binaries.iter().any(|binary| relevant(query, &[*binary]))
+        if !matcher.relevant(&[&capture[1]])
+            && !binaries.iter().any(|binary| matcher.relevant(&[*binary]))
         {
             continue;
         }
-        let mut item = Match::new("Cargo", &capture[1], &capture[1]);
+        let mut item = Match::new(Backend::Cargo, &capture[1], &capture[1]);
         item.version = capture[2].to_owned();
         item.origin = capture[3].to_owned();
         item.scope = "user".to_owned();
@@ -1136,14 +1105,15 @@ fn detect_cargo(query: &str) -> Vec<Match> {
 }
 
 fn detect_nix(query: &str) -> Vec<Match> {
+    let matcher = QueryMatcher::new(query);
     let mut found = Vec::new();
     if exists("nix") {
         let value: Value = serde_json::from_str(&output("nix", &["profile", "list", "--json"]))
             .unwrap_or(Value::Null);
         let elements = value.get("elements").unwrap_or(&value);
         for (id, _) in elements.as_object().into_iter().flatten() {
-            if relevant(query, &[id]) {
-                let mut item = Match::new("Nix", id, id);
+            if matcher.relevant(&[id]) {
+                let mut item = Match::new(Backend::Nix, id, id);
                 item.scope = "user".to_owned();
                 item.role = Role::Explicit;
                 found.push(item);
@@ -1157,8 +1127,8 @@ fn detect_nix(query: &str) -> Vec<Match> {
                 continue;
             };
             let (name, version) = split_name_version(package);
-            if relevant(query, &[&name]) {
-                let mut item = Match::new("Nix Legacy", &name, &name);
+            if matcher.relevant(&[&name]) {
+                let mut item = Match::new(Backend::NixLegacy, &name, &name);
                 item.version = version;
                 item.origin = fields.get(1).copied().unwrap_or_default().to_owned();
                 item.scope = "user".to_owned();
@@ -1183,6 +1153,7 @@ fn detect_guix(query: &str) -> Vec<Match> {
     if !exists("guix") {
         return Vec::new();
     }
+    let matcher = QueryMatcher::new(query);
     let profile = std::env::var_os("GUIX_PROFILE")
         .map_or_else(|| home().join(".guix-profile"), PathBuf::from);
     let option = format!("--profile={}", profile.display());
@@ -1190,10 +1161,10 @@ fn detect_guix(query: &str) -> Vec<Match> {
         .lines()
         .filter_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 2 || !relevant(query, &[fields[0]]) {
+            if fields.len() < 2 || !matcher.relevant(&[fields[0]]) {
                 return None;
             }
-            let mut item = Match::new("Guix", fields[0], fields[0]);
+            let mut item = Match::new(Backend::Guix, fields[0], fields[0]);
             item.version = fields[1].to_owned();
             item.profile = profile.display().to_string();
             item.scope = "user".to_owned();
@@ -1204,6 +1175,7 @@ fn detect_guix(query: &str) -> Vec<Match> {
 }
 
 fn detect_conda(query: &str) -> Vec<Match> {
+    let matcher = QueryMatcher::new(query);
     let manager = if exists("conda") {
         "conda"
     } else if exists("micromamba") {
@@ -1229,14 +1201,14 @@ fn detect_conda(query: &str) -> Vec<Match> {
             let Some(id) = package.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            if !relevant(query, &[id]) {
+            if !matcher.relevant(&[id]) {
                 continue;
             }
             let mut item = Match::new(
                 if manager == "conda" {
-                    "Conda"
+                    Backend::Conda
                 } else {
-                    "Micromamba"
+                    Backend::Micromamba
                 },
                 id,
                 id,
@@ -1303,6 +1275,18 @@ fn find_executable(query: &str) -> Option<PathBuf> {
 }
 
 fn detect_owner(query: &str) -> Vec<Match> {
+    static CACHE: OnceLock<OwnerCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let entry = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(query.to_owned())
+        .or_insert_with(|| Arc::new(OnceLock::new()))
+        .clone();
+    entry.get_or_init(|| detect_owner_uncached(query)).clone()
+}
+
+fn detect_owner_uncached(query: &str) -> Vec<Match> {
     if query.is_empty()
         || Path::new(query)
             .file_name()
@@ -1319,6 +1303,7 @@ fn detect_owner(query: &str) -> Vec<Match> {
     let resolved_text = resolved.display().to_string();
     let visible_text = visible.display().to_string();
     if let Some(kind) = rpm_manager() {
+        let backend = Backend::parse(kind).expect("known RPM backend");
         for candidate in [&resolved_text, &visible_text] {
             let text = output(
                 "rpm",
@@ -1343,7 +1328,7 @@ fn detect_owner(query: &str) -> Vec<Match> {
                 } else {
                     format!("{}.{}", fields[0], architecture)
                 };
-                let mut item = Match::new(kind, id, fields[0]);
+                let mut item = Match::new(backend, id, fields[0]);
                 item.version = fields[1].to_owned();
                 item.architecture = architecture.to_owned();
                 item.summary = fields.get(3).copied().unwrap_or_default().to_owned();
@@ -1369,7 +1354,7 @@ fn detect_owner(query: &str) -> Vec<Match> {
                 );
                 let fields: Vec<&str> = details.trim().split('\t').collect();
                 if fields.len() >= 3 && fields[0].as_bytes().get(1) == Some(&b'i') {
-                    let mut item = Match::new("APT", fields[1], fields[1]);
+                    let mut item = Match::new(Backend::Apt, fields[1], fields[1]);
                     item.version = fields[2].to_owned();
                     item.summary = fields.get(3).copied().unwrap_or_default().to_owned();
                     item.installed_size_bytes = fields
@@ -1389,7 +1374,7 @@ fn detect_owner(query: &str) -> Vec<Match> {
                 let details = parse_key_value_records(&output("pacman", &["-Qi", name]));
                 if let Some(record) = details.first() {
                     let id = record.get("Name").map_or(name, String::as_str);
-                    let mut item = Match::new("Pacman", id, id);
+                    let mut item = Match::new(Backend::Pacman, id, id);
                     item.version = record.get("Version").cloned().unwrap_or_default();
                     item.summary = record.get("Description").cloned().unwrap_or_default();
                     item.installed_size_bytes = record
@@ -1410,33 +1395,41 @@ fn detect_owner(query: &str) -> Vec<Match> {
         }
     }
     for (backend, program, args) in [
-        ("APK", "apk", vec!["info", "--who-owns", &resolved_text]),
-        ("OPKG", "opkg", vec!["search", &resolved_text]),
-        ("XBPS", "xbps-query", vec!["--ownedby", &resolved_text]),
-        ("Eopkg", "eopkg", vec!["search-file", &resolved_text]),
+        (
+            Backend::Apk,
+            "apk",
+            vec!["info", "--who-owns", &resolved_text],
+        ),
+        (Backend::Opkg, "opkg", vec!["search", &resolved_text]),
+        (
+            Backend::Xbps,
+            "xbps-query",
+            vec!["--ownedby", &resolved_text],
+        ),
+        (Backend::Eopkg, "eopkg", vec!["search-file", &resolved_text]),
     ] {
         if !exists(program) {
             continue;
         }
         let text = output(program, &args);
-        let inventories = match backend {
-            "APK" => apk_inventory(),
-            "OPKG" => opkg_inventory(),
-            "XBPS" => xbps_inventory(),
-            "Eopkg" => eopkg_inventory(),
-            _ => Vec::new(),
+        let inventories: &[PackageRecord] = match backend {
+            Backend::Apk => apk_inventory(),
+            Backend::Opkg => opkg_inventory(),
+            Backend::Xbps => xbps_inventory(),
+            Backend::Eopkg => eopkg_inventory(),
+            _ => unreachable!("ownership backend"),
         };
         if let Some(record) = inventories
-            .into_iter()
+            .iter()
             .find(|record| text.contains(&record.name))
         {
             let mut item = Match::new(backend, &record.name, &record.name);
-            item.version = record.version;
-            item.summary = record.summary;
+            item.version.clone_from(&record.version);
+            item.summary.clone_from(&record.summary);
             item.installed_size_bytes = record.size;
             item.command_path = Some(visible.clone());
             item.role = record.role;
-            item.origin = record.origin;
+            item.origin.clone_from(&record.origin);
             return vec![item];
         }
     }
@@ -1473,7 +1466,7 @@ fn detect_owner(query: &str) -> Vec<Match> {
                 .and_then(|name| name.to_str())
                 .unwrap_or_default();
             let (name, version) = split_name_version(package_dir);
-            let mut item = Match::new("Portage", format!("{category}/{name}"), name);
+            let mut item = Match::new(Backend::Portage, format!("{category}/{name}"), name);
             item.version = version;
             item.command_path = Some(visible.clone());
             item.origin = read(&package.join("repository")).trim().to_owned();
@@ -1507,7 +1500,7 @@ fn detect_owner(query: &str) -> Vec<Match> {
                 let package = entry.file_name().to_string_lossy().into_owned();
                 let fields: Vec<&str> = package.rsplitn(4, '-').collect();
                 let name = fields.get(3).copied().unwrap_or(&package);
-                let mut item = Match::new("Slackware", name, name);
+                let mut item = Match::new(Backend::Slackware, name, name);
                 item.version = fields.get(2).copied().unwrap_or_default().to_owned();
                 item.command_path = Some(visible.clone());
                 return vec![item];
@@ -1555,7 +1548,7 @@ fn detect_owner(query: &str) -> Vec<Match> {
             .file_stem()
             .and_then(|value| value.to_str())
             .unwrap_or(query);
-        let mut item = Match::new("AppImage", resolved_text, name);
+        let mut item = Match::new(Backend::AppImage, resolved_text, name);
         item.source_path = Some(resolved.clone());
         item.command_path = (visible != resolved).then_some(visible);
         item.scope = if path_within(&resolved, &home()) {
@@ -1581,7 +1574,7 @@ fn detect_owner(query: &str) -> Vec<Match> {
             .iter()
             .any(|marker| resolved_text.contains(marker))
     {
-        let mut item = Match::new("Standalone", &visible_text, query);
+        let mut item = Match::new(Backend::Standalone, &visible_text, query);
         item.source_path = Some(visible.clone());
         item.command_path = Some(visible.clone());
         item.scope = if path_within(item.source_path.as_ref().expect("path"), &home()) {
@@ -1598,6 +1591,7 @@ fn detect_owner(query: &str) -> Vec<Match> {
 }
 
 fn detect_appimages(query: &str) -> Vec<Match> {
+    let matcher = QueryMatcher::new(query);
     let direct = PathBuf::from(query);
     if direct.is_file()
         && (direct
@@ -1610,7 +1604,7 @@ fn detect_appimages(query: &str) -> Vec<Match> {
             .file_stem()
             .and_then(|value| value.to_str())
             .unwrap_or(query);
-        let mut item = Match::new("AppImage", path.display().to_string(), name);
+        let mut item = Match::new(Backend::AppImage, path.display().to_string(), name);
         item.source_path = Some(path.clone());
         item.scope = if path_within(&path, &home()) {
             "user"
@@ -1643,11 +1637,11 @@ fn detect_appimages(query: &str) -> Vec<Match> {
                 .file_name()
                 .and_then(|value| value.to_str())
                 .unwrap_or_default();
-            if !name.to_ascii_lowercase().ends_with(".appimage") || !relevant(query, &[name]) {
+            if !name.to_ascii_lowercase().ends_with(".appimage") || !matcher.relevant(&[name]) {
                 continue;
             }
             let mut item = Match::new(
-                "AppImage",
+                Backend::AppImage,
                 path.display().to_string(),
                 path.file_stem()
                     .and_then(|value| value.to_str())
@@ -1721,23 +1715,25 @@ fn desktop_entries() -> Vec<(String, String, String, PathBuf)> {
 }
 
 fn detect_desktop(query: &str) -> Vec<Match> {
+    let matcher = QueryMatcher::new(query);
     let mut found = Vec::new();
     for (name, executable, container, desktop) in desktop_entries() {
-        if !relevant(
-            query,
-            &[
-                &name,
-                &executable,
-                desktop
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or_default(),
-            ],
-        ) {
+        if !matcher.relevant(&[
+            &name,
+            &executable,
+            desktop
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default(),
+        ]) {
             continue;
         }
         if !container.is_empty() {
-            let mut item = Match::new("Container Export", desktop.display().to_string(), name);
+            let mut item = Match::new(
+                Backend::ContainerExport,
+                desktop.display().to_string(),
+                name,
+            );
             item.profile = container;
             item.source_path = Some(desktop);
             item.role = Role::Explicit;
@@ -1745,7 +1741,7 @@ fn detect_desktop(query: &str) -> Vec<Match> {
         } else {
             let path = PathBuf::from(&executable);
             if path.is_file() && is_appimage(&path) {
-                let mut item = Match::new("AppImage", path.display().to_string(), name);
+                let mut item = Match::new(Backend::AppImage, path.display().to_string(), name);
                 item.source_path = Some(path);
                 item.role = Role::Explicit;
                 item.installed_size_bytes = item
@@ -1772,7 +1768,7 @@ fn detect_desktop(query: &str) -> Vec<Match> {
                     continue;
                 }
                 for mut item in detect_owner(command) {
-                    if item.backend != "Standalone" {
+                    if item.backend != Backend::Standalone {
                         item.name.clone_from(&name);
                         found.push(item);
                     }
@@ -1810,7 +1806,9 @@ fn detect_archive(query: &str) -> Vec<Match> {
             let id = format!("{}.{}", fields[0], fields[2]);
             let installed = output("rpm", &["-q", "--qf", "%{VERSION}-%{RELEASE}\n", "--", &id]);
             if !installed.trim().is_empty() {
-                let mut item = Match::new(rpm_manager().unwrap_or("RPM"), &id, fields[0]);
+                let backend =
+                    Backend::parse(rpm_manager().unwrap_or("RPM")).expect("known RPM backend");
+                let mut item = Match::new(backend, &id, fields[0]);
                 item.version = installed.lines().next().unwrap_or_default().to_owned();
                 item.architecture = fields[2].to_owned();
                 item.source_path = Some(absolute_path(&path));
@@ -1834,7 +1832,7 @@ fn detect_archive(query: &str) -> Vec<Match> {
             };
             let installed = output("dpkg-query", &["-W", "-f=${Version}\n", &id]);
             if !installed.trim().is_empty() {
-                let mut item = Match::new("APT", id, fields[0]);
+                let mut item = Match::new(Backend::Apt, id, fields[0]);
                 item.version = installed.trim().to_owned();
                 item.architecture = fields[2].to_owned();
                 item.source_path = Some(absolute_path(&path));
@@ -1851,7 +1849,7 @@ fn detect_archive(query: &str) -> Vec<Match> {
             let installed = output("pacman", &["-Q", fields[0]]);
             let installed_fields: Vec<&str> = installed.split_whitespace().collect();
             if installed_fields.len() >= 2 && installed_fields[0] == fields[0] {
-                let mut item = Match::new("Pacman", fields[0], fields[0]);
+                let mut item = Match::new(Backend::Pacman, fields[0], fields[0]);
                 item.version = installed_fields[1].to_owned();
                 item.source_path = Some(absolute_path(&path));
                 item.evidence = format!("local Arch package archive version {}", fields[1]);
@@ -1867,12 +1865,9 @@ fn detect_archive(query: &str) -> Vec<Match> {
             .filter_map(|line| line.split_once(" = "))
             .collect();
         if let Some(name) = fields.get("pkgname") {
-            if let Some(installed) = apk_inventory()
-                .into_iter()
-                .find(|record| record.name == *name)
-            {
-                let mut item = Match::new("APK", *name, *name);
-                item.version = installed.version;
+            if let Some(installed) = apk_inventory().iter().find(|record| record.name == *name) {
+                let mut item = Match::new(Backend::Apk, *name, *name);
+                item.version.clone_from(&installed.version);
                 item.architecture = fields.get("arch").copied().unwrap_or_default().to_owned();
                 item.source_path = Some(absolute_path(&path));
                 item.evidence = format!(
@@ -1888,12 +1883,10 @@ fn detect_archive(query: &str) -> Vec<Match> {
         let records = parse_key_value_records(&control);
         if let Some(fields) = records.first() {
             if let Some(name) = fields.get("Package") {
-                if let Some(installed) = opkg_inventory()
-                    .into_iter()
-                    .find(|record| record.name == *name)
+                if let Some(installed) = opkg_inventory().iter().find(|record| record.name == *name)
                 {
-                    let mut item = Match::new("OPKG", name, name);
-                    item.version = installed.version;
+                    let mut item = Match::new(Backend::Opkg, name, name);
+                    item.version.clone_from(&installed.version);
                     item.architecture = fields.get("Architecture").cloned().unwrap_or_default();
                     item.source_path = Some(absolute_path(&path));
                     item.evidence = format!(
@@ -1913,12 +1906,9 @@ fn detect_archive(query: &str) -> Vec<Match> {
             .trim_end_matches(".xbps");
         let package_version = stem.rsplit_once('.').map_or(stem, |(value, _)| value);
         let (name, archive_version) = split_xbps(package_version);
-        if let Some(installed) = xbps_inventory()
-            .into_iter()
-            .find(|record| record.name == name)
-        {
-            let mut item = Match::new("XBPS", &name, &name);
-            item.version = installed.version;
+        if let Some(installed) = xbps_inventory().iter().find(|record| record.name == name) {
+            let mut item = Match::new(Backend::Xbps, &name, &name);
+            item.version.clone_from(&installed.version);
             item.source_path = Some(absolute_path(&path));
             item.evidence = format!("local XBPS archive version {archive_version}");
             return vec![item];
@@ -1936,7 +1926,7 @@ fn detect_archive(query: &str) -> Vec<Match> {
                 .into_iter()
                 .find(|record| record.name == name)
             {
-                let mut item = Match::new("Slackware", name, name);
+                let mut item = Match::new(Backend::Slackware, name, name);
                 item.version = installed.version;
                 item.architecture = fields[1].to_owned();
                 item.source_path = Some(absolute_path(&path));
@@ -1955,7 +1945,7 @@ fn detect_archive(query: &str) -> Vec<Match> {
                     .into_iter()
                     .find(|record| record.name == *name)
                 {
-                    let mut item = Match::new("Eopkg", name, name);
+                    let mut item = Match::new(Backend::Eopkg, name, name);
                     item.version = installed.version;
                     item.source_path = Some(absolute_path(&path));
                     item.evidence = format!(
@@ -2072,27 +2062,58 @@ fn appstream_bytes(path: &Path) -> Option<Vec<u8>> {
     (bytes.len() as u64 <= LIMIT).then_some(bytes)
 }
 
-fn parse_appstream(bytes: &[u8]) -> Vec<AppStreamRecord> {
+fn appstream_record_relevant(record: &AppStreamRecord, matcher: &QueryMatcher) -> bool {
+    matcher.relevant(&[
+        &record.id,
+        &record.name,
+        &record.summary,
+        &record.package,
+        &record.binaries.join(" "),
+    ])
+}
+
+fn parse_appstream_filtered(bytes: &[u8], matcher: Option<&QueryMatcher>) -> Vec<AppStreamRecord> {
+    #[derive(Clone, Copy)]
+    enum Field {
+        None,
+        Id,
+        Name,
+        Summary,
+        Package,
+        Binary,
+    }
+
     let mut reader = Reader::from_reader(Cursor::new(bytes));
     reader.config_mut().trim_text(true);
     let mut buffer = Vec::new();
     let mut current: Option<AppStreamRecord> = None;
-    let mut field = String::new();
+    let mut field = Field::None;
     let mut records = Vec::new();
     loop {
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Start(event)) => {
-                let tag = String::from_utf8_lossy(event.local_name().as_ref()).into_owned();
-                if tag == "component" {
-                    current = Some(AppStreamRecord::default());
-                }
-                field = tag;
+                field = match event.local_name().as_ref() {
+                    b"component" => {
+                        current = Some(AppStreamRecord::default());
+                        Field::None
+                    }
+                    b"id" => Field::Id,
+                    b"name" => Field::Name,
+                    b"summary" => Field::Summary,
+                    b"pkgname" => Field::Package,
+                    b"binary" => Field::Binary,
+                    _ => Field::None,
+                };
             }
             Ok(Event::Text(text)) => {
                 let Some(record) = &mut current else {
                     buffer.clear();
                     continue;
                 };
+                if matches!(field, Field::None) {
+                    buffer.clear();
+                    continue;
+                }
                 let value = reader
                     .decoder()
                     .decode(text.as_ref())
@@ -2102,27 +2123,28 @@ fn parse_appstream(bytes: &[u8]) -> Vec<AppStreamRecord> {
                     buffer.clear();
                     continue;
                 }
-                match field.as_str() {
-                    "id" if record.id.is_empty() => record.id = value,
-                    "name" if record.name.is_empty() => record.name = value,
-                    "summary" if record.summary.is_empty() => record.summary = value,
-                    "pkgname" if record.package.is_empty() => record.package = value,
-                    "binary" => record.binaries.push(value),
+                match field {
+                    Field::Id if record.id.is_empty() => record.id = value,
+                    Field::Name if record.name.is_empty() => record.name = value,
+                    Field::Summary if record.summary.is_empty() => record.summary = value,
+                    Field::Package if record.package.is_empty() => record.package = value,
+                    Field::Binary => record.binaries.push(value),
                     _ => {}
                 }
             }
             Ok(Event::End(event)) => {
-                let tag = String::from_utf8_lossy(event.local_name().as_ref()).into_owned();
-                if tag == "component" {
+                if event.local_name().as_ref() == b"component" {
                     if let Some(record) = current.take().filter(|record| {
-                        !record.id.is_empty()
+                        (!record.id.is_empty()
                             || !record.package.is_empty()
-                            || !record.binaries.is_empty()
+                            || !record.binaries.is_empty())
+                            && matcher
+                                .is_none_or(|matcher| appstream_record_relevant(record, matcher))
                     }) {
                         records.push(record);
                     }
                 }
-                field.clear();
+                field = Field::None;
             }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
@@ -2132,7 +2154,43 @@ fn parse_appstream(bytes: &[u8]) -> Vec<AppStreamRecord> {
     records
 }
 
+#[cfg(test)]
+fn parse_appstream(bytes: &[u8]) -> Vec<AppStreamRecord> {
+    parse_appstream_filtered(bytes, None)
+}
+
+fn native_package_matches(package: &str) -> Vec<Match> {
+    let base = package_base_ref(package);
+    let from_matches = |items: &[Match]| {
+        items
+            .iter()
+            .filter(|item| package_base_ref(&item.id) == base)
+            .cloned()
+            .collect()
+    };
+    let from_records = |backend: Backend, items: &[PackageRecord]| {
+        items
+            .iter()
+            .filter(|item| package_base_ref(&item.name) == base)
+            .map(|item| package_record_match(backend, item))
+            .collect()
+    };
+    match native_family() {
+        NativeFamily::Apt => from_matches(apt_inventory()),
+        NativeFamily::Rpm => from_matches(rpm_inventory()),
+        NativeFamily::Pacman => from_matches(pacman_inventory()),
+        NativeFamily::Apk => from_records(Backend::Apk, apk_inventory()),
+        NativeFamily::Xbps => from_records(Backend::Xbps, xbps_inventory()),
+        NativeFamily::Eopkg => from_records(Backend::Eopkg, eopkg_inventory()),
+        _ => native_detector()(package)
+            .into_iter()
+            .filter(|item| package_base_ref(&item.id) == base)
+            .collect(),
+    }
+}
+
 fn detect_appstream(query: &str) -> Vec<Match> {
+    let matcher = QueryMatcher::new(query);
     let roots = [
         PathBuf::from("/usr/share/metainfo"),
         PathBuf::from("/usr/share/appdata"),
@@ -2154,37 +2212,23 @@ fn detect_appstream(query: &str) -> Vec<Match> {
         .take(4096)
     {
         if let Some(bytes) = appstream_bytes(&path) {
-            records.extend(parse_appstream(&bytes).into_iter().filter(|record| {
-                relevant(
-                    query,
-                    &[
-                        &record.id,
-                        &record.name,
-                        &record.summary,
-                        &record.package,
-                        &record.binaries.join(" "),
-                    ],
-                )
-            }));
+            records.extend(parse_appstream_filtered(&bytes, Some(&matcher)));
         }
     }
-    let detector = native_detector();
     let mut found = Vec::new();
     for record in records {
         let mut owners = if record.package.is_empty() {
             Vec::new()
         } else {
-            detector(&record.package)
-                .into_iter()
-                .filter(|item| package_base(&item.id) == package_base(&record.package))
-                .collect()
+            native_package_matches(&record.package)
         };
         if owners.is_empty() {
             owners = record
                 .binaries
                 .iter()
                 .find_map(|binary| {
-                    let owned = detect_owner(Path::new(binary).file_name()?.to_str()?);
+                    let command = Path::new(binary).file_name()?.to_str()?;
+                    let owned = detect_owner(command);
                     (!owned.is_empty()).then_some(owned)
                 })
                 .unwrap_or_default();
@@ -2204,16 +2248,16 @@ type Detector = fn(&str) -> Vec<Match>;
 
 fn native_detector() -> Detector {
     match native_family() {
-        "apt" => detect_apt,
-        "rpm" => detect_rpm,
-        "pacman" => detect_pacman,
-        "apk" => detect_apk,
-        "xbps" => detect_xbps,
-        "portage" => detect_portage,
-        "slackware" => detect_slackware,
-        "eopkg" => detect_eopkg,
-        "swupd" => detect_swupd,
-        _ => |_| Vec::new(),
+        NativeFamily::Apt => detect_apt,
+        NativeFamily::Rpm => detect_rpm,
+        NativeFamily::Pacman => detect_pacman,
+        NativeFamily::Apk => detect_apk,
+        NativeFamily::Xbps => detect_xbps,
+        NativeFamily::Portage => detect_portage,
+        NativeFamily::Slackware => detect_slackware,
+        NativeFamily::Eopkg => detect_eopkg,
+        NativeFamily::Swupd => detect_swupd,
+        NativeFamily::Unknown => |_| Vec::new(),
     }
 }
 
@@ -2242,15 +2286,14 @@ fn detectors() -> Vec<Detector> {
     selected
 }
 
-fn exact_match(item: &Match, query: &str) -> bool {
-    let needle = norm(query);
+fn exact_match(item: &Match, matcher: &QueryMatcher) -> bool {
     [item.id.as_str(), item.name.as_str()]
         .into_iter()
-        .any(|value| norm(value) == needle)
+        .any(|value| matcher.exact(value))
 }
 
-fn score(item: &Match, query: &str) -> (u8, usize, String) {
-    let needle = norm(query);
+fn score(item: &Match, matcher: &QueryMatcher) -> (u8, usize, String) {
+    let needle = matcher.normalized();
     let id = norm(&item.id);
     let name = norm(&item.name);
     let command = item
@@ -2263,7 +2306,7 @@ fn score(item: &Match, query: &str) -> (u8, usize, String) {
         0
     } else if id == needle || name == needle {
         1
-    } else if id.starts_with(&needle) || name.starts_with(&needle) {
+    } else if id.starts_with(needle) || name.starts_with(needle) {
         2
     } else {
         3
@@ -2272,6 +2315,7 @@ fn score(item: &Match, query: &str) -> (u8, usize, String) {
 }
 
 pub fn find_matches(query: &str) -> Vec<Match> {
+    let matcher = QueryMatcher::new(query);
     let archive = detect_archive(query);
     if !archive.is_empty() {
         return archive;
@@ -2283,7 +2327,7 @@ pub fn find_matches(query: &str) -> Vec<Match> {
             .iter()
             .all(|item| matches!(item.backend.as_str(), "Standalone" | "AppImage"));
         if direct_file {
-            let appimage = owner.iter().any(|item| item.backend == "AppImage");
+            let appimage = owner.iter().any(|item| item.backend == Backend::AppImage);
             selected.retain(|detector| {
                 std::ptr::fn_addr_eq(*detector, detect_gearlever as Detector)
                     || (appimage && std::ptr::fn_addr_eq(*detector, detect_desktop as Detector))
@@ -2315,34 +2359,33 @@ pub fn find_matches(query: &str) -> Vec<Match> {
     let mut results: Vec<Match> = unique.into_values().collect();
     let gearlever_paths: HashSet<PathBuf> = results
         .iter()
-        .filter(|item| item.backend == "Gear Lever")
+        .filter(|item| item.backend == Backend::GearLever)
         .filter_map(|item| item.source_path.as_ref())
         .map(|path| fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
         .collect();
     if !gearlever_paths.is_empty() {
         results.retain(|item| {
-            item.backend != "AppImage"
+            item.backend != Backend::AppImage
                 || item.source_path.as_ref().is_none_or(|path| {
                     !gearlever_paths
                         .contains(&fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
                 })
         });
     }
-    let needle = norm(query);
     let has_exact_command = results.iter().any(|item| {
         item.command_path
             .as_ref()
             .and_then(|path| path.file_name())
-            .is_some_and(|name| norm(&name.to_string_lossy()) == needle)
+            .is_some_and(|name| matcher.exact(&name.to_string_lossy()))
     });
     if has_exact_command {
         results.retain(|item| {
-            exact_match(item, query)
+            exact_match(item, &matcher)
                 || item
                     .command_path
                     .as_ref()
                     .and_then(|path| path.file_name())
-                    .is_some_and(|name| norm(&name.to_string_lossy()) == needle)
+                    .is_some_and(|name| matcher.exact(&name.to_string_lossy()))
         });
     }
     let command_matches: Vec<Match> = results
@@ -2353,11 +2396,11 @@ pub fn find_matches(query: &str) -> Vec<Match> {
     if !command_matches.is_empty() {
         let managed: HashSet<PathBuf> = command_matches
             .iter()
-            .filter(|item| item.backend != "Standalone")
+            .filter(|item| item.backend != Backend::Standalone)
             .filter_map(|item| item.command_path.clone())
             .collect();
         results.retain(|item| {
-            if item.backend == "Standalone"
+            if item.backend == Backend::Standalone
                 && item
                     .command_path
                     .as_ref()
@@ -2365,10 +2408,10 @@ pub fn find_matches(query: &str) -> Vec<Match> {
             {
                 return false;
             }
-            item.command_path.is_some() || exact_match(item, query)
+            item.command_path.is_some() || exact_match(item, &matcher)
         });
     }
-    results.sort_by_key(|item| score(item, query));
+    results.sort_by_key(|item| score(item, &matcher));
     results
 }
 
@@ -2376,10 +2419,12 @@ pub fn filter_dependencies(matches: Vec<Match>, query: &str, show: bool) -> (Vec
     if show {
         return (matches, 0);
     }
+    let matcher = QueryMatcher::new(query);
     let mut visible = Vec::new();
     let mut hidden = Vec::new();
     for item in matches {
-        if item.role.is_dependency() && item.command_path.is_none() && !exact_match(&item, query) {
+        if item.role.is_dependency() && item.command_path.is_none() && !exact_match(&item, &matcher)
+        {
             hidden.push(item);
         } else {
             visible.push(item);
@@ -2407,9 +2452,10 @@ mod tests {
 
     #[test]
     fn exact_identifier_ranks_before_fuzzy_name() {
-        let exact = Match::new("APT", "edit", "edit");
-        let fuzzy = Match::new("APT", "editor-libs", "editor-libs");
-        assert!(score(&exact, "edit") < score(&fuzzy, "edit"));
+        let exact = Match::new(Backend::Apt, "edit", "edit");
+        let fuzzy = Match::new(Backend::Apt, "editor-libs", "editor-libs");
+        let matcher = QueryMatcher::new("edit");
+        assert!(score(&exact, &matcher) < score(&fuzzy, &matcher));
     }
 
     #[test]
@@ -2444,8 +2490,8 @@ mod tests {
 
     #[test]
     fn fuzzy_dependencies_are_hidden_when_an_app_is_visible() {
-        let app = Match::new("DNF", "editor", "Editor");
-        let mut library = Match::new("DNF", "editor-libs", "editor-libs");
+        let app = Match::new(Backend::Dnf, "editor", "Editor");
+        let mut library = Match::new(Backend::Dnf, "editor-libs", "editor-libs");
         library.role = Role::Dependency;
         let (visible, hidden) = filter_dependencies(vec![app, library], "editor", false);
         assert_eq!(visible.len(), 1);
@@ -2454,7 +2500,7 @@ mod tests {
 
     #[test]
     fn sole_dependency_result_is_not_hidden() {
-        let mut library = Match::new("DNF", "library-tools", "library-tools");
+        let mut library = Match::new(Backend::Dnf, "library-tools", "library-tools");
         library.role = Role::Dependency;
         let (visible, hidden) = filter_dependencies(vec![library], "library", false);
         assert_eq!(visible.len(), 1);
@@ -2463,7 +2509,7 @@ mod tests {
 
     #[test]
     fn exact_dependency_is_never_hidden() {
-        let mut library = Match::new("DNF", "library", "library");
+        let mut library = Match::new(Backend::Dnf, "library", "library");
         library.role = Role::Dependency;
         let (visible, hidden) = filter_dependencies(vec![library], "library", false);
         assert_eq!(visible.len(), 1);

@@ -1,11 +1,12 @@
 use crate::command::{CommandResult, CommandStatus, exists, run};
-use crate::discovery::dnf_binary;
-use crate::model::{Impact, Match, Preview, PreviewStatus};
+use crate::model::{Backend, Impact, Match, Preview, PreviewStatus};
+use crate::platform::dnf_binary;
 use regex::Regex;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(90);
@@ -209,24 +210,32 @@ fn zypper_preview(ids: &[String]) -> Preview {
     if !result.ok() {
         return failed(&result, "Zypper");
     }
-    let expression = Regex::new(r#"(?i)<solvable\b[^>]*\bname=[\"']([^\"']+)[\"'][^>]*(?:\btransaction=[\"'](?:remove|erase)[\"']|\bstatus=[\"'](?:remove|erase)[\"'])"#).expect("valid expression");
-    let mut planned: Vec<String> = expression
+    static PRIMARY: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?i)<solvable\b[^>]*\bname=[\"']([^\"']+)[\"'][^>]*(?:\btransaction=[\"'](?:remove|erase)[\"']|\bstatus=[\"'](?:remove|erase)[\"'])"#).expect("valid expression")
+    });
+    let mut planned: Vec<String> = PRIMARY
         .captures_iter(&result.stdout)
         .map(|found| found[1].to_owned())
         .collect();
     if planned.is_empty() {
-        let alternate = Regex::new(r#"(?i)<solvable\b[^>]*(?:\btransaction=[\"'](?:remove|erase)[\"']|\bstatus=[\"'](?:remove|erase)[\"'])[^>]*\bname=[\"']([^\"']+)[\"']"#).expect("valid expression");
-        planned = alternate
+        static ALTERNATE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r#"(?i)<solvable\b[^>]*(?:\btransaction=[\"'](?:remove|erase)[\"']|\bstatus=[\"'](?:remove|erase)[\"'])[^>]*\bname=[\"']([^\"']+)[\"']"#).expect("valid expression")
+        });
+        planned = ALTERNATE
             .captures_iter(&result.stdout)
             .map(|found| found[1].to_owned())
             .collect();
     }
     if planned.is_empty() {
-        let section = Regex::new(r"(?is)<to-remove>(.*?)</to-remove>").expect("valid expression");
-        let names = Regex::new(r#"(?i)<solvable\b[^>]*\bname=[\"']([^\"']+)[\"']"#)
-            .expect("valid expression");
-        if let Some(removed) = section.captures(&result.stdout) {
-            planned = names
+        static SECTION: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(?is)<to-remove>(.*?)</to-remove>").expect("valid expression")
+        });
+        static NAMES: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r#"(?i)<solvable\b[^>]*\bname=[\"']([^\"']+)[\"']"#)
+                .expect("valid expression")
+        });
+        if let Some(removed) = SECTION.captures(&result.stdout) {
+            planned = NAMES
                 .captures_iter(&removed[1])
                 .map(|found| found[1].to_owned())
                 .collect();
@@ -246,9 +255,10 @@ fn apk_preview(ids: &[String]) -> Preview {
     if !result.ok() {
         return failed(&result, "APK");
     }
-    let expression =
-        Regex::new(r"(?i)(?:purging|deleting|removing)\s+([^\s(]+)").expect("valid expression");
-    let mut planned: Vec<String> = expression
+    static EXPRESSION: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)(?:purging|deleting|removing)\s+([^\s(]+)").expect("valid expression")
+    });
+    let mut planned: Vec<String> = EXPRESSION
         .captures_iter(&result.combined())
         .map(|found| found[1].trim_end_matches(':').to_owned())
         .collect();
@@ -283,9 +293,10 @@ fn opkg_preview(ids: &[String]) -> Preview {
     if !result.ok() {
         return failed(&result, "OPKG");
     }
-    let expression =
-        Regex::new(r"(?im)^(?:Removing|Not selecting)\s+([^\s.]+)").expect("valid expression");
-    let planned: Vec<String> = expression
+    static EXPRESSION: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?im)^(?:Removing|Not selecting)\s+([^\s.]+)").expect("valid expression")
+    });
+    let planned: Vec<String> = EXPRESSION
         .captures_iter(&result.combined())
         .map(|found| found[1].to_owned())
         .collect();
@@ -303,7 +314,8 @@ fn xbps_preview(ids: &[String]) -> Preview {
     if !result.ok() {
         return failed(&result, "XBPS");
     }
-    let version = Regex::new(r"^(.+)-[0-9][^\s]*_\d+$").expect("valid expression");
+    static VERSION: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^(.+)-[0-9][^\s]*_\d+$").expect("valid expression"));
     let planned: Vec<String> = result
         .combined()
         .lines()
@@ -313,7 +325,7 @@ fn xbps_preview(ids: &[String]) -> Preview {
                 return None;
             }
             let package = *fields.first()?;
-            version.captures(package).map(|found| found[1].to_owned())
+            VERSION.captures(package).map(|found| found[1].to_owned())
         })
         .collect();
     if planned.is_empty() {
@@ -346,8 +358,10 @@ fn portage_preview(items: &[Match]) -> Preview {
     if !result.ok() {
         return failed(&result, "Portage");
     }
-    let expression = Regex::new(r"(?m)^\s*>>>\s+([^\s]+/[^\s-]+)-[0-9]").expect("valid expression");
-    let planned: Vec<String> = expression
+    static EXPRESSION: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^\s*>>>\s+([^\s]+/[^\s-]+)-[0-9]").expect("valid expression")
+    });
+    let planned: Vec<String> = EXPRESSION
         .captures_iter(&result.stdout)
         .map(|found| found[1].to_owned())
         .collect();
@@ -365,7 +379,7 @@ fn portage_preview(items: &[Match]) -> Preview {
 }
 
 fn conda_preview(item: &Match) -> Preview {
-    let manager = if item.backend == "Conda" {
+    let manager = if item.backend == Backend::Conda {
         "conda"
     } else {
         "micromamba"
@@ -530,7 +544,7 @@ fn is_protected(name: &str, protected: &HashSet<String>) -> bool {
         || base.starts_with("linux-image")
 }
 
-fn fingerprint(preview: &Preview, items: &[Match], cleanup_backends: &[String]) -> String {
+fn fingerprint(preview: &Preview, items: &[Match], cleanup_backends: &[Backend]) -> String {
     let value = json!({
         "items": items.iter().map(|item| (&item.backend, &item.id, &item.version, &item.scope, &item.installation, &item.profile)).collect::<Vec<_>>(),
         "manager_cleanup": cleanup_backends,
@@ -622,7 +636,7 @@ fn impact_rank(impact: Impact) -> u8 {
     }
 }
 
-pub fn build(items: &[Match], cleanup_backends: &[String]) -> Preview {
+pub fn build(items: &[Match], cleanup_backends: &[Backend]) -> Preview {
     if items.is_empty() {
         return blocked("no application was selected");
     }
@@ -736,11 +750,11 @@ mod tests {
 
     #[test]
     fn fingerprint_changes_with_cleanup() {
-        let item = Match::new("Flatpak", "org.example.App", "Example");
+        let item = Match::new(Backend::Flatpak, "org.example.App", "Example");
         let preview = Preview::exact(vec![item.id.clone()]);
         assert_ne!(
             fingerprint(&preview, std::slice::from_ref(&item), &[]),
-            fingerprint(&preview, &[item], &["Flatpak".to_owned()])
+            fingerprint(&preview, &[item], &[Backend::Flatpak])
         );
     }
 }

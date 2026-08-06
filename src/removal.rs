@@ -1,6 +1,6 @@
 use crate::command::{exists, which};
-use crate::discovery::{dnf_binary, rpm_manager};
-use crate::model::{Match, RemovalBatch};
+use crate::model::{Backend, Match, RemovalBatch};
+use crate::platform::{dnf_binary, rpm_manager};
 use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -245,7 +245,7 @@ pub fn command_for(item: &Match, manager_cleanup: bool) -> Result<Vec<String>, S
             format!("--remove={id}"),
         ]),
         "Conda" | "Micromamba" => {
-            let program = if item.backend == "Conda" {
+            let program = if item.backend == Backend::Conda {
                 "conda"
             } else {
                 "micromamba"
@@ -318,37 +318,37 @@ pub fn command_for(item: &Match, manager_cleanup: bool) -> Result<Vec<String>, S
     }
 }
 
-fn batchable(backend: &str) -> bool {
+fn batchable(backend: Backend) -> bool {
     matches!(
         backend,
-        "Flatpak"
-            | "APT"
-            | "APT-RPM"
-            | "DNF"
-            | "YUM"
-            | "RPM"
-            | "RPM-OSTree"
-            | "Zypper"
-            | "URPMI"
-            | "Pacman"
-            | "APK"
-            | "OPKG"
-            | "XBPS"
-            | "Slackware"
-            | "Eopkg"
-            | "Homebrew"
-            | "Homebrew Cask"
-            | "NPM"
+        Backend::Flatpak
+            | Backend::Apt
+            | Backend::AptRpm
+            | Backend::Dnf
+            | Backend::Yum
+            | Backend::Rpm
+            | Backend::RpmOstree
+            | Backend::Zypper
+            | Backend::Urpmi
+            | Backend::Pacman
+            | Backend::Apk
+            | Backend::Opkg
+            | Backend::Xbps
+            | Backend::Slackware
+            | Backend::Eopkg
+            | Backend::Homebrew
+            | Backend::HomebrewCask
+            | Backend::Npm
     )
 }
 
 pub fn build_batches(
     items: &[Match],
-    cleanup_backends: &[String],
+    cleanup_backends: &[Backend],
 ) -> Result<Vec<RemovalBatch>, String> {
     let mut grouped: BTreeMap<String, Vec<Match>> = BTreeMap::new();
     for item in items {
-        let key = if batchable(&item.backend) {
+        let key = if batchable(item.backend) {
             format!(
                 "{}\0{}\0{}\0{}",
                 item.backend, item.scope, item.installation, item.profile
@@ -478,7 +478,7 @@ mod tests {
 
     #[test]
     fn flatpak_scope_and_data_are_explicit() {
-        let mut item = Match::new("Flatpak", "org.example.App", "Example");
+        let mut item = Match::new(Backend::Flatpak, "org.example.App", "Example");
         item.scope = "user".to_owned();
         assert_eq!(
             command_for(&item, true).expect("command"),
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn named_flatpak_installation_is_preserved() {
-        let mut item = Match::new("Flatpak", "org.example.App", "Example");
+        let mut item = Match::new(Backend::Flatpak, "org.example.App", "Example");
         item.installation = "work".to_owned();
         assert!(
             command_for(&item, false)
@@ -506,7 +506,7 @@ mod tests {
 
     #[test]
     fn conda_removes_a_package_not_the_environment() {
-        let mut item = Match::new("Conda", "ruff", "ruff");
+        let mut item = Match::new(Backend::Conda, "ruff", "ruff");
         item.profile = "/home/me/env".to_owned();
         let command = command_for(&item, false).expect("command");
         assert_eq!(
@@ -525,7 +525,7 @@ mod tests {
 
     #[test]
     fn guix_uses_the_discovered_profile() {
-        let mut item = Match::new("Guix", "hello", "hello");
+        let mut item = Match::new(Backend::Guix, "hello", "hello");
         item.profile = "/home/me/.guix-profile".to_owned();
         assert!(
             command_for(&item, false)
@@ -536,13 +536,13 @@ mod tests {
 
     #[test]
     fn container_exports_are_blocked() {
-        let item = Match::new("Container Export", "example.desktop", "Example");
+        let item = Match::new(Backend::ContainerExport, "example.desktop", "Example");
         assert!(command_for(&item, false).is_err());
     }
 
     #[test]
     fn single_target_tool_managers_are_not_batched() {
-        for backend in ["Pipx", "Cargo", "UV Tool"] {
+        for backend in [Backend::Pipx, Backend::Cargo, Backend::UvTool] {
             let first = Match::new(backend, "one", "one");
             let second = Match::new(backend, "two", "two");
             let batches = build_batches(&[first, second], &[]).expect("batches");

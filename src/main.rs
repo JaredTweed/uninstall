@@ -10,7 +10,7 @@ use std::time::Duration;
 use uninstall::cleanup::{self, CleanupCandidate, DataOption};
 use uninstall::command::{output, run as command_run};
 use uninstall::discovery;
-use uninstall::model::{Impact, JsonResult, Match, Preview, PreviewStatus};
+use uninstall::model::{Backend, Impact, JsonResult, Match, Preview, PreviewStatus, RemovalBatch};
 use uninstall::preview;
 use uninstall::provenance;
 use uninstall::removal;
@@ -116,7 +116,7 @@ fn show_matches(items: &[Match]) {
             "{:>4}. {}  [{}]{} | {}",
             index + 1,
             sanitize(&item.name),
-            sanitize(&item.backend),
+            sanitize(item.backend.label()),
             version,
             attributes
                 .into_iter()
@@ -134,7 +134,7 @@ fn show_matches(items: &[Match]) {
             );
         }
         println!("      Why installed: {}", sanitize(&item.reason));
-        if item.backend == "Standalone" {
+        if item.backend == Backend::Standalone {
             println!("      note: related files cannot be identified automatically");
         }
         if !item.evidence.is_empty() {
@@ -282,14 +282,14 @@ fn show_data_options(options: &[DataOption]) {
             width = width
         );
     }
-    let managers: BTreeSet<&str> = options
-        .iter()
-        .filter_map(|option| option.backend.as_deref())
-        .collect();
+    let managers: BTreeSet<Backend> = options.iter().filter_map(|option| option.backend).collect();
     let manager_note = if managers.len() == 1 {
         format!(
             "{} data is manager-owned.",
-            managers.first().copied().unwrap_or("Package-manager")
+            managers
+                .first()
+                .map(|backend| backend.label())
+                .unwrap_or("Package-manager")
         )
     } else if managers.is_empty() {
         String::new()
@@ -403,7 +403,7 @@ fn installed_version(item: &Match) -> Option<String> {
         }
         _ => return None,
     };
-    let value = if item.backend == "APT" {
+    let value = if item.backend == Backend::Apt {
         text.split_once('\t')
             .filter(|(status, _)| status.as_bytes().get(1) == Some(&b'i'))
             .map(|(_, version)| version.trim())
@@ -417,18 +417,40 @@ fn installed_version(item: &Match) -> Option<String> {
 fn revalidate(items: &[Match]) -> Result<(), String> {
     preview::ensure_manager_present(items)?;
     for item in items {
-        if present(item) == Some(false) {
-            return Err(format!("{} is no longer installed", item.name));
-        }
-        if !item.version.is_empty() {
-            if let Some(current) = installed_version(item) {
-                if current != item.version {
-                    return Err(format!(
-                        "{} changed from version {} to {} after selection",
-                        item.name, item.version, current
-                    ));
-                }
+        let version_query_is_presence_query = matches!(
+            item.backend.as_str(),
+            "APT"
+                | "DNF"
+                | "YUM"
+                | "RPM"
+                | "RPM-OSTree"
+                | "Zypper"
+                | "URPMI"
+                | "APT-RPM"
+                | "Pacman"
+                | "APK"
+                | "XBPS"
+                | "Flatpak"
+                | "Snap"
+                | "Homebrew"
+                | "Homebrew Cask"
+                | "Cargo"
+                | "AppImage"
+                | "Standalone"
+                | "Gear Lever"
+        );
+        if !item.version.is_empty() && version_query_is_presence_query {
+            let Some(current) = installed_version(item) else {
+                return Err(format!("{} is no longer installed", item.name));
+            };
+            if current != item.version {
+                return Err(format!(
+                    "{} changed from version {} to {} after selection",
+                    item.name, item.version, current
+                ));
             }
+        } else if present(item) == Some(false) {
+            return Err(format!("{} is no longer installed", item.name));
         }
     }
     Ok(())
@@ -600,7 +622,7 @@ fn present(item: &Match) -> Option<bool> {
             checked("guix", &["package", &profile, "--list-installed", &item.id])
         }
         "Conda" | "Micromamba" => {
-            let program = if item.backend == "Conda" {
+            let program = if item.backend == Backend::Conda {
                 "conda"
             } else {
                 "micromamba"
@@ -772,7 +794,7 @@ fn file_targets(selected: &[Match]) -> Vec<PathBuf> {
         if let Some(path) = &item.source_path {
             paths.insert(path.clone());
         }
-        if item.backend == "AppImage" {
+        if item.backend == Backend::AppImage {
             if let (Some(path), Some(exposed)) = (&item.source_path, &item.command_path) {
                 if path != exposed
                     && std::fs::canonicalize(path).ok() == std::fs::canonicalize(exposed).ok()
@@ -794,7 +816,7 @@ fn run_command(command: &[String]) -> io::Result<i32> {
 fn execute(
     selected: &[Match],
     plan: &Preview,
-    cleanup_backends: &[String],
+    cleanup_backends: &[Backend],
     data_candidates: Vec<CleanupCandidate>,
     file_candidates: Vec<CleanupCandidate>,
 ) -> i32 {
@@ -816,11 +838,7 @@ fn execute(
             return 1;
         }
     };
-    let commands = match prepare_commands(
-        selected,
-        cleanup_backends,
-        plan.status == PreviewStatus::Exact,
-    ) {
+    let commands = match commands_for_batches(&batches, plan.status == PreviewStatus::Exact) {
         Ok(commands) => commands,
         Err(error) => {
             eprintln!("{}.", sanitize(&error));
@@ -843,7 +861,7 @@ fn execute(
             .join(", ");
         println!(
             "\nRemoving {names} [{}]...",
-            sanitize(&batch.items[0].backend)
+            sanitize(batch.items[0].backend.label())
         );
         if batch
             .items
@@ -904,20 +922,20 @@ fn execute(
             Some(false) => println!(
                 "  Removed: {} [{}]",
                 sanitize(&item.name),
-                sanitize(&item.backend)
+                sanitize(item.backend.label())
             ),
             Some(true) => {
                 println!(
                     "  Still installed: {} [{}]",
                     sanitize(&item.name),
-                    sanitize(&item.backend)
+                    sanitize(item.backend.label())
                 );
                 failed = true;
             }
             None => println!(
                 "  Pending or unverifiable: {} [{}]",
                 sanitize(&item.name),
-                sanitize(&item.backend)
+                sanitize(item.backend.label())
             ),
         }
     }
@@ -934,15 +952,20 @@ fn execute(
 
 fn prepare_commands(
     selected: &[Match],
-    cleanup_backends: &[String],
+    cleanup_backends: &[Backend],
     exact: bool,
 ) -> Result<Vec<Vec<String>>, String> {
-    removal::build_batches(selected, cleanup_backends)?
-        .into_iter()
+    let batches = removal::build_batches(selected, cleanup_backends)?;
+    commands_for_batches(&batches, exact)
+}
+
+fn commands_for_batches(batches: &[RemovalBatch], exact: bool) -> Result<Vec<Vec<String>>, String> {
+    batches
+        .iter()
         .map(|batch| {
             let command = removal::pin_command(&batch.command)?;
             Ok(if exact {
-                removal::make_noninteractive(command, &batch.items[0].backend)
+                removal::make_noninteractive(command, batch.items[0].backend.label())
             } else {
                 command
             })
@@ -957,7 +980,7 @@ fn json_report(query: &str, show_dependencies: bool) -> i32 {
     let results: Vec<JsonResult> = matches
         .iter()
         .map(|item| JsonResult {
-            backend: item.backend.clone(),
+            backend: item.backend,
             id: item.id.clone(),
             name: item.name.clone(),
             version: item.version.clone(),
@@ -1055,7 +1078,7 @@ fn no_match(query: &str) -> i32 {
     } else if let Some(path) = uninstall::command::which(query) {
         let absolute = uninstall::util::absolute_path(&path);
         let absolute_text = absolute.display().to_string();
-        let base_package = if uninstall::discovery::rpm_manager() == Some("RPM-OSTree") {
+        let base_package = if uninstall::platform::rpm_manager() == Some("RPM-OSTree") {
             output("rpm", &["-qf", "--qf", "%{NAME}\n", "--", &absolute_text])
         } else {
             String::new()
@@ -1105,7 +1128,7 @@ fn interactive(query: &str, show_dependencies: bool) -> i32 {
     }
     progress(
         "Explaining installation and checking removal impact…",
-        || provenance::decorate(&mut matches),
+        || provenance::explain(&mut matches),
     );
     show_matches(&matches);
     let selected = choose(&matches);
@@ -1124,9 +1147,9 @@ fn interactive(query: &str, show_dependencies: bool) -> i32 {
     let detected = cleanup::find_user_data(&selected);
     let options = cleanup::data_options(&selected, &detected);
     let data_choices = choose_data(&options);
-    let cleanup_backends: Vec<String> = data_choices
+    let cleanup_backends: Vec<Backend> = data_choices
         .iter()
-        .filter_map(|index| options[*index].backend.clone())
+        .filter_map(|index| options[*index].backend)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -1201,7 +1224,9 @@ fn interactive(query: &str, show_dependencies: bool) -> i32 {
         let label = if outside_home {
             "Data outside your home directory"
         } else if plan.impact == Impact::Unknown
-            && selected.iter().all(|item| item.backend == "Standalone")
+            && selected
+                .iter()
+                .all(|item| item.backend == Backend::Standalone)
         {
             "Standalone removal"
         } else {
@@ -1235,7 +1260,8 @@ fn noninteractive(query: &str, backend: &str, confirmation: &str) -> i32 {
     let selected: Vec<Match> = matches
         .into_iter()
         .filter(|item| {
-            item.backend.eq_ignore_ascii_case(backend) && item.id.eq_ignore_ascii_case(query)
+            item.backend.label().eq_ignore_ascii_case(backend)
+                && item.id.eq_ignore_ascii_case(query)
         })
         .collect();
     if selected.len() != 1 {

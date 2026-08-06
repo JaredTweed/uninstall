@@ -1,6 +1,172 @@
 use serde::Serialize;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub enum Backend {
+    #[serde(rename = "Flatpak")]
+    Flatpak,
+    #[serde(rename = "Snap")]
+    Snap,
+    #[serde(rename = "APT")]
+    Apt,
+    #[serde(rename = "APT-RPM")]
+    AptRpm,
+    #[serde(rename = "DNF")]
+    Dnf,
+    #[serde(rename = "YUM")]
+    Yum,
+    #[serde(rename = "RPM")]
+    Rpm,
+    #[serde(rename = "RPM-OSTree")]
+    RpmOstree,
+    #[serde(rename = "Zypper")]
+    Zypper,
+    #[serde(rename = "URPMI")]
+    Urpmi,
+    #[serde(rename = "Pacman")]
+    Pacman,
+    #[serde(rename = "APK")]
+    Apk,
+    #[serde(rename = "OPKG")]
+    Opkg,
+    #[serde(rename = "XBPS")]
+    Xbps,
+    #[serde(rename = "Portage")]
+    Portage,
+    #[serde(rename = "Slackware")]
+    Slackware,
+    #[serde(rename = "Eopkg")]
+    Eopkg,
+    #[serde(rename = "Swupd")]
+    Swupd,
+    #[serde(rename = "Swupd 3rd-party")]
+    SwupdThirdParty,
+    #[serde(rename = "Homebrew")]
+    Homebrew,
+    #[serde(rename = "Homebrew Cask")]
+    HomebrewCask,
+    #[serde(rename = "Gear Lever")]
+    GearLever,
+    #[serde(rename = "Pipx")]
+    Pipx,
+    #[serde(rename = "UV Tool")]
+    UvTool,
+    #[serde(rename = "NPM")]
+    Npm,
+    #[serde(rename = "Cargo")]
+    Cargo,
+    #[serde(rename = "Nix")]
+    Nix,
+    #[serde(rename = "Nix Legacy")]
+    NixLegacy,
+    #[serde(rename = "Guix")]
+    Guix,
+    #[serde(rename = "Conda")]
+    Conda,
+    #[serde(rename = "Micromamba")]
+    Micromamba,
+    #[serde(rename = "AppImage")]
+    AppImage,
+    #[serde(rename = "Standalone")]
+    Standalone,
+    #[serde(rename = "Container Export")]
+    ContainerExport,
+}
+
+impl Backend {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Flatpak => "Flatpak",
+            Self::Snap => "Snap",
+            Self::Apt => "APT",
+            Self::AptRpm => "APT-RPM",
+            Self::Dnf => "DNF",
+            Self::Yum => "YUM",
+            Self::Rpm => "RPM",
+            Self::RpmOstree => "RPM-OSTree",
+            Self::Zypper => "Zypper",
+            Self::Urpmi => "URPMI",
+            Self::Pacman => "Pacman",
+            Self::Apk => "APK",
+            Self::Opkg => "OPKG",
+            Self::Xbps => "XBPS",
+            Self::Portage => "Portage",
+            Self::Slackware => "Slackware",
+            Self::Eopkg => "Eopkg",
+            Self::Swupd => "Swupd",
+            Self::SwupdThirdParty => "Swupd 3rd-party",
+            Self::Homebrew => "Homebrew",
+            Self::HomebrewCask => "Homebrew Cask",
+            Self::GearLever => "Gear Lever",
+            Self::Pipx => "Pipx",
+            Self::UvTool => "UV Tool",
+            Self::Npm => "NPM",
+            Self::Cargo => "Cargo",
+            Self::Nix => "Nix",
+            Self::NixLegacy => "Nix Legacy",
+            Self::Guix => "Guix",
+            Self::Conda => "Conda",
+            Self::Micromamba => "Micromamba",
+            Self::AppImage => "AppImage",
+            Self::Standalone => "Standalone",
+            Self::ContainerExport => "Container Export",
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.label()
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|backend| backend.label().eq_ignore_ascii_case(value))
+    }
+
+    pub const ALL: [Self; 34] = [
+        Self::Flatpak,
+        Self::Snap,
+        Self::Apt,
+        Self::AptRpm,
+        Self::Dnf,
+        Self::Yum,
+        Self::Rpm,
+        Self::RpmOstree,
+        Self::Zypper,
+        Self::Urpmi,
+        Self::Pacman,
+        Self::Apk,
+        Self::Opkg,
+        Self::Xbps,
+        Self::Portage,
+        Self::Slackware,
+        Self::Eopkg,
+        Self::Swupd,
+        Self::SwupdThirdParty,
+        Self::Homebrew,
+        Self::HomebrewCask,
+        Self::GearLever,
+        Self::Pipx,
+        Self::UvTool,
+        Self::Npm,
+        Self::Cargo,
+        Self::Nix,
+        Self::NixLegacy,
+        Self::Guix,
+        Self::Conda,
+        Self::Micromamba,
+        Self::AppImage,
+        Self::Standalone,
+        Self::ContainerExport,
+    ];
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Role {
@@ -31,7 +197,7 @@ impl Role {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Match {
-    pub backend: String,
+    pub backend: Backend,
     pub id: String,
     pub name: String,
     pub version: String,
@@ -50,9 +216,9 @@ pub struct Match {
 }
 
 impl Match {
-    pub fn new(backend: &str, id: impl Into<String>, name: impl Into<String>) -> Self {
+    pub fn new(backend: Backend, id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
-            backend: backend.to_owned(),
+            backend,
             id: id.into(),
             name: name.into(),
             version: String::new(),
@@ -74,7 +240,11 @@ impl Match {
     pub fn key(&self) -> String {
         format!(
             "{}\0{}\0{}\0{}\0{}",
-            self.backend, self.id, self.scope, self.installation, self.profile
+            self.backend.label(),
+            self.id,
+            self.scope,
+            self.installation,
+            self.profile
         )
     }
 }
@@ -147,7 +317,7 @@ pub struct RemovalBatch {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonResult {
-    pub backend: String,
+    pub backend: Backend,
     pub id: String,
     pub name: String,
     pub version: String,
@@ -178,11 +348,17 @@ mod tests {
     fn labels_are_human_readable() {
         assert_eq!(Role::WeakDependency.label(), "weak dependency");
         assert_eq!(Impact::Caution.label(), "CAUTION");
+        assert_eq!(Backend::RpmOstree.label(), "RPM-OSTree");
+        assert_eq!(Backend::parse("gear lever"), Some(Backend::GearLever));
+        assert_eq!(
+            serde_json::to_string(&Backend::SwupdThirdParty).expect("serialize backend"),
+            "\"Swupd 3rd-party\""
+        );
     }
 
     #[test]
     fn match_key_separates_profiles_and_installations() {
-        let first = Match::new("Flatpak", "org.example.App", "Example");
+        let first = Match::new(Backend::Flatpak, "org.example.App", "Example");
         let mut second = first.clone();
         second.installation = "work".to_owned();
         assert_ne!(first.key(), second.key());
