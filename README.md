@@ -22,6 +22,42 @@ Ready to run (freeing about 159 MiB):
 Continue? [y/N]
 ```
 
+```console
+$ uninstall term
+Checking installed applications…
+Explaining installation and checking removal impact…
+
+Found 4 likely installed options:
+
+   1. Terminal  [DNF]  50.1-2.fc44 | system | group | 2.1 MiB
+      ptyxis.x86_64
+      provides command: /usr/bin/ptyxis
+      Why installed: installed through Fedora Workstation Environment → GNOME (gnome-desktop); DNF transaction 2: dnf5 --config /kiwi_dnf5.conf -y --disable-plugin=priorities,versionlock --releasever=42 --exclude=device-mapper-multipath --exclude=fcoe-utils --exclude=gfs2-utils --exclude=g… (abbreviated)
+   2. XTerm  [DNF]  406-1.fc44 | system | 1.9 MiB
+      provides command: /usr/bin/xterm
+      Why installed: explicitly requested; DNF transaction 149: yum -y install libxkbcommon-x11 libnl3 libnsl iptables psmisc libatomic xterm (recorded reason: User; source repository: fedora)
+   3. Micro Text Editor  [DNF]  2.0.15-1.fc44 | system | external | 13 MiB
+      micro.x86_64
+      provides command: /usr/bin/micro
+      Why installed: installed outside DNF and later recorded in its package database
+      archive evidence: AppStream component io.github.zyedidia.micro
+   4. COSMIC Terminal  [DNF]  1.5.0-1.fc44 | system | dependency | 36 MiB
+      cosmic-term.x86_64
+      provides command: /usr/bin/cosmic-term
+      Why installed: cosmic-session requires it; DNF transaction 224: dnf install @cosmic-desktop-environment (recorded reason: Dependency; source repository: updates)
+
+Choose numbers separated by commas, 'a' for all, or Enter to cancel.
+> 2
+Checking removal impact…
+
+Also expected to remove 2 now-unused dependencies: libXaw, xorg-x11-fonts-misc
+
+Ready to run (freeing about 8.5 MiB):
+  /usr/bin/sudo -- /usr/bin/dnf5 -y remove xterm.x86_64
+
+Continue? [y/N] 
+```
+
 It searches:
 
 - Flatpak (including named system installations), Snap, AppImage, and
