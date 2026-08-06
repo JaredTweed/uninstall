@@ -1,0 +1,36 @@
+Title: I made a safer universal uninstall command for Linux
+
+I made a command called `uninstall` that finds and removes Linux applications regardless of how they were installed.
+
+Instead of remembering whether something came from DNF, APT, Flatpak, Snap, an AppImage, Gear Lever, Cargo, pipx, npm, Homebrew, Nix, or another installer, you can run:
+
+    uninstall FreeCAD
+
+It searches the supported package managers and standalone applications, shows the likely matches, explains why each one is installed, previews what else the package manager expects to remove, and asks before making any changes.
+
+It can also optionally remove associated application data. Detected paths are shown individually with their sizes and are never selected automatically. High-impact or uncertain removals require typed confirmation.
+
+Some other things it handles:
+
+- Applications installed as dependencies or as part of package groups
+- The original package-manager transaction when that history is available
+- Commands whose package name is different from the executable name
+- Flatpak installations and sandbox data
+- Gear Lever-managed AppImages
+- Local `.rpm`, `.deb`, and other supported package archives
+- Standalone executables
+- Dependency and total disk-space estimates
+- Self-uninstallation
+- Read-only JSON output for scripts
+
+Install the latest release with:
+
+    curl -fsSL https://raw.githubusercontent.com/JaredTweed/uninstall/main/install.sh | sh
+
+Source code and releases:
+
+https://github.com/JaredTweed/uninstall
+
+It is written in Rust and distributed as checksum-verified, signed static binaries for x86-64, ARM64, ARMv7, and 32-bit x86. The test suite performs real removals in disposable Debian, Ubuntu, Fedora, Alpine, Arch, openSUSE, and Void Linux containers.
+
+The project is new, so I would especially appreciate reports about unusual package-manager configurations, applications it fails to identify, confusing explanations, or removal plans that could be clearer. Please review the displayed command and package-manager transaction before confirming a removal, and feel free to open an issue if anything looks wrong.
