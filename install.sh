@@ -1,10 +1,7 @@
 #!/bin/sh
 set -eu
 
-RELEASE_VERSION=0.18.0
-DEFAULT_SOURCE_URL="https://raw.githubusercontent.com/JaredTweed/uninstall/v${RELEASE_VERSION}/uninstall"
-SOURCE_URL=${UNINSTALL_SOURCE_URL:-$DEFAULT_SOURCE_URL}
-CHECKSUM_URL=${UNINSTALL_CHECKSUM_URL:-"${DEFAULT_SOURCE_URL}.sha256"}
+RELEASE_VERSION=0.19.0
 PREFIX=${PREFIX:-/usr/local}
 
 case "$PREFIX" in
@@ -22,93 +19,82 @@ if [ "$(printf '%s' "$PREFIX" | tr -d '[:cntrl:]')" != "$PREFIX" ]; then
     exit 1
 fi
 
-DESTINATION="$PREFIX/bin/uninstall"
-for required_command in chmod curl dirname grep install mkdir mktemp mv rm sed tr uname; do
+for required_command in chmod curl dirname install mkdir mktemp mv rm sed tr uname; do
     if ! command -v "$required_command" >/dev/null 2>&1; then
         printf '%s\n' "$required_command is required but was not found." >&2
         exit 1
     fi
 done
 
-source_kind=python
-if ! command -v python3 >/dev/null 2>&1 \
-        || ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 8))'; then
-    if [ -n "${UNINSTALL_SOURCE_URL:-}" ]; then
-        printf '%s\n' 'The selected source requires Python 3.8 or newer.' >&2
-        exit 1
-    fi
-    machine=$(uname -m)
-    case "$machine" in
-        x86_64|amd64) architecture=x86_64 ;;
-        aarch64|arm64) architecture=aarch64 ;;
-        *) printf '%s\n' "No self-contained release is available for $machine." >&2; exit 1 ;;
-    esac
-    libc=glibc
-    if command -v ldd >/dev/null 2>&1 \
-            && ldd --version 2>&1 | grep -qi musl; then libc=musl; fi
-    asset="uninstall-linux-${architecture}-${libc}"
-    SOURCE_URL="https://github.com/JaredTweed/uninstall/releases/download/v${RELEASE_VERSION}/${asset}"
-    CHECKSUM_URL="${SOURCE_URL}.sha256"
-    source_kind=binary
-fi
+case "$(uname -m)" in
+    x86_64|amd64) architecture=x86_64 ;;
+    aarch64|arm64) architecture=aarch64 ;;
+    armv7l|armv7) architecture=armv7 ;;
+    i386|i486|i586|i686) architecture=i686 ;;
+    *) printf '%s\n' "No uninstall release is available for $(uname -m)." >&2; exit 1 ;;
+esac
 
-tmp_file=$(mktemp "${TMPDIR:-/tmp}/uninstall.XXXXXX")
+asset="uninstall-linux-${architecture}-musl"
+default_url="https://github.com/JaredTweed/uninstall/releases/download/v${RELEASE_VERSION}/${asset}"
+source_url=${UNINSTALL_SOURCE_URL:-$default_url}
+checksum_url=${UNINSTALL_CHECKSUM_URL:-"${source_url}.sha256"}
+destination="$PREFIX/bin/uninstall"
+
+temporary=$(mktemp "${TMPDIR:-/tmp}/uninstall.XXXXXX")
 checksum_file=$(mktemp "${TMPDIR:-/tmp}/uninstall-checksum.XXXXXX")
 stage_file=
+privilege_helper=
 cleanup() {
-    rm -f "$tmp_file" "$checksum_file"
-    if [ -n "$stage_file" ] && [ -w "$(dirname "$stage_file")" ]; then
-        rm -f "$stage_file"
+    rm -f "$temporary" "$checksum_file"
+    if [ -n "$stage_file" ]; then
+        if [ -n "$privilege_helper" ]; then
+            "$privilege_helper" rm -f -- "$stage_file" 2>/dev/null || true
+        else
+            rm -f -- "$stage_file" 2>/dev/null || true
+        fi
     fi
 }
 trap cleanup EXIT HUP INT TERM
 
-printf '%s\n' "Downloading uninstall ${RELEASE_VERSION}..."
-if ! curl -fsSL "$SOURCE_URL" -o "$tmp_file" 2>/dev/null; then
-    if [ "$SOURCE_URL" != "$DEFAULT_SOURCE_URL" ]; then
-        exit 1
-    fi
-    SOURCE_URL="https://raw.githubusercontent.com/JaredTweed/uninstall/main/uninstall"
-    CHECKSUM_URL="${SOURCE_URL}.sha256"
-    printf '%s\n' 'Tagged source is not published yet; using the matching main-branch build.'
-    curl -fsSL "$SOURCE_URL" -o "$tmp_file"
-fi
-if [ "$source_kind" = python ]; then
-    head_line=$(sed -n '1p' "$tmp_file")
-    if [ "$head_line" != '#!/usr/bin/env python3' ]; then
-        printf '%s\n' 'Downloaded file does not look like uninstall; refusing to install.' >&2
-        exit 1
-    fi
-fi
+printf '%s\n' "Downloading uninstall ${RELEASE_VERSION} for ${architecture}..."
+curl -fsSL "$source_url" -o "$temporary"
 
 expected_checksum=${UNINSTALL_SHA256:-}
-if [ -z "$expected_checksum" ] && [ -z "${UNINSTALL_SOURCE_URL:-}" ]; then
-    curl -fsSL "$CHECKSUM_URL" -o "$checksum_file"
+if [ -z "$expected_checksum" ]; then
+    if ! curl -fsSL "$checksum_url" -o "$checksum_file"; then
+        printf '%s\n' 'A published SHA-256 checksum is required; refusing to install.' >&2
+        exit 1
+    fi
     expected_checksum=$(sed -n '1{s/[[:space:]].*//;p;}' "$checksum_file")
 fi
-if [ -n "$expected_checksum" ]; then
-    if command -v python3 >/dev/null 2>&1; then
-        actual_checksum=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$tmp_file")
-    elif command -v sha256sum >/dev/null 2>&1; then
-        actual_checksum=$(sha256sum "$tmp_file" | sed 's/[[:space:]].*//')
-    elif command -v openssl >/dev/null 2>&1; then
-        actual_checksum=$(openssl dgst -sha256 "$tmp_file" | sed 's/^.*= //')
-    else
-        printf '%s\n' 'python3, sha256sum, or openssl is required to verify the download.' >&2
-        exit 1
-    fi
-    if [ "$actual_checksum" != "$expected_checksum" ]; then
-        printf '%s\n' 'Downloaded checksum mismatch; refusing to install.' >&2
-        exit 1
-    fi
-elif [ -z "${UNINSTALL_SOURCE_URL:-}" ]; then
-    printf '%s\n' 'A checksum was required but unavailable; refusing to install.' >&2
+case "$expected_checksum" in
+    *[!0-9A-Fa-f]*|'') printf '%s\n' 'The expected SHA-256 checksum is invalid.' >&2; exit 1 ;;
+esac
+if [ "${#expected_checksum}" -ne 64 ]; then
+    printf '%s\n' 'The expected SHA-256 checksum is invalid.' >&2
     exit 1
 fi
 
-chmod 755 "$tmp_file"
-if ! actual_version=$("$tmp_file" --version 2>/dev/null); then
-    printf '%s\n' 'Downloaded file failed its self-check; refusing to install.' >&2
+if command -v sha256sum >/dev/null 2>&1; then
+    actual_checksum=$(sha256sum "$temporary" | sed 's/[[:space:]].*//')
+elif command -v shasum >/dev/null 2>&1; then
+    actual_checksum=$(shasum -a 256 "$temporary" | sed 's/[[:space:]].*//')
+elif command -v openssl >/dev/null 2>&1; then
+    actual_checksum=$(openssl dgst -sha256 "$temporary" | sed 's/^.*= //')
+else
+    printf '%s\n' 'sha256sum, shasum, or openssl is required to verify the download.' >&2
+    exit 1
+fi
+actual_checksum=$(printf '%s' "$actual_checksum" | tr 'A-F' 'a-f')
+expected_checksum=$(printf '%s' "$expected_checksum" | tr 'A-F' 'a-f')
+if [ "$actual_checksum" != "$expected_checksum" ]; then
+    printf '%s\n' 'Downloaded checksum mismatch; refusing to install.' >&2
+    exit 1
+fi
+
+chmod 755 "$temporary"
+if ! actual_version=$("$temporary" --version 2>/dev/null); then
+    printf '%s\n' 'Downloaded executable failed its self-check; refusing to install.' >&2
     exit 1
 fi
 if [ "$actual_version" != "uninstall $RELEASE_VERSION" ]; then
@@ -116,31 +102,24 @@ if [ "$actual_version" != "uninstall $RELEASE_VERSION" ]; then
     exit 1
 fi
 
-destination_dir=$(dirname "$DESTINATION")
-privilege_helper=
+destination_dir=$(dirname "$destination")
 if [ ! -d "$destination_dir" ]; then
     if mkdir -p "$destination_dir" 2>/dev/null; then
         :
-    elif command -v sudo >/dev/null 2>&1; then
-        privilege_helper=sudo
-        sudo install -d -m 755 "$destination_dir"
-    elif command -v doas >/dev/null 2>&1; then
-        privilege_helper=doas
-        doas install -d -m 755 "$destination_dir"
-    elif command -v pkexec >/dev/null 2>&1; then
-        privilege_helper=pkexec
-        pkexec install -d -m 755 "$destination_dir"
+    elif command -v sudo >/dev/null 2>&1; then privilege_helper=sudo; sudo install -d -m 755 "$destination_dir"
+    elif command -v doas >/dev/null 2>&1; then privilege_helper=doas; doas install -d -m 755 "$destination_dir"
+    elif command -v pkexec >/dev/null 2>&1; then privilege_helper=pkexec; pkexec install -d -m 755 "$destination_dir"
     else
-        printf '%s\n' "Cannot create $destination_dir; set a writable PREFIX or install sudo/doas/pkexec." >&2
+        printf '%s\n' "Cannot create $destination_dir; set a writable PREFIX or install sudo, doas, or pkexec." >&2
         exit 1
     fi
 fi
 
 if [ -w "$destination_dir" ]; then
     stage_file=$(mktemp "$destination_dir/.uninstall.XXXXXX")
-    install -m 755 "$tmp_file" "$stage_file"
+    install -m 755 "$temporary" "$stage_file"
     "$stage_file" --version >/dev/null
-    mv -f "$stage_file" "$DESTINATION"
+    mv -f "$stage_file" "$destination"
     stage_file=
 else
     if [ -z "$privilege_helper" ]; then
@@ -148,17 +127,16 @@ else
         elif command -v doas >/dev/null 2>&1; then privilege_helper=doas
         elif command -v pkexec >/dev/null 2>&1; then privilege_helper=pkexec
         else
-            printf '%s\n' "Cannot write to $destination_dir; set a writable PREFIX or install sudo/doas/pkexec." >&2
+            printf '%s\n' "Cannot write to $destination_dir; set a writable PREFIX or install sudo, doas, or pkexec." >&2
             exit 1
         fi
     fi
-    random_name=$(basename "$tmp_file")
-    stage_file="$destination_dir/.${random_name}.new"
-    "$privilege_helper" install -m 755 "$tmp_file" "$stage_file"
+    stage_file=$("$privilege_helper" mktemp "$destination_dir/.uninstall.XXXXXX")
+    "$privilege_helper" install -m 755 "$temporary" "$stage_file"
     "$stage_file" --version >/dev/null
-    "$privilege_helper" mv -f "$stage_file" "$DESTINATION"
+    "$privilege_helper" mv -f "$stage_file" "$destination"
     stage_file=
 fi
 
-printf '%s\n' "Installed uninstall to $DESTINATION"
+printf '%s\n' "Installed uninstall to $destination"
 printf '%s\n' 'Try: uninstall FreeCAD'

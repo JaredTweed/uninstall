@@ -10,47 +10,43 @@ permissions:
 
 jobs:
   build:
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
+          - target: x86_64-unknown-linux-musl
             architecture: x86_64
-          - runner: ubuntu-24.04-arm
+          - target: aarch64-unknown-linux-musl
             architecture: aarch64
-    runs-on: ${{ matrix.runner }}
+          - target: armv7-unknown-linux-musleabihf
+            architecture: armv7
+          - target: i686-unknown-linux-musl
+            architecture: i686
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
         with:
-          python-version: "3.13"
-      - name: Verify tag and tests
+          tool: cross
+      - name: Verify tag version
         run: |
-          test "$(./uninstall --version)" = "uninstall ${GITHUB_REF_NAME#v}"
-          python -m unittest discover -s tests
-      - name: Build glibc executable
+          manifest_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test "$manifest_version" = "${GITHUB_REF_NAME#v}"
+      - run: cross build --locked --release --target ${{ matrix.target }}
+      - name: Prepare asset
         run: |
-          python -m pip install pyinstaller
-          pyinstaller --clean --onefile --name uninstall-linux-${{ matrix.architecture }}-glibc uninstall
-          mv dist/uninstall-linux-${{ matrix.architecture }}-glibc .
-      - name: Build musl executable
-        run: |
-          docker run --rm -v "$PWD:/src" -w /src python:3.13-alpine sh -c '
-            apk add --no-cache binutils gcc musl-dev zlib-dev &&
-            pip install pyinstaller &&
-            pyinstaller --clean --onefile --distpath /src/dist-musl --name uninstall-linux-${{ matrix.architecture }}-musl uninstall
-          '
-          mv dist-musl/uninstall-linux-${{ matrix.architecture }}-musl .
-      - name: Checksums
-        run: |
-          sha256sum uninstall-linux-${{ matrix.architecture }}-* > checksums-${{ matrix.architecture }}.txt
-          for file in uninstall-linux-${{ matrix.architecture }}-*; do sha256sum "$file" > "$file.sha256"; done
+          asset=uninstall-linux-${{ matrix.architecture }}-musl
+          cp target/${{ matrix.target }}/release/uninstall "$asset"
+          chmod 755 "$asset"
+          sha256sum "$asset" > "$asset.sha256"
+          if [ "${{ matrix.architecture }}" = x86_64 ]; then
+            test "$(./$asset --version)" = "uninstall ${GITHUB_REF_NAME#v}"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.architecture }}
-          path: |
-            uninstall-linux-${{ matrix.architecture }}-*
-            checksums-${{ matrix.architecture }}.txt
+          path: uninstall-linux-${{ matrix.architecture }}-musl*
 
   publish:
     needs: build
@@ -64,7 +60,7 @@ jobs:
       - uses: sigstore/cosign-installer@v3
       - name: Sign release files
         run: |
-          for file in uninstall-linux-*-glibc uninstall-linux-*-musl; do
+          for file in uninstall-linux-*-musl; do
             cosign sign-blob --yes --bundle "$file.sigstore.json" "$file"
           done
       - name: Publish immutable assets
@@ -72,4 +68,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
-            uninstall-linux-* checksums-*.txt
+            uninstall-linux-*-musl uninstall-linux-*-musl.sha256 uninstall-linux-*-musl.sigstore.json
+      - name: Verify published installer end to end
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prefix=$(mktemp -d)
+          curl -fsSL "https://raw.githubusercontent.com/JaredTweed/uninstall/${GITHUB_REF_NAME}/install.sh" | PREFIX="$prefix" sh
+          test "$("$prefix/bin/uninstall" --version)" = "uninstall ${GITHUB_REF_NAME#v}"
+          printf 'y\n' | "$prefix/bin/uninstall" --self-uninstall
+          test ! -e "$prefix/bin/uninstall"

@@ -8,7 +8,7 @@ separate opt-in selection.
 Please report a suspected command-injection, privilege-boundary, path traversal,
 symlink-race, preview, protection, or unintended-deletion issue privately through
 GitHub's security-advisory interface. Include the distribution, package-manager
-and Python versions, installation scope, and sanitized terminal output. Do not
+and uninstall versions, installation scope, and sanitized terminal output. Do not
 include credentials, private repository URLs, or unrelated package history.
 
 Security fixes are supported on the newest tagged release. Older releases may

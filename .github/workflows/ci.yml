@@ -13,30 +13,55 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.8", "3.11", "3.13"]
+        rust: ["1.85", "stable"]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: ${{ matrix.python }}
-      - run: python -m unittest discover -s tests -v
-      - run: python -m py_compile uninstall
-      - run: sh -n install.sh
-      - run: git diff --check
+          toolchain: ${{ matrix.rust }}
+      - run: cargo test --locked --all-targets
+      - run: cargo build --locked --release
+      - run: test "$(target/release/uninstall --version)" = "uninstall 0.19.0"
 
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: "3.13"
-      - run: pip install ruff
-      - run: ruff check uninstall tests
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
       - run: shellcheck install.sh tests/integration_remove.sh
+      - run: sh -n install.sh
+      - run: git diff --check
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  build-static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --locked --release --target x86_64-unknown-linux-musl
+      - run: target/x86_64-unknown-linux-musl/release/uninstall --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uninstall-x86_64-musl
+          path: target/x86_64-unknown-linux-musl/release/uninstall
 
   distro-smoke:
+    needs: build-static
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -48,50 +73,25 @@ jobs:
           - alpine:latest
           - archlinux:latest
           - opensuse/tumbleweed:latest
-    container: ${{ matrix.image }}
+          - voidlinux/voidlinux:latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Python when absent
-        shell: sh
+      - uses: actions/download-artifact@v4
+        with:
+          name: uninstall-x86_64-musl
+          path: dist
+      - run: chmod 755 dist/uninstall
+      - name: Perform a real disposable removal
+        env:
+          IMAGE: ${{ matrix.image }}
         run: |
-          if command -v python3 >/dev/null 2>&1; then exit 0; fi
-          if command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y python3; exit 0; fi
-          if command -v dnf >/dev/null 2>&1; then dnf install -y python3; exit 0; fi
-          if command -v apk >/dev/null 2>&1; then apk add python3; exit 0; fi
-          if command -v pacman >/dev/null 2>&1; then pacman -Sy --noconfirm python; exit 0; fi
-          if command -v zypper >/dev/null 2>&1; then zypper --non-interactive install python3; exit 0; fi
-          if command -v xbps-install >/dev/null 2>&1; then
-            repository_file=/usr/share/xbps.d/00-repository-main.conf
-            if [ -f "$repository_file" ]; then
-              sed -i 's|alpha.de.repo.voidlinux.org|repo-default.voidlinux.org|' "$repository_file"
-            fi
-            xbps-install -Suy xbps && xbps-install -Sy python3
-            exit 0
-          fi
-          exit 1
-      - run: python3 -m py_compile uninstall
-      - run: ./uninstall --version
-      - run: ./uninstall --help >/dev/null
-      - name: Perform a real disposable removal where an exact backend is available
-        run: sh tests/integration_remove.sh
-
-  void-smoke:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Compile and perform a real XBPS removal in Void Linux
-        run: |
-          docker run --rm -v "$PWD:/work:ro" -w /work \
-            voidlinux/voidlinux:latest sh -c '
-              set -eu
+          docker run --rm -v "$PWD:/work:ro" -w /work "$IMAGE" sh -c '
+            if command -v xbps-install >/dev/null 2>&1; then
               repository_file=/usr/share/xbps.d/00-repository-main.conf
               if [ -f "$repository_file" ]; then
                 sed -i "s|alpha.de.repo.voidlinux.org|repo-default.voidlinux.org|" "$repository_file"
               fi
               xbps-install -Suy xbps
-              xbps-install -Sy python3
-              PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m py_compile uninstall
-              ./uninstall --version
-              ./uninstall --help >/dev/null
-              sh tests/integration_remove.sh
-            '
+            fi
+            UNINSTALL_BIN=/work/dist/uninstall sh tests/integration_remove.sh
+          '

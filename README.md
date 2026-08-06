@@ -8,7 +8,7 @@ $ uninstall DOSbox
 
 Found 1 likely installed option:
 
-   1. dosbox-staging  [DNF]  0.82.2-5.fc44 | system | weak dependency | 16 MiB
+   1. DOSBox Staging  [DNF]  0.82.2-5.fc44 | system | weak dependency | 16 MiB
       provides command: /usr/bin/dosbox
       Why installed: wine recommends it; DNF transaction 193: dnf install wine (recorded reason: Weak Dependency; source repository: updates)
 
@@ -16,8 +16,8 @@ Automatically selected the only result.
 
 Also expected to remove 8 now-unused dependencies: SDL2_net, fluid-soundfont-common, fluid-soundfont-gm, fluidsynth-libs, iir1, mt32emu, opusfile, speexdsp
 
-Ready to run (estimated installed data affected: about 159 MiB):
-  sudo dnf5 remove dosbox-staging
+Ready to run (freeing about 159 MiB):
+  /usr/bin/sudo -- /usr/bin/dnf5 -y remove dosbox-staging.x86_64
 
 Continue? [y/N]
 ```
@@ -89,13 +89,12 @@ is an advanced `rpm-ostree override remove` operation and is reported as such.
 
 ## Install
 
-The installer checks for Python 3.8+, `curl`, and the standard system utilities it
-needs before changing anything. It downloads the matching pinned release to a
-temporary file, verifies the CLI can start and reports the exact expected
-version, verifies the published SHA-256 digest, stages it in the destination
-filesystem, and only then atomically replaces the installed command. If Python
-3.8 is unavailable, tagged releases provide self-contained glibc and musl
-executables for x86-64 and AArch64.
+The installer downloads a self-contained, statically linked Rust executable for
+the current architecture. It verifies the pinned release's published SHA-256
+digest and exact version, stages it in the destination filesystem, and only
+then atomically replaces the installed command. No Python runtime or Linux
+distribution package is required. Release binaries cover x86-64, AArch64,
+32-bit ARMv7, and 32-bit x86.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/JaredTweed/uninstall/main/install.sh | sh
@@ -224,13 +223,12 @@ are sent as one transaction—the same grouping used for its preview. Backends
 that accept one target at a time and mixed backends remain separate commands.
 User-data paths are deleted only if every command succeeds.
 
-Search backends run concurrently in a bounded four-worker pool. Within one
-invocation, each package-manager inventory is loaded once and reused for
-matching, ownership, dependency relationships, roles, provenance, and sizes.
-DNF history and package sizes are requested in batches, retained APT/Pacman/
-Zypper logs are indexed in one pass, and independent provenance and dry-run
-work overlaps. These are invocation-only caches: every new `uninstall` command
-reads the package managers' current state, with no daemon or stale disk cache.
+Search backends run concurrently in a bounded four-worker pool. Reusable APT,
+RPM, Pacman, APK, OPKG, XBPS, and Eopkg inventories are loaded once per
+invocation, and an exact command owner avoids a redundant full native-package
+search. DNF role metadata is requested in one batch. These are invocation-only
+caches: every new `uninstall` command reads the package managers' current state,
+with no daemon or stale disk cache.
 
 Dependency explanations are necessarily best effort: alternatives, rich
 conditional dependencies, pruned transaction history, package groups, and
@@ -304,25 +302,26 @@ removed by this tool.
 
 ## Install from a fork
 
-Point the installer at the raw executable:
+Point the installer at a release executable and its checksum:
 
 ```sh
 curl -fsSL https://example.com/install.sh |
-  UNINSTALL_SOURCE_URL=https://example.com/uninstall sh
+  UNINSTALL_SOURCE_URL=https://example.com/uninstall \
+  UNINSTALL_CHECKSUM_URL=https://example.com/uninstall.sha256 sh
 ```
 
 ## Development
 
 ```sh
-python3 -m unittest discover -s tests -v
+cargo fmt --check
+cargo clippy --all-targets --all-features
+cargo test
 ```
 
-The test suite replaces package managers with harmless fixtures and never
-uninstalls real packages. Machine-readable inventory is preferred where
-available (including Gear Lever, pipx, Nix, rpm-ostree, and Zypper), with
-version-compatible fallbacks where necessary. Fixtures cover APK, OPKG, XBPS,
-Portage, Slackware, Eopkg, Swupd, Guix, and legacy Nix without requiring those
-package managers on the development machine.
+Unit and CLI tests use disposable files and never touch installed host
+packages. CI additionally installs and removes a disposable package inside
+isolated Debian, Ubuntu, Fedora, Alpine, Arch, openSUSE, and Void containers.
+The same static release binary is used in every container.
 
 ## License
 
