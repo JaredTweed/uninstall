@@ -31,6 +31,8 @@ Source code and releases:
 
 https://github.com/JaredTweed/uninstall
 
+Disclosure: I developed this with Codex assistance, reviewed the implementation, and tested it across multiple architectures and Linux distributions.
+
 It is written in Rust and distributed as checksum-verified, signed static binaries for x86-64, ARM64, ARMv7, and 32-bit x86. The test suite performs real removals in disposable Debian, Ubuntu, Fedora, Alpine, Arch, openSUSE, and Void Linux containers.
 
 The project is new, so I would especially appreciate reports about unusual package-manager configurations, applications it fails to identify, confusing explanations, or removal plans that could be clearer. Please review the displayed command and package-manager transaction before confirming a removal, and feel free to open an issue if anything looks wrong.
