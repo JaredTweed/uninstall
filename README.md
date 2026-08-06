@@ -3,7 +3,7 @@
 Find, explain, and safely remove Linux software—regardless of how it was installed.
 
 ```console
-$ uninstall DOSbox
+$ uninstall Dosbox
 Checking installed applications…
 
 Found 1 likely installed option:
