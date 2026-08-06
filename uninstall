@@ -138,8 +138,11 @@ class CleanupCandidate:
     device: int
     inode: int
     mode: int
+    change_time_ns: int
     parent_device: int
     parent_inode: int
+    target_fd: int
+    parent_fd: int
 
 
 @dataclass(frozen=True)
@@ -6688,17 +6691,51 @@ def manager_cleanup_size(kind: str, selected: list[Match]) -> int | None:
 _CLEANUP_SNAPSHOTS: dict[Path, CleanupCandidate] = {}
 
 
+def close_cleanup_candidate(candidate: CleanupCandidate | None) -> None:
+    if candidate is None:
+        return
+    for descriptor in (candidate.target_fd, candidate.parent_fd):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def clear_cleanup_snapshots() -> None:
+    for candidate in _CLEANUP_SNAPSHOTS.values():
+        close_cleanup_candidate(candidate)
+    _CLEANUP_SNAPSHOTS.clear()
+
+
 def snapshot_cleanup_candidate(
         path: Path, evidence: str = "normalized-name match",
 ) -> CleanupCandidate | None:
+    parent_fd = -1
+    target_fd = -1
     try:
-        details = path.lstat()
-        parent = path.parent.stat()
+        parent_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        parent_flags |= getattr(os, "O_CLOEXEC", 0)
+        parent_flags |= getattr(os, "O_NOFOLLOW", 0)
+        parent_fd = os.open(str(path.absolute().parent), parent_flags)
+        target_flags = getattr(os, "O_PATH", os.O_RDONLY)
+        target_flags |= getattr(os, "O_CLOEXEC", 0)
+        target_flags |= getattr(os, "O_NOFOLLOW", 0)
+        target_fd = os.open(
+            path.absolute().name, target_flags, dir_fd=parent_fd)
+        details = os.fstat(target_fd)
+        parent = os.fstat(parent_fd)
     except OSError:
+        for descriptor in (target_fd, parent_fd):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
         return None
     return CleanupCandidate(
         path.absolute(), evidence, details.st_dev, details.st_ino,
-        details.st_mode, parent.st_dev, parent.st_ino,
+        details.st_mode, details.st_ctime_ns, parent.st_dev, parent.st_ino,
+        target_fd, parent_fd,
     )
 
 
@@ -6803,7 +6840,9 @@ def ask_cleanup(
         for path in selected_paths:
             snapshot = snapshot_cleanup_candidate(path)
             if snapshot:
-                _CLEANUP_SNAPSHOTS[path.absolute()] = snapshot
+                absolute = path.absolute()
+                close_cleanup_candidate(_CLEANUP_SNAPSHOTS.pop(absolute, None))
+                _CLEANUP_SNAPSHOTS[absolute] = snapshot
         return cleanup_kinds, selected_paths
 
 
@@ -7060,6 +7099,7 @@ def remove_paths(paths: list[Path]) -> bool:
     allowed_roots = [root.resolve() for root in user_data_roots()]
     allowed_roots.append((Path.home() / "snap").resolve())
     for path in paths:
+        expected: CleanupCandidate | None = None
         try:
             absolute = path.absolute()
             resolved_parent = path.parent.resolve()
@@ -7068,49 +7108,47 @@ def remove_paths(paths: list[Path]) -> bool:
                 for root in allowed_roots
             ):
                 raise ValueError("path is outside the approved app-data locations")
-            expected = _CLEANUP_SNAPSHOTS.get(absolute)
+            expected = _CLEANUP_SNAPSHOTS.pop(absolute, None)
             if expected is None:
                 expected = snapshot_cleanup_candidate(absolute)
             if expected is None:
-                print(f"  Already removed {display(path)}")
-                continue
+                if not absolute.exists() and not absolute.is_symlink():
+                    print(f"  Already removed {display(path)}")
+                    continue
+                raise ValueError("path could not be opened safely")
             current = absolute.lstat()
-            parent_current = absolute.parent.stat()
-            if ((current.st_dev, current.st_ino, stat.S_IFMT(current.st_mode))
+            parent_path_current = absolute.parent.stat()
+            parent_handle_current = os.fstat(expected.parent_fd)
+            if ((current.st_dev, current.st_ino, stat.S_IFMT(current.st_mode),
+                 current.st_ctime_ns)
                     != (expected.device, expected.inode,
-                        stat.S_IFMT(expected.mode))):
+                        stat.S_IFMT(expected.mode), expected.change_time_ns)):
                 raise ValueError("path changed after it was selected")
-            if ((parent_current.st_dev, parent_current.st_ino)
+            if ((parent_path_current.st_dev, parent_path_current.st_ino)
+                    != (expected.parent_device, expected.parent_inode)
+                    or (parent_handle_current.st_dev,
+                        parent_handle_current.st_ino)
                     != (expected.parent_device, expected.parent_inode)):
                 raise ValueError("parent directory changed after selection")
-            open_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-            open_flags |= getattr(os, "O_CLOEXEC", 0)
-            open_flags |= getattr(os, "O_NOFOLLOW", 0)
-            parent_fd = os.open(str(absolute.parent), open_flags)
             tombstone: Path | None = None
-            try:
-                opened_parent = os.fstat(parent_fd)
-                if ((opened_parent.st_dev, opened_parent.st_ino)
-                        != (expected.parent_device, expected.parent_inode)):
-                    raise ValueError("parent directory changed during deletion")
-                if stat.S_ISDIR(current.st_mode):
-                    trash_name = (
-                        ".uninstall-trash-" + secrets.token_hex(12))
-                    os.rename(
-                        absolute.name, trash_name,
-                        src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
-                    )
-                    tombstone = absolute.parent / trash_name
-                else:
-                    os.unlink(absolute.name, dir_fd=parent_fd)
-            finally:
-                os.close(parent_fd)
+            if stat.S_ISDIR(current.st_mode):
+                trash_name = ".uninstall-trash-" + secrets.token_hex(12)
+                os.rename(
+                    absolute.name, trash_name,
+                    src_dir_fd=expected.parent_fd,
+                    dst_dir_fd=expected.parent_fd,
+                )
+                tombstone = absolute.parent / trash_name
+            else:
+                os.unlink(absolute.name, dir_fd=expected.parent_fd)
             if tombstone is not None:
                 shutil.rmtree(tombstone)
             print(f"  Removed {display(path)}")
         except (OSError, ValueError) as error:
             ok = False
             print(f"  Could not remove {display(path)}: {display(error)}", file=sys.stderr)
+        finally:
+            close_cleanup_candidate(expected)
     return ok
 
 

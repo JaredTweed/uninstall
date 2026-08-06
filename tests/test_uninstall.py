@@ -112,7 +112,7 @@ class UninstallTests(unittest.TestCase):
         MODULE.runtime_protected_packages.cache_clear()
         MODULE.nix_profile_metadata.cache_clear()
         MODULE._DIAGNOSTICS.clear()
-        MODULE._CLEANUP_SNAPSHOTS.clear()
+        MODULE.clear_cleanup_snapshots()
         MODULE._DNF_HISTORY_DETAILS.clear()
         MODULE._DNF_INSTALL_RECORDS.clear()
 
@@ -2372,7 +2372,12 @@ class UninstallTests(unittest.TestCase):
             similar = home / ".config/freecad-backup"
             exact.mkdir()
             similar.mkdir()
-            with patch.object(MODULE.Path, "home", return_value=home):
+            empty_xdg = {
+                "XDG_CONFIG_HOME": "", "XDG_CACHE_HOME": "",
+                "XDG_DATA_HOME": "", "XDG_STATE_HOME": "",
+            }
+            with patch.dict(os.environ, empty_xdg, clear=False), \
+                    patch.object(MODULE.Path, "home", return_value=home):
                 result = MODULE.find_user_data(selected)
             self.assertEqual(result, [exact])
 
@@ -2452,7 +2457,9 @@ class UninstallTests(unittest.TestCase):
         find_user_data.return_value = [Path("/home/test/.config/Example")]
         run.return_value.returncode = 1
         with patch("builtins.input", side_effect=["a", "REMOVE Example"]), \
-                patch.object(MODULE, "revalidate_package_identity", return_value=""):
+                patch.object(MODULE, "revalidate_package_identity", return_value=""), \
+                patch.object(
+                    MODULE, "pinned_command", side_effect=lambda command: command):
             self.assertEqual(MODULE.run_uninstall("Example"), 1)
         remove_paths.assert_not_called()
         self.assertTrue(any(
@@ -2697,6 +2704,10 @@ class UninstallTests(unittest.TestCase):
             with patch.object(MODULE, "user_data_roots", return_value=[root]):
                 self.assertFalse(MODULE.remove_paths([candidate]))
             self.assertTrue(candidate.exists())
+            with self.assertRaises(OSError):
+                os.fstat(snapshot.target_fd)
+            with self.assertRaises(OSError):
+                os.fstat(snapshot.parent_fd)
 
     def test_named_flatpak_installation_is_preserved_in_command(self):
         item = MODULE.Match(

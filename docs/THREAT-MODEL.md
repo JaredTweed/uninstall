@@ -11,9 +11,10 @@ boundary, previews native transactions when possible, fingerprints the preview,
 and repeats it immediately before execution. A changed transaction is aborted.
 
 Detected data paths are optional. Broad XDG roots are rejected. Selected paths
-are snapshotted by device, inode, type, and parent identity, then revalidated and
-removed relative to an opened parent directory. A failed uninstall keeps all
-selected data.
+are held open and snapshotted by device, inode, type, change time, and parent
+identity, then revalidated and removed relative to the held parent directory.
+Holding the descriptors prevents an unlinked inode from being recycled as a
+replacement while the user confirms. A failed uninstall keeps all selected data.
 
 Package-manager simulations remain fallible: installed databases may change,
 history may be pruned, conditional dependencies may be ambiguous, and immutable
